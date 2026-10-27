@@ -1,0 +1,42 @@
+{
+  "name": "dsh-memjudge",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 记忆插件：SQLite 逐字存储 + CJK 二元组 BM25 段级检索 + 三元组拒答门 + 冲突消解 + lastAccessed 衰减 + 2000 字符注入预算。工具名全部 memjudge_ 前缀，与 memory_* 系插件零冲突。",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./store": "./src/store.mjs",
+    "./search": "./src/search.mjs",
+    "./judge": "./src/judge.mjs",
+    "./schema": "./src/schema.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "docs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0-rc.2 <0.3.0",
+      "node": ">=22.5"
+    }
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "bm25",
+    "sqlite",
+    "retrieval"
+  ],
+  "license": "MIT"
+}

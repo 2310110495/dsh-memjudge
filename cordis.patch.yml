@@ -1,0 +1,3 @@
+- insert:
+    - id: memjudge
+      name: 'dsh-memjudge'
