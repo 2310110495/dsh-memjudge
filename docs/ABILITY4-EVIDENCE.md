@@ -8,9 +8,10 @@
 ## 1. 基线与判分口径
 
 - 判分：`mem-eval/harness/score.mjs` 的 `scoreRecall`，kw 全中 = 1.0、部分 = 0.5、全不中 = 0。
-- 基线：综合题 **0.583（5/12，满分 5 题）**；召回 92 题 **0.989（91/92）**；平均返回 1321–1624 字符。
+- 基线（**快照 2026-10-28T20:50 · adapter HEAD `196da30`**）：综合题 **0.625（5 满分 / 5 半分 / 2 零分）**；召回 92 题 **0.989（91/92）**；平均返回 1321–1624 字符。
+- 上文与各轮次表格里的 **0.583 是 19:24 旧快照**（4 满分 / 6 半分 / 2 零分）。两者的差别只有 S03（0.5 → 1），来自工作树里 `src/index.mjs` / `src/judge.mjs` 的改动。**引用时请标快照**，不要混用。
 - 天花板参考：t21 一度报 0.792，后自行推翻——那是实验脚本没受 `limit=16` 与章级聚合约束、
-  在 2000 字里装 40 段拿到的「多给内容」，接进真实路径后仍是 0.583。
+  在 2000 字里装 40 段拿到的「多给内容」，接进真实路径后仍是 0.583（现基线 0.625）。
 
 ## 2. 五轮尝试与各自的否定结论
 
@@ -82,4 +83,27 @@
 >
 > 历史临时脚本位于 `D:\cursor项目组\4\.t8\t2*.mjs`，那是**工作目录、可随时删除**，不作为证据来源引用。
 >
-> 状态说明：脚本目前只产出控制台输出，尚未生成 `results/memjudge-turns3.json` 这类正式结果文件（t31 负责 harness 正式化，字段应含 `turns / llmCalls / promptTokens / completionTokens`）。在产物落地前，0.708 只能作为**待复核引用**，不得单独用作验收依据。
+> 状态说明（t31 已更新）：正式 harness 已落地并纳入版本控制 ——
+> **`memjudge-plugin/reports/run-turns.mjs`**（t31，新增文件；`mem-eval/harness/` 下有一份同内容副本，但 `mem-eval/` 不是 git 仓库，证据链以本仓库这份为准）。
+>
+> ```bash
+> cd memjudge-plugin
+> set -a && . ./.env.local && set +a
+> node reports/run-turns.mjs ../memjudge-plugin/adapters/memjudge.mjs --turns 1 --recall   # 回归：0.625 + 召回 0.989
+> node reports/run-turns.mjs ../memjudge-plugin/adapters/memjudge.mjs --turns 3             # 多轮口径
+> node reports/run-turns.mjs ../memjudge-plugin/adapters/memjudge.mjs --turns 3 --dry-run   # CI：不调 LLM，等价单轮
+> ```
+>
+> **t31 实测**（快照 2026-10-28T20:50 · adapter HEAD `196da30`）：
+> - `--turns 1` → synth **0.625**，与 `run-one.mjs` 现跑**逐题完全一致**（S01:0 S02:1 S03:1 S04:0.5 S05:1 S06:0.5 S07:0.5 S08:0.5 S09:1 S10:0 S11:1 S12:0.5），证明脚本无偏差。
+> - `--turns 1 --recall` → 召回 **91/92 = 0.989**（miss R20）。
+> - `--turns 3` → synth **0.667**（5 满分 / 6 半分 / 1 零分），轮数 `{1:9, 2:1, 3:2}`；成本 15 次 LLM 调用、prompt 23570 tok、completion 1909 tok、42.4s → **1.25 次/题、1964 tok/题**。
+> - `--turns 3 --dry-run` → **0.625**（= 单轮），LLM 0 次调用。
+>
+> **重要修正**：t28 报的 +0.125（0.583 → 0.708）在新基线上缩到 **+0.042**（0.625 → 0.667）。基线越强，多轮 query 的边际收益越小。因此 `--turns 3` **不作为 C 方案的验收依据** —— 它和 `outline` 是不同机制：
+> - `--turns 3` 是「换关键词再搜」，仍走同一条 BM25，问句侧变不出答案段的专有内容；
+> - `--mode outline` 是「先看全库目录再按 id 精读」，若成功，ch2/ch6 的 descriptor **第 1 轮就在目录里**，而不是「从没进过候选」。
+>
+> 判据因此可以写死：`--turns 3` 失败时答案段**从未进入任何一轮候选**；`--mode outline` 成功时它**在第 1 轮的目录里**。这两者的区别就是「检索不到」与「看得到但没读」。
+
+> 实现约束（t31 踩过，写进脚本注释）：**评测脚本不许对 adapter 返回做二次裁剪**。`adapter.query` 的返回本来就紧贴 2000 字，再 `slice(0, 2000)` 会切掉末尾那句，S03 当场从 1 掉到 0.5。预算由 adapter 自己守，脚本只记录 `overBudgetRounds`。
