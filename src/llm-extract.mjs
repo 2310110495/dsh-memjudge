@@ -1,4 +1,4 @@
-// LLM 提取层（SiliconFlow，OpenAI 兼容）。
+// LLM 提取层（OpenAI 兼容端点，端点/模型由 llm-client 统一解析）。
 //
 // 分工：规则层（extract.mjs）保证「不依赖网络也能跑、43ms 启动重建」；
 // 这一层在 key 可用时补语义三元组，失败一律静默降级，调用方不需要 try/catch。
@@ -9,12 +9,11 @@
 //   3. 缓存按 text 的 sha256 去重，同一段文本永不重复调用（文本改了 hash 就变）。
 
 import { llmKey } from './config.mjs';
+import { chat, resolveModel } from './llm-client.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const ENDPOINT = 'https://api.siliconflow.cn/v1/chat/completions';
-const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 const VTYPE_ALLOWED = new Set(['number', 'date', 'time', 'percent', 'id', 'coord', 'enum', 'text']);
 const TIMEOUT_MS = 150_000;
 const BATCH_SIZE = 2;     // 一次 2 条：批越大单次生成越久，实测 4 条会在 45s 超时被 abort
@@ -134,31 +133,20 @@ export function groundFilter(triples, text) {
 }
 
 async function callOnce(texts, apiKey) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: buildUserPrompt(texts) },
-        ],
-      }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`http ${res.status}`);
-    const json = await res.json();
-    const content = json?.choices?.[0]?.message?.content;
-    const parsed = parsePayload(content);
-    if (!parsed) throw new Error('unparsable payload');
-    return parsed;
-  } finally {
-    clearTimeout(timer);
-  }
+  // 超时、abort、HTTP 非 2xx 都由 llm-client 抛成错误：外层 extractBatch 原有两次尝试
+  // 的重试语义不变，错误也不会被吞成「成功但空结果」。
+  const json = await chat({
+    model: resolveModel(),
+    temperature: 0,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: buildUserPrompt(texts) },
+    ],
+  }, { timeoutMs: TIMEOUT_MS, apiKey });
+  const content = json?.choices?.[0]?.message?.content;
+  const parsed = parsePayload(content);
+  if (!parsed) throw new Error('unparsable payload');
+  return parsed;
 }
 
 /**

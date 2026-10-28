@@ -14,8 +14,10 @@
 //   3. 查询扩展是**查询时**算的，不落盘、不进索引，库体预算不受影响。
 
 import { llmKey } from './config.mjs';
+import { chat, resolveModel } from './llm-client.mjs';
 
-const ENDPOINT = 'https://api.siliconflow.cn/v1/chat/completions';
+// 端点不在这里定义：由 llm-client 从 config 的 baseUrl 拼，面板改了就跟着改。
+// MODEL 常量只作 QE_DEFAULTS 的历史兜底值；实际请求模型取 chatModel()（见 resolveModel）。
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 
 export const QE_DEFAULTS = Object.freeze({
@@ -105,6 +107,9 @@ export async function expand(query, opts = {}) {
   if (!Number.isFinite(o.timeoutMs) || o.timeoutMs <= 0) o.timeoutMs = QE_DEFAULTS.timeoutMs;
   if (!Number.isInteger(o.maxQueries) || o.maxQueries < 2) o.maxQueries = QE_DEFAULTS.maxQueries;
   if (!Number.isFinite(o.cacheTtlMs)) o.cacheTtlMs = QE_DEFAULTS.cacheTtlMs;
+  // 模型跟着面板配置走：只有调用方**显式**传 opts.model 时才覆盖 chatModel()。
+  // 读 opts.model 而不是 o.model —— 后者已被 QE_DEFAULTS.model 填成常量。
+  o.model = resolveModel(opts.model);
   const q = String(query ?? '').trim();
   const fallback = {
     queries: q ? [q] : [],
@@ -129,30 +134,19 @@ export async function expand(query, opts = {}) {
   const fetchImpl = typeof o.fetchImpl === 'function' ? o.fetchImpl : globalThis.fetch;
   if (typeof fetchImpl !== 'function') return { ...fallback, degraded: 'no-key', queries: [q] };
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), Math.max(1, o.timeoutMs));
   const t0 = Date.now();
   qeStats.calls += 1;
   try {
-    const res = await fetchImpl(ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${llmKey()}` },
-      body: JSON.stringify({
-        model: o.model,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: buildUserPrompt(q) },
-        ],
-      }),
-      signal: ctrl.signal,
-    });
-    if (!res || !res.ok) {
-      qeStats.failures += 1;
-      qeStats.degraded += 1;
-      return { ...fallback, degraded: 'http', queries: [q], ms: Date.now() - t0 };
-    }
-    const json = await res.json();
+    // 超时由 llm-client 用 o.timeoutMs 建 AbortController；非 2xx 抛 ChatHttpError，
+    // 落到下面的 catch 分支仍是 degraded:'http'，对外语义不变。
+    const json = await chat({
+      model: o.model,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: buildUserPrompt(q) },
+      ],
+    }, { timeoutMs: o.timeoutMs, fetchImpl });
     const sub = parseQueries(json?.choices?.[0]?.message?.content);
     const ms = Date.now() - t0;
     qeStats.ms += ms;
@@ -182,8 +176,6 @@ export async function expand(query, opts = {}) {
     qeStats.lastError = String(err?.message || err);
     const timedOut = /abort|AbortError/i.test(String(err?.name || err?.message || err));
     return { ...fallback, degraded: timedOut ? 'timeout' : 'http', queries: [q], ms };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

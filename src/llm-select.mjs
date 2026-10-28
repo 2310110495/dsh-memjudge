@@ -10,8 +10,10 @@
 // 静默降级会让整轮实验测的都是降级版本而没人知道。
 
 import { llmKey } from './config.mjs';
+import { chat, resolveModel } from './llm-client.mjs';
 
-const ENDPOINT = 'https://api.siliconflow.cn/v1/chat/completions';
+// 端点不在这里定义：由 llm-client 从 config 的 baseUrl 拼，面板改了就跟着改。
+// MODEL 常量只作 LS_DEFAULTS 的历史兜底值；实际请求模型取 chatModel()（见 resolveModel）。
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 
 export const LS_DEFAULTS = Object.freeze({
@@ -129,6 +131,9 @@ export async function select(query, candidates, opts = {}) {
   // 这次是第二次：{...defaults, ...opts} 会把显式 undefined 抄进来，必须逐字段判有限值。
   if (!Number.isFinite(o.snippetChars) || o.snippetChars < 40) o.snippetChars = LS_DEFAULTS.snippetChars;
   if (!Number.isInteger(o.poolSize) || o.poolSize < 1) o.poolSize = LS_DEFAULTS.poolSize;
+  // 模型跟着面板配置走：只有调用方**显式**传 opts.model 时才覆盖 chatModel()。
+  // 注意读的是 opts.model 而不是 o.model —— 后者已被 LS_DEFAULTS.model 填成常量。
+  o.model = resolveModel(opts.model);
 
   const q = String(query ?? '').trim();
   const list = (Array.isArray(candidates) ? candidates : []).map((c) => String(c ?? ''));
@@ -149,26 +154,16 @@ export async function select(query, candidates, opts = {}) {
   const fetchImpl = typeof o.fetchImpl === 'function' ? o.fetchImpl : globalThis.fetch;
   if (typeof fetchImpl !== 'function') return base;
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), o.timeoutMs);
   const t0 = Date.now();
   lsStats.calls += 1;
   try {
-    const res = await fetchImpl(ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${llmKey()}` },
-      body: JSON.stringify({
-        model: o.model,
-        temperature: 0,
-        messages: [{ role: 'user', content: buildPrompt(q, snippets, o.maxPicks) }],
-      }),
-      signal: ctrl.signal,
-    });
-    if (!res || !res.ok) {
-      lsStats.failures += 1;
-      return { ...base, degraded: 'http', ms: Date.now() - t0 };
-    }
-    const json = await res.json();
+    // 超时由 llm-client 用 o.timeoutMs 建 AbortController；非 2xx 抛 ChatHttpError，
+    // 落到下面的 catch 分支仍是 degraded:'http'，对外语义不变。
+    const json = await chat({
+      model: o.model,
+      temperature: 0,
+      messages: [{ role: 'user', content: buildPrompt(q, snippets, o.maxPicks) }],
+    }, { timeoutMs: o.timeoutMs, fetchImpl });
     const content = json?.choices?.[0]?.message?.content;
     const picks = parsePicks(content, snippets.length);
     const ms = Date.now() - t0;
@@ -194,8 +189,6 @@ export async function select(query, candidates, opts = {}) {
     lsStats.lastError = String(err?.message || err);
     const timedOut = /abort/i.test(String(err?.name || err?.message || err));
     return { ...base, degraded: timedOut ? 'timeout' : 'http', ms };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
