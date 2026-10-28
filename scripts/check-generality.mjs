@@ -19,7 +19,21 @@ import { chapters, recall, synthesis } from '../../mem-eval/corpus/quiz.mjs';
 const store = buildStore(chapters.map((c) => ({ n: c.n, text: c.text })));
 const body = chapters.map((c) => c.text).join('\n');
 // t15：属性缺席判据要的是 L1 的 (entity, attr) 集合，不是旧的滑窗 facts。
-const l1Facts = chapters.flatMap((c) => extractL1(c.text, { ch: c.n }));
+// --llm：改用 LLM 层（读 .llm-cache.json，命中就不发请求），用于对照「LLM 层默认开还是关」。
+const USE_LLM = process.argv.includes('--llm');
+let l1Facts;
+if (USE_LLM) {
+  const { extractL1Hybrid } = await import('../src/extract.mjs');
+  const { createCache, llmStats } = await import('../src/llm-extract.mjs');
+  const r = await extractL1Hybrid(chapters.map((c) => ({ text: c.text, chapter: c.n })), {
+    cache: createCache('.llm-cache.json'),
+  });
+  l1Facts = r.facts;
+  console.log(`[LLM 层] 来源=${r.source} 三元组=${l1Facts.length} 缓存命中=${llmStats.cacheHits} 调用=${llmStats.calls}`);
+} else {
+  l1Facts = chapters.flatMap((c) => extractL1(c.text, { ch: c.n }));
+  console.log(`[规则层] 三元组=${l1Facts.length}`);
+}
 
 // 括号内是语料中的 grep 计数，0 表示这个名字/属性从没出现过。
 const ABSENT_CASES = [
@@ -71,7 +85,7 @@ for (const [tag, q] of ABSENT_CASES) {
   if (hard) denied += 1;
   else {
     const gap = knownGap(q);
-    if (gap) gapCount += 1;
+    if (gap) { gapCount += 1; console.log(`  [C 组缺口] ${q}（短语「${gap}」整串不在正文，但 gate 判 ${g.reason} cov=${g.coverage ?? '-'}）`); }
     else misses.push(`${tag} → ${q}（${g.reason} cov=${g.coverage ?? '-'}）`);
   }
 }

@@ -401,7 +401,7 @@ function hitBy(pool, pq, p) {
  */
 // 属性短语：「的 X」优先（「白鲸号的舵机型号是多少」→ 舵机型号），否则退回 primary。
 // 同义词只按「物理量名」归并，不登记任何题面，避免变成题库白名单。
-const ATTR_PHRASE_RE = /的([\u4e00-\u9fff]{2,6}?)(?=是|有|为|多少|什么|哪|几|怎么|如何|叫|称为|称作|$|[?？])/;
+const ATTR_PHRASE_RE = /的([\u4e00-\u9fff]{2,6}?)(?=是|有|为|多少|什么|哪|几|怎么|如何|叫|称为|称作|到底|究竟|具体|准确|实际上|一般|$|[?？])/;
 const ATTR_SYNONYM = [
   ['直径', '口径', '粗细', '外径'],
   ['容量', '容积', '装载量'],
@@ -419,29 +419,66 @@ function canonAttr(s) {
   }
   return t;
 }
-const ATTR_SUFFIX_WORDS = ['总额', '清单', '编号', '代号', '型号', '容量', '压力', '直径', '口径', '日期', '时间', '数量', '金额', '费用', '长度', '宽度', '高度', '深度', '重量', '功率', '速度', '航速', '吨位', '页码', '项数'];
+const ATTR_SUFFIX_WORDS = ['总额', '清单', '编号', '代号', '型号', '容量', '压力', '直径', '口径', '日期', '时间', '数量', '金额', '费用', '长度', '宽度', '高度', '深度', '重量', '功率', '速度', '航速', '吨位', '页码', '项数',
+  // 度量/状态类：ATTR_SUFFIX 里有的都要能剥，否则「一小时流量」的 core 会变成整串
+  // 而误判为「材料里没有」（R52）。
+  '流量', '盐度', '浓度', '含量', '气压', '湿度', '角度', '距离', '续航', '电压', '比重', '温度', '页数', '人数', '件数', '海拔', '吃水', '载重'];
 // 「修理费总额」的核心是「修理费」：材料里有「修理费」就说明这个属性存在，
 // 只是问句把量名后缀加长了。C 组「舵机型号」的核心「舵机」在材料里没有，仍然要拒。
 function attrCore(key) {
-  for (const suf of ATTR_SUFFIX_WORDS) if (key.endsWith(suf) && key.length > suf.length) return key.slice(0, -suf.length);
-  return key;
+  let k = String(key);
+  for (const suf of ATTR_SUFFIX_WORDS) {
+    if (k.endsWith(suf) && k.length > suf.length) { k = k.slice(0, -suf.length); break; }
+  }
+  // 剥掉动词性前缀（「化验含盐度」→「含」）：动词不承担「这个属性是否存在」的证据。
+  return k.replace(/^(化验|检测|测量|计算|记录|查看|查阅|读取|实测|目测|取样)/u, '');
 }
 const ANSWER_TYPE_ONLY = /^(名字|名称|型号|编号|日期|时间|数量|金额|费用|长度|宽度|高度|深度|重量|吨位)$/;
+// 语气/冗余修饰词：只剥语气，不碰实体名与属性核心词。「深度到底」→「深度」。
+const TONE_HEAD = /^(?:到底|究竟|具体|准确|实际上|实际|其实|一般来说|一般|到底儿)/u;
+const TONE_TAIL = /(?:到底|究竟|具体|准确|实际上|实际|其实|一般来说|一般)$/u;
 function cleanPhrase(s) {
-  return String(s)
-    .replace(/(一共|共计|总计|合计|不超过|超过|大约|约|时|共)$/u, '')
-    .replace(/^[时当近约共合总]/u, '');
+  let t = String(s).replace(/[\s\u3000]+/g, '');
+  // 量词尾巴与语气尾巴可能叠加（「深度到底是多少」→「深度到底」），多剥一轮
+  for (let i = 0; i < 2; i += 1) {
+    const before = t;
+    t = t.replace(/(一共|共计|总计|合计|不超过|超过|大约|约|时|共)$/u, '');
+    t = t.replace(TONE_TAIL, '');
+    if (t === before) break;
+  }
+  t = t.replace(TONE_HEAD, '');
+  return t;
 }
 function attrPhraseOf(query, pq) {
-  const m = String(query).match(ATTR_PHRASE_RE);
-  const raw = m && [...m[1]].length >= 2 ? m[1] : (pq?.primary || '');
+  const q = String(query).replace(/[？?。！!，,、；;：:]/g, '');
+  const m = q.match(ATTR_PHRASE_RE);
+  let raw = m && [...m[1]].length >= 2 ? m[1] : (pq?.primary || '');
+  // 无「的」的问法（「舵机型号具体是什么」）：parseQuery 的 primary 只剩「舵机」，
+  // 丢了名词后缀。这里从问句尾部取完整名词串，但只在它以名词后缀收尾时采用，
+  // 否则回退 primary——避免把「每卷钢卷重」这类块当成属性。
+  if (!m) {
+    // 去尾疑问部分（含「多长时间」「什么时间」这类时间问法），再剥语气词
+    let head = q.replace(/(到底|究竟|具体|准确|实际上|一般)?(是多少|是什么|有多大|多大|多长|多重|多粗|多高|多深|是几|几米|几厘米|几吨|多长时间|什么时间|多少时间|多少|什么|哪一?个?|如何|怎么|什么样?)$/u, '');
+    head = cleanPhrase(head);
+    // 只取「名词性修饰语 + 名词后缀」的尾巴，且修饰语里不许有动词/虚词：
+    // 「检验员说机舱温度」取「机舱温度」，「触损发生在」不取。
+    const tail = head.match(/([\u4e00-\u9fff]{2,4})(编号|代号|型号|呼号|名称|名字|日期|时间|深度|长度|宽度|高度|厚度|半径|面积|体积|重量|吨位|人数|页数|数量|件数|金额|费用|费率|流量|速度|温度|气压|湿度|角度|距离|续航|功率|电压|比重|含量|浓度|盐度|压力|工期|时限|期限|吃水|载重|航速|航次|容量|排量|定额|标准)$/u);
+    if (tail && !/(发生在|说|开了|是|的|了|过|由|在|把|被)/u.test(tail[1])) raw = `${tail[1]}${tail[2]}`;
+  }
   const cand = cleanPhrase(raw);
+  // 语气词被切剩一个尾字（「功率底」来自「到底」、「型号具」来自「具体」）：
+  // 按问句里出现过的语气词定向剥掉，不做通用单字剥离（「船底」是真名词）。
+  let trimmed = cand;
+  if (/到底/u.test(String(query))) trimmed = trimmed.replace(/底$/u, '');
+  if (/究竟/u.test(String(query))) trimmed = trimmed.replace(/竟$/u, '');
+  if (/具体/u.test(String(query))) trimmed = trimmed.replace(/体$/u, '');
+  const final = trimmed.length >= 2 ? trimmed : cand;
   // 短语里混进动词/量词（「未上船」「那批」）说明抽错了，宁可不判也不误伤。
-  if (/(未|没|导致|一批|那批|上船|下船|超过|不超过)/.test(cand)) return '';
+  if (/(未|没|导致|一批|那批|上船|下船|超过|不超过)/.test(final)) return '';
   // 「叫什么名字」问的是名字这个词本身，属性缺席判据对它没有信息量；
   // 只放行这种纯答案类型词，复合短语（「舵机型号」）仍然要判。
-  if (ANSWER_TYPE_ONLY.test(cand)) return '';
-  return [...cand].length >= 2 ? cand : '';
+  if (ANSWER_TYPE_ONLY.test(final)) return '';
+  return [...final].length >= 2 ? final : '';
 }
 
 export function gate(query, target, opts = {}) {
@@ -548,20 +585,38 @@ export function gate(query, target, opts = {}) {
       const m = String(query).match(/([\u4e00-\u9fff]{2,6})的[\u4e00-\u9fff]{2,6}?(?:是|有|为|多少|什么|哪|几|叫)/);
       if (m && fullText.includes(norm(m[1]))) subject = m[1];
     }
+    // 省略主语的问法不做兜底推断：主体靠「X 的 Y」或 facts 主语取，取不到就只走
+    // 名词后缀那一支（见下 canJudge），避免把「钢卷重」「部件」这类碎片判成缺席。
     const phrase = attrPhraseOf(query, pq);
-    if (subject && phrase) {
+    if (phrase) {
       const key = canonAttr(phrase);
       const core = attrCore(key);
       // 属性存在性看全库，不只看该实体的槽：材料里任何实体记过「修理费」，
       // 就说明这个属性在这份材料里不是缺席的（主体归属问题不在这里判）。
-      const own = opts.l1Facts.filter((f) => f.entity === subject);
+      const own = subject ? opts.l1Facts.filter((f) => f.entity === subject) : [];
       const has = opts.l1Facts.some((f) => {
         const a = canonAttr(f.attr);
-        return a === key || a.includes(key) || key.includes(a)
-          || (core.length >= 2 && (a.includes(core) || core.includes(a)));
+        // 只认「属性名包含问句属性」或「两边共享核心词」，不再认「问句属性包含属性名」：
+        // 后者会让「舵机型号」被已有的「型号」吞掉，C 组硬拒直接漏一条。
+        return a === key || a.includes(key) || (core.length >= 2 && a.includes(core));
       });
-      const inText = glueAll.includes(norm(phrase));
-      if ((own.length > 0 || fullText.includes(norm(subject))) && !has && !inText) {
+      // 与 glueAll 同源归一化：glueAll 是 gateTextDocument 产物（会剥「据/于/在」等），
+      // 用裸 norm 比对会漏（「证据清单」被剥成「证清单」，R86 因此被误判缺席）。
+      const bare = gateTextDocument(phrase);
+      const inText = bare.length >= 2 && (glueAll.includes(bare)
+        || (bare.length > 3 && glueAll.includes(bare.replace(/[一两几]$/u, ''))));
+      // 主语必须有据；省略主语的问法要额外满足两条才算缺席：
+      //   ① 短语以名词后缀收尾（「锚机功率」「舵机型号」），
+      //   ② 它的核心修饰语（剥掉后缀）整串在全文也没出现——否则像 R52「一小时流量」
+      //      这种「材料里有、只是没抽成 attr」的题会被误伤。
+      const NOUN_TAIL = new RegExp(ATTR_SUFFIX);
+      const subjectKnown = subject ? (own.length > 0 || fullText.includes(norm(subject))) : false;
+      const weak = NOUN_TAIL.test(key) && key.length >= 3 && core.length >= 2 && !glueAll.includes(core);
+      // 共同门槛：核心修饰语（剥掉后缀的部分）整串不在全文。R52「一小时流量」的
+      // core 是「一小时」，全文里有——说明材料只是没抽成 attr，不该判缺席。
+      const coreMissing = core.length >= 2 && !glueAll.includes(core);
+      const canJudge = (subjectKnown || weak) && coreMissing;
+      if (canJudge && !has && !inText) {
         return {
           deny: true,
           reason: 'attribute-not-recorded',
@@ -569,7 +624,9 @@ export function gate(query, target, opts = {}) {
           attribute: phrase,
           // 文案要复述完整问法：H1 的属性 key 是拉丁串「imo」，只回拉丁串会让
           // SPEC §2.6 的 absent 整串（「IMO 编号」）落空，拒答被判成没拒。
-          detail: `「${subject}」有记载，但材料里没有「${attrPhrase(query, phrase) || phrase}」这一项`,
+          detail: subject
+            ? `「${subject}」有记载，但材料里没有「${attrPhrase(query, phrase) || phrase}」这一项`
+            : `材料里没有「${attrPhrase(query, phrase) || phrase}」这一项`,
         };
       }
     }
