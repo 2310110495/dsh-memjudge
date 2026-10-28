@@ -17,7 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { tokenize, terms, recencyFactor, finalScore, SEARCH_DEFAULTS } from '../src/search.mjs';
+import { tokenize, terms, recencyFactor, finalScore, SEARCH_DEFAULTS, jiebaActive } from '../src/search.mjs';
 
 const DAY = 86_400_000;
 
@@ -29,13 +29,27 @@ test('分词器：NFKC 全角英数归一到半角', () => {
   assert.ok(tokens.includes('指标'));
 });
 
-test('分词器：CJK 相邻 bigram（汉字+假名同一条 run）', () => {
-  const { tokens } = tokenize('白鲸号');
-  assert.deepEqual(tokens, ['白鲸', '鲸号']);
-  // 假名走同一 CJK 路径：タワー 是 3 个 code point → 2 个 bigram
+// t12 后：含汉字的 run 走 jieba cutForSearch（有 jieba 时），纯假名仍二元组。
+// 断言拆成「路径相关」与「路径无关」两半，避免测试绑死在某个依赖是否装上。
+test('分词器：CJK 词边界（jieba 词典路径，验收硬要求）', (t) => {
+  if (!jiebaActive()) return t.skip('jieba 未启用，本用例走 fallback 分支的姊妹用例');
+  // 验收原文：必须是 凹陷/深度，不是 凹陷/陷深/深度
+  assert.deepEqual(terms('凹陷深度'), ['凹陷', '深度']);
+  // cutForSearch 会同时给整词与子词；子词被抑制后整词保留
+  assert.ok(terms('北京烤鸭').includes('北京烤鸭'), '整词必须保留');
+  assert.ok(!terms('凹陷深度').includes('陷深'), '不得出现跨词二元组');
+});
+
+test('分词器：二元组兜底（无 jieba 时的确定性契约）', (t) => {
+  if (jiebaActive()) return t.skip('jieba 可用，本用例在 MEMJUDGE_NO_JIEBA=1 下生效');
+  assert.deepEqual(terms('凹陷深度'), ['凹陷', '陷深', '深度']);
+});
+
+test('分词器：假名走二元组、单字仍进索引（两条路径一致）', () => {
+  // タワー = 3 个 code point → 2 个 bigram，与 jieba 是否可用无关
   assert.deepEqual(terms('タワー'), ['タワ', 'ワー']);
-  // 汉字-假名交界不断 run（"行く" 整体成词）
-  assert.deepEqual(terms('行く'), ['行く']);
+  // 单字 token 仍进索引（打分乘 singleCharDiscount，强命中另由 strong 闸门管）
+  assert.ok(terms('鲸').includes('鲸'));
 });
 
 test('分词器：拉丁整词 + 小写化，跨语言字母不切半', () => {

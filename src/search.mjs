@@ -34,13 +34,28 @@
 //      （normalizeEn 只动纯字母词），写入侧与检索侧走同一函数，命中一致性不破。
 //   c. 默认衰减走 schema 双档（warm/cold），只有显式传 halfLifeDays 数值才是 RestRegular
 //      的统一半衰期。两条路径的乘性因子同源（0.5+0.5·imp / 1+0.1·ln(1+acc) / 0.3 罚）。
+//
+// t12 升级（来源：TencentDB-Agent-Memory src/core/store/sqlite.ts:156-280）：
+//   CJK 切分由「相邻二元组」换成 jieba 搜索引擎模式 cutForSearch(text, true)。
+//   抄三件：懒加载单例 + require 失败置 null 永不重试（:166-178）、搜索模式而非精确模式
+//   （cutForSearch 同时产出整词与子词，「北京烤鸭」→ 北京/烤鸭/北京烤鸭，长词不会被切丢）、
+//   ZH_STOP_WORDS 小停用词表（:184-189）。不抄它的 FTS5 引号 OR 拼装——memjudge 自带倒排与 BM25。
+//   为什么换：二元组把「凹陷深度」切成 凹陷/陷深/深度，凭空造出「陷深」这个不存在的词，
+//   IDF 被噪声摊薄；jieba 只给 凹陷/深度。
+//   @node-rs/jieba 在 optionalDependencies 里，装不上（离线/无预编译包）自动退回二元组，
+//   两条路径都通、结果都在同一处（tokenize）。强制降级：MEMJUDGE_NO_JIEBA=1。
+//   保留不变：Latin 整词 + 小写化 + 英语停用词 + Porter 词干（meow 那套），只换 CJK 切分。
+//   Latin/假名边界仍由 run 扫描决定，只把含汉字的 run 交给 jieba（纯假名交给 jieba 会被
+//   中文词典切碎，仍走二元组）。
 
+import { createRequire } from 'node:module';
 import { rankWeight, decayFactor, DECAY } from './schema.mjs';
 
 export const SEARCH_DEFAULTS = Object.freeze({
   k1: 1.5, // BM25 词频饱和参数（与 mem-eval worker 的 buildBM25Index 同值）
   b: 0.75, // 长度归一化强度。1=完全归一，0=不归一；段级语料取 0.75 让长段不吃亏
   singleCharDiscount: 0.35, // 单汉字 token 的分数折扣（只降权，不禁止）
+  subwordDiscount: 0.35, // jieba 子词的分数折扣（「轮机」之于「轮机长」：同一处证据，不重复计满权）
   decayFloor: 0, // 0 = 严格按衰减公式（能力 12 要求 30 天 ≤0.25）；>0 会放宽旧条目
   halfLifeDays: null, // null = 用 schema 双档（warm 120 / cold 12）；数值 = 统一覆盖（RestRegular 风格）
   topChapters: 2, // 章级聚合取前几章（实测：1→0.946，2→0.989，3→0.978）
@@ -56,11 +71,52 @@ const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ー々]/u;
 // 字母/数字类：é ü ñ、西里尔、希腊、谚文、全角英数（NFKC 后）……一切语言的字母数字
 const WORD = /[\p{L}\p{N}]/u;
 
-/** 单字符分类：CJK → bigram 路径；字母/数字 → 整词路径；其余（标点/符号/emoji）→ 丢弃。 */
+/** 单字符分类：CJK → 词切分路径；字母/数字 → 整词路径；其余（标点/符号/emoji）→ 丢弃。 */
 function classify(cp) {
   if (CJK.test(cp)) return 'cjk';
   if (WORD.test(cp)) return 'word';
   return 'skip';
+}
+
+// ── jieba（腾讯 MemoryCore 抄来的懒加载单例） ──────────────────────────────
+// 语义照抄 sqlite.ts:166-178：undefined = 还没试过；null = 试过且不可用，**永不重试**。
+// 后者是关键——依赖没装时每次 tokenize 都去 require 一次会把 3 万字的索引构建拖成灾难。
+const nodeRequire = createRequire(import.meta.url);
+
+/** 腾讯 :184-189 原表，只保留高频功能词。 */
+const ZH_STOP_WORDS = new Set([
+  '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
+  '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着',
+  '没有', '看', '好', '自己', '这', '他', '她', '它', '们', '那',
+  '吗', '吧', '呢', '啊', '呀', '哦', '嗯',
+]);
+
+/** 只对含汉字的 run 用 jieba；纯假名（タワー/ひらがな）走二元组，中文词典切不好它们。 */
+const HAN = /[\p{Script=Han}]/u;
+
+let _jieba; // undefined = 未尝试 | null = 不可用 | 对象 = 可用
+
+/** 取 jieba 单例；不可用返回 null（调用方据此退回二元组）。 */
+function getJieba() {
+  if (_jieba !== undefined) return _jieba;
+  if (process.env.MEMJUDGE_NO_JIEBA === '1') {
+    _jieba = null; // 显式降级（模拟 optionalDependency 未装 / 离线）
+    return _jieba;
+  }
+  try {
+    const { Jieba } = nodeRequire('@node-rs/jieba');
+    const { dict } = nodeRequire('@node-rs/jieba/dict');
+    const inst = Jieba.withDict(dict);
+    _jieba = typeof inst?.cutForSearch === 'function' ? inst : null;
+  } catch {
+    _jieba = null; // 装不上就永久走二元组，不重试
+  }
+  return _jieba;
+}
+
+/** 供测试/诊断：读当前是否真的用上了 jieba（不改状态）。 */
+export function jiebaActive() {
+  return getJieba() !== null;
 }
 
 // 英语停用词（含撇号切分碎片 s/t/d/ll/ve/re/m）。功能词不承载检索意义。
@@ -174,9 +230,11 @@ function normalizeEn(tokens) {
 }
 
 /**
- * 分词（meow 类别路由 + en 归一化）：
- * - CJK 类（汉字+假名）：连续段相邻 bigram——中文稳定零依赖，日文 n-gram 基线；
- *   run<2 单字不成词丢弃防噪音；汉字-假名交界不断 run，"行く/食べる"自然成词；
+ * 分词（meow 类别路由 + jieba CJK 切分 + en 归一化）：
+ * - CJK 类（汉字+假名）：
+ *     · 含汉字的 run 且 jieba 可用 → cutForSearch(run, true) 搜索引擎模式，
+ *       整词与子词同时产出（「北京烤鸭」→ 北京/烤鸭/北京烤鸭），滤标点/中文停用词/本 run 内重复；
+ *     · jieba 不可用、或纯假名 run、或切完为空 → 相邻二元组（零依赖兜底，run<2 保留单字）；
  * - 字母/数字类（\p{L}\p{N}）：连续段整词 + 小写化（café/привет/한국어/全角英数…）；
  * - 其余（标点/空白/符号/emoji）：跳过——信息量为零，不污染 IDF。
  * 文本先 NFKC 归一化（全角ＢＭ２５→bm25、半角片假名→全角）；Array.from 按 code point
@@ -184,7 +242,7 @@ function normalizeEn(tokens) {
  *
  * 返回三类结果，区分「进索引」与「算强命中」是两层：
  *   tokens —— 全部进索引的 token（含单汉字）
- *   strong —— 长度 ≥2 的 token（unicode bigram 或拉丁词），只有它们能单独支撑一条命中
+ *   strong —— 长度 ≥2 的 token（词或二元组或拉丁词），只有它们能单独支撑一条命中
  */
 export function tokenize(text) {
   const s = String(text ?? '');
@@ -198,11 +256,34 @@ export function tokenize(text) {
     while (j < cps.length && classify(cps[j]) === cls) j += 1;
     const run = cps.slice(i, j);
     if (cls === 'cjk') {
-      // 连续 CJK → 相邻 bigram（单字不成词，避免噪音）
-      if (run.length >= 2) {
-        for (let k = 0; k + 1 < run.length; k += 1) raw.push(run[k] + run[k + 1]);
-      } else {
-        raw.push(run[0]); // 单字保留（memjudge 需要单字 token 进索引，打分时降权）
+      const runText = run.join('');
+      const jb = HAN.test(runText) ? getJieba() : null;
+      let emitted = 0;
+      if (jb) {
+        const seen = new Set();
+        const picked = [];
+        for (const t of jb.cutForSearch(runText, true)) {
+          const w = String(t).trim();
+          if (!w || !WORD.test(w) || ZH_STOP_WORDS.has(w) || seen.has(w)) continue;
+          seen.add(w);
+          picked.push(w);
+        }
+        // 子词不再删除，只登记到 tokenize 的 weak 集合由打分侧折扣。
+        // 腾讯那边用 FTS5 的 OR 串，重复词不重复计分，所以它不用管；
+        // memjudge 带 tf 权重，必须把「轮机/机长/轮机长」的重复计分压下去，
+        // 但同一批子词对「硫含量/检验员机舱」这类问法是唯一的召回桥梁，不能删。
+        for (const w of picked) {
+          raw.push(w);
+          emitted += 1;
+        }
+      }
+      // 兜底：jieba 不可用 / 纯假名 / 切完被停用词滤空 → 二元组
+      if (emitted === 0) {
+        if (run.length >= 2) {
+          for (let k = 0; k + 1 < run.length; k += 1) raw.push(run[k] + run[k + 1]);
+        } else {
+          raw.push(run[0]); // 单字保留（memjudge 需要单字 token 进索引，打分时降权）
+        }
       }
     } else {
       raw.push(run.join('').toLowerCase());
@@ -212,7 +293,19 @@ export function tokenize(text) {
   // 英语归一化：停用词 + Porter 词干还原
   const tokens = normalizeEn(raw);
   const strong = tokens.filter((t) => t.length >= 2);
-  return { tokens, strong, hasStrong: strong.length > 0 };
+  // 子词归并表：子词 → 包含它的整词。cutForSearch 把「轮机长」同时吐成 轮机/机长/轮机长，
+  // 三者是同一处证据。全部照收会让 tf 变成三倍（同一句里出现两次 = 6），把只含子词的段落
+  // 顶到正确段之上（实测 R10 误命中 c16p11 得分 13.64）；全部删掉又会丢掉子词级召回
+  // （R12「硫含量」被整词盖住后 body 覆盖率从 0.56 掉到 0.33，被拒答门误杀）。
+  // 所以既不删也不重复计：整词在场时，子词的计数归并给它（由 add()/scoreTerms() 执行）。
+  const covers = new Map();
+  for (const a of tokens) {
+    if (a.length < 2) continue;
+    for (const b of tokens) {
+      if (b.length > a.length && b.includes(a)) { covers.set(a, b); break; }
+    }
+  }
+  return { tokens, strong, hasStrong: strong.length > 0, covers };
 }
 
 /** 便捷：只要 token 列表（索引构建用）。 */
@@ -313,9 +406,16 @@ class SearchIndex {
   add(mem) {
     const text = String(mem?.text ?? '');
     if (!text) return this;
-    const { tokens } = tokenize(text);
+    const { tokens, covers } = tokenize(text);
+    const tfAll = new Map();
+    for (const t of tokens) tfAll.set(t, (tfAll.get(t) ?? 0) + 1);
+    // 整词在场 → 子词计数归并（不重复计分）；整词缺席 → 子词照常保留自己的 tf。
     const tf = new Map();
-    for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
+    for (const [t, f] of tfAll) {
+      const whole = covers.get(t);
+      if (whole && tfAll.has(whole)) continue;
+      tf.set(t, f);
+    }
     const idx = this.docs.length;
     const nowMs = normNum(mem?.createdAt, Date.now());
     const doc = {
@@ -373,8 +473,13 @@ class SearchIndex {
    */
   scoreTerms(query, opts = {}) {
     const o = { ...this.opts, ...opts };
-    const { tokens, strong } = tokenize(query);
-    const qTerms = [...new Set(tokens)];
+    const { tokens, strong, covers: qCovers } = tokenize(query);
+    const qAll = new Set(tokens);
+    // 查询侧同样归并：整词已在，子词不再单独加一次分（否则一次提问被数三遍）。
+    const qTerms = [...qAll].filter((t) => {
+      const whole = qCovers.get(t);
+      return !(whole && qAll.has(whole));
+    });
     const strongSet = new Set(strong);
     const acc = new Map();
     let postingsVisited = 0;
@@ -484,6 +589,16 @@ class SearchIndex {
       for (const s of list) push(s);
     }
 
+    // 预算比最短候选段还小时，逐段整取会一个都装不下 —— 那等于「有命中却报零结果」，
+    // 下游看到的是 denied=true，比返回一段截断原文更糟。这里退回「最高分段的截断片段」，
+    // 并且只在整取结果为空时才触发，不影响正常预算下的装填。
+    if (!out.length && scored.length && o.maxChars > 0) {
+      const top = scored[0];
+      const cut = top.doc.text.slice(0, o.maxChars);
+      out.push({ ...top, doc: { ...top.doc, text: cut }, truncated: true });
+      chars = cut.length;
+    }
+
     const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
     const hits = out.map((s) => ({
       id: s.doc.id,
@@ -491,6 +606,7 @@ class SearchIndex {
       para: s.doc.para,
       text: s.doc.text,
       chars: s.doc.text.length,
+      truncated: Boolean(s.truncated),
       score: s.score,
       bm25: s.bm25,
       weight: s.weight,
@@ -529,11 +645,20 @@ export function search(idx, query, opts = {}) {
 /** 单条打分（不建索引，用于对照实验与单元断言）。 */
 export function score(queryText, docText, mem = {}, opts = {}) {
   const o = { ...SEARCH_DEFAULTS, ...opts };
-  const q = new Set(tokenize(queryText).tokens);
-  const strong = new Set(tokenize(queryText).strong);
-  const { tokens } = tokenize(docText);
+  const qt = tokenize(queryText);
+  const q = new Set(qt.tokens);
+  const strong = new Set(qt.strong);
+  const dt = tokenize(docText);
+  const { tokens, covers: docCovers } = dt;
+  const tfAll = new Map();
+  for (const t of tokens) tfAll.set(t, (tfAll.get(t) ?? 0) + 1);
+  // 与 add()/scoreTerms() 同一套子词归并：整词在场时子词不再重复计分。
   const tf = new Map();
-  for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
+  for (const [t, f] of tfAll) {
+    const whole = docCovers.get(t);
+    if (whole && tfAll.has(whole)) continue;
+    tf.set(t, f);
+  }
   let bm25 = 0;
   let strongHits = 0;
   for (const t of q) {
@@ -549,4 +674,4 @@ export function score(queryText, docText, mem = {}, opts = {}) {
 }
 
 export { SearchIndex };
-export default { SEARCH_DEFAULTS, tokenize, terms, index, search, score, finalScore, SearchIndex };
+export default { SEARCH_DEFAULTS, tokenize, terms, index, search, score, finalScore, SearchIndex, jiebaActive };

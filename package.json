@@ -13,6 +13,9 @@
     "./schema": "./src/schema.mjs",
     "./package.json": "./package.json"
   },
+  "optionalDependencies": {
+    "@node-rs/jieba": "^2.0.0"
+  },
   "files": [
     "src",
     "docs",
