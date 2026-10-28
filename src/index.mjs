@@ -23,6 +23,7 @@ import path from 'node:path';
 import { open as openStore } from './store.mjs';
 import { SearchIndex } from './search.mjs';
 import { gate, resolveConflict } from './judge.mjs';
+import { renderRecall, sleepPhase } from './layer.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
 export const name = 'memjudge';
@@ -222,6 +223,11 @@ export function apply(ctx, config) {
   /**
    * 固定注入块。只放索引（id + 首行 + 章号），不放全文。
    * 关闭时返回空串——dsh-system-prompt 会过滤空 section，最终 0 字符。
+   *
+   * 渲染走 layer.renderRecall（soul-md 同源）：只输出 descriptor 行
+   * `- "id" — 首行：来源`，正文一个字不进 prompt。预算按整行扣：装不下的行整条丢弃，
+   * 绝不截半行——半行 descriptor 对模型是噪声。layer 是被注入路径真正消费的模块，
+   * 不是可 import 的孤儿。
    */
   const renderInject = () => {
     if (!cfg.autoInject) return '';
@@ -236,16 +242,18 @@ export function apply(ctx, config) {
     }
 
     const total = store.stats().memories;
-    const head = `## memjudge 记忆索引（${rows.length}/${total} 条，按最近使用）\n`;
+    const head = `## memjudge 记忆索引（${rows.length}/${total} 条，按最近使用）`;
     const tail = '\n用 memjudge_recall 取全文，memjudge_conflicts 查前后矛盾。';
-    let body = '';
-    for (const row of rows) {
+    const topics = rows.map((row) => {
       const src = decodeSource(row.source);
-      const line = `- [${row.id}] ${oneLine(row.text, 90)}${src.chapter ? `（ch${src.chapter}）` : ''}\n`;
-      if (head.length + body.length + line.length + tail.length > cfg.injectBudget) break;
-      body += line;
-    }
-    injectCache = body ? (head + body + tail).slice(0, cfg.injectBudget) : '';
+      return {
+        key: row.id,
+        title: oneLine(row.text, 90),
+        summary: src.chapter ? `ch${src.chapter}` : '手动写入',
+      };
+    });
+    const body = renderRecall([{ heading: head, topics }], cfg.injectBudget - tail.length);
+    injectCache = body ? `${body}${tail}`.slice(0, cfg.injectBudget) : '';
     return injectCache;
   };
 
@@ -484,15 +492,19 @@ export function apply(ctx, config) {
       if (!ids.length) return { forgotten: [], count: 0, dryRun };
       if (dryRun) return { forgotten: ids, count: ids.length, dryRun: true };
 
-      // store 没有 delete：用 raw() 在同一事务里删 facts 与 memories。
+      // store 没有 delete：用 raw() 在同一事务里删子表（facts/segments）与 memories。
+      // facts.memory_id 与 segments.ord 都是 memories.rowid 的代理键，先按 id 换 ord
+      // 删子表、再删主表——顺序反了子查询就返回 NULL，留孤儿行让 stats/wear 虚高。
       const db = store.raw();
-      const delFact = db.prepare('DELETE FROM facts WHERE memory_id = ?');
+      const delFact = db.prepare('DELETE FROM facts WHERE memory_id = (SELECT rowid FROM memories WHERE id = ?)');
+      const delSeg = db.prepare('DELETE FROM segments WHERE ord = (SELECT rowid FROM memories WHERE id = ?)');
       const delMem = db.prepare('DELETE FROM memories WHERE id = ?');
       const removed = [];
       db.exec('BEGIN');
       try {
         for (const id of ids) {
           delFact.run(id);
+          delSeg.run(id);
           if (delMem.run(id).changes > 0) removed.push(id);
         }
         db.exec('COMMIT');
@@ -606,6 +618,7 @@ export function apply(ctx, config) {
           injectChars: { type: 'integer' },
           injectBudget: { type: 'integer' },
           dbPath: { type: 'string' },
+          tidy: { type: 'string', description: 'layer 四阶段后台整理（mneme sleep 同构）的一句话结论。' },
         },
         required: [
           'memories', 'facts', 'textChars', 'bytes', 'limitBytes', 'withinLimit',
@@ -617,6 +630,7 @@ export function apply(ctx, config) {
         `记忆 ${value.memories} 条 / 三元组 ${value.facts} 条 / 正文 ${value.textChars} 字\n`
         + `库体 ${(value.bytes / 1024).toFixed(1)}KB（上限 ${(value.limitBytes / 1024).toFixed(0)}KB，${value.withinLimit ? '在预算内' : '超预算'}）\n`
         + `倒排 ${value.terms} 词 / ${value.postings} 条 posting / ${value.chapters} 章\n`
+        + `后台整理 ${value.tidy ?? '未运行'}\n`
         + `注入 ${value.injectEnabled ? `开启（${value.injectChars}/${value.injectBudget} 字符）` : '关闭（0 字符）'}`,
       ),
     },
@@ -625,6 +639,9 @@ export function apply(ctx, config) {
       const base = store.stats();
       const ix = getIndex().stats();
       const injectText = renderInject();
+      // layer 的后台整理（mneme sleep 四阶段同构）在体检时报一次：每阶段独立 fail-safe，
+      // 一个阶段抛错只记进 errors，不影响统计输出。冲突阶段与 memjudge_conflicts 同源。
+      const tidy = sleepPhase(chapterRows());
       const out = {
         memories: base.memories,
         facts: base.facts,
@@ -640,6 +657,9 @@ export function apply(ctx, config) {
         injectChars: injectText.length,
         injectBudget: cfg.injectBudget,
         dbPath: args?.verbose === true ? store.path : '',
+        tidy: `${tidy.conflicts.length} 组待审矛盾 / ${tidy.archived.length} 条待降级`
+          + ` / ${tidy.relations.length} 条共现关系`
+          + (tidy.errors.length ? ` / ${tidy.errors.length} 阶段失败` : ''),
       };
       return out;
     },

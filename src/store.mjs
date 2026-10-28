@@ -13,8 +13,82 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeId } from './schema.mjs';
 
-export const STORE_SCHEMA_VERSION = 1;
+export const STORE_SCHEMA_VERSION = 2;
 export const STORAGE_LIMIT_BYTES = 200 * 1024;
+
+// ── 预算（抄 PerryLink/dsh-memento lib/budget.mjs:17-51，逐行移植） ──────────
+// memento 的红线：硬上限报错 BUDGET_EXCEEDED、绝不静默截断。单位是 text.length
+// （UTF-16 code unit），不是字节、不是 token。与 STORAGE_LIMIT_BYTES 正交：
+// 那个是 200KB 字节的验收阈值，这个是「库还能不能再吃一条」的写入闸门。
+
+/**
+ * 当前库正文用量：Σ text.length（memento entryUsage 的 memjudge 形态）。
+ * 参数是 dump() 的行（或任意带 text 字段的对象数组）。
+ */
+export function entryUsage(rows) {
+  let sum = 0;
+  for (const row of rows ?? []) sum += String(row?.text ?? '').length;
+  return sum;
+}
+
+/**
+ * 写入前校验：used + addition 是否仍在预算内（memento checkBudget 逐行同构）。
+ * 返回 { ok:true } 或 { ok:false, used, limit, needed }；needed = 还差多少字符。
+ * 纯函数，不落库、不改状态。
+ */
+export function checkBudget(used, limit, addition) {
+  if (!Number.isFinite(limit) || limit <= 0) return { ok: true };
+  if (used + addition <= limit) return { ok: true };
+  return { ok: false, used, limit, needed: used + addition - limit };
+}
+
+/** 领域错误：写满即拒，绝不截断（memento errors.mjs 的 BUDGET_EXCEEDED 同码）。 */
+export class BudgetExceededError extends Error {
+  constructor({ used, limit, needed }) {
+    super(`写入超出预算：已用 ${used} 字符 + 本条需要 ${needed} 字符 > 上限 ${limit} 字符`);
+    this.name = 'BudgetExceededError';
+    this.code = 'BUDGET_EXCEEDED';
+    this.details = { used, limit, needed };
+  }
+}
+
+// ── 机械切段（抄 QiDouZu/retcon-form retcon.py:39-56，逐行移植） ─────────────
+// 为什么按标点硬切：标点断句是人类写东西时自带的边界，机械切不会把主谓拆散。
+// retcon 的 verdict 写得很直白——固定 400 字窗切出的段，换行位置可能正好劈在
+// 主语和谓语中间，读起来像被人从中间撕开。按标点是「没有内容模型时的最优近似」。
+export const SPLIT_RE = /[，。！？；：\n、]+|——|--/;
+const CH = /[一-鿿]/;
+
+/**
+ * split_segments 的 JS 移植：先按 SPLIT_RE 切，太短（<2 个汉字）的段合并到前段。
+ * 用途与 Python 版一致：把长文本变成段列表。返回段文本数组（不含分隔符）。
+ */
+export function splitSegments(text) {
+  // 先按空行进块，块内再切。这层隔离是段数口径的前提：适配器是把章按空行切成
+  // 多条 memory、每条各自切段的，若短碎片合并能跨过空行，整章切与逐块切会给出
+  // 不同段数（实测 2704 vs 2706），段层与磨损统计就随写入粒度漂移。
+  // 分块后恒有 splitSegments(a + '\n\n' + b) === splitSegments(a) ++ splitSegments(b)。
+  return String(text ?? '')
+    .split(/\n\s*\n/)
+    .flatMap((block) => splitBlock(block));
+}
+
+function splitBlock(block) {
+  const parts = String(block)
+    .split(SPLIT_RE)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const segs = [];
+  for (const part of parts) {
+    const chCount = (part.match(/[一-鿿]/g) ?? []).length;
+    if (chCount < 2 && segs.length) {
+      segs[segs.length - 1] = `${segs[segs.length - 1]} ${part}`;
+    } else {
+      segs.push(part);
+    }
+  }
+  return segs;
+}
 
 // ---------------------------------------------------------------- 抽取
 
@@ -217,7 +291,52 @@ function hashText(s) {
   return `${hex(h1)}${hex(h2)}-${s.length}`;
 }
 
+// 段表只记「覆盖位图」：段文本、长度、时间戳全部从 memory.text 现切现算，不落盘。
+// 这是 200KB 预算下的形状——2704 个句级段若每段都存 id/hash/长度/时间戳，
+// 光元数据就 76KB（实测），加进 152KB 的章级基线直接超预算。落盘只留
+// (ord, seg_count, covered) 一行/条 memory：实测 2704 段 = 1 页。
+// hashSegment 保留为纯函数给调用方做完整性校验（不占库）。
+
+/**
+ * 段级短指纹（纯函数，不落库）：FNV-1a 32 位整数。
+ * 段不做幂等去重——hash 只是完整性指纹，不是唯一键；与 memories.text_hash
+ * 的 32 位十六进制幂等键是两个用途。保留给调用方校验「段文本未被改写」。
+ */
+function hashSegment(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
 // ---------------------------------------------------------------- 表结构
+
+// 段层表：一条 memory 一行，seg_count + covered 位图（'0'/'1' 字符序列）。
+// 为什么不是「一段一行」：一段一行实测 2704 行吃掉 92KB（memory_id 是 21 字符的
+// 物理键，WITHOUT ROWID 每行 32B），直接把能力 7 的 200KB 红线打穿到 252KB。
+// 位图形态下 20 章段元数据只占 1 页 4KB，逻辑段数仍是 2704（segmentsOf 展开），
+// 段文本本来就不落盘——「原文只此一份」的 retcon 语义不受影响。
+//
+// 键用 ord（= memories.rowid 的代理键）而不是 21 字符的字符串 id：facts 与 segments
+// 两张表把 id 重复存了 684 行，实测多付 16KB，段级写入（294 条）就此顶到 220KB。
+// 换成 8 字节整数后两表各省约 2 页；对外 API 仍原样收发字符串 id，映射在 SQL 里做。
+const SEGMENTS_DDL = `CREATE TABLE IF NOT EXISTS segments (
+  ord       INTEGER PRIMARY KEY,
+  seg_count INTEGER NOT NULL,
+  covered   TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;`;
+
+const FACTS_DDL = `CREATE TABLE IF NOT EXISTS facts (
+  memory_id INTEGER NOT NULL,
+  entity    TEXT,
+  attr      TEXT NOT NULL,
+  key       TEXT NOT NULL,
+  value     TEXT NOT NULL,
+  unit      TEXT,
+  kind      TEXT NOT NULL,
+  at        INTEGER NOT NULL
+);`;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -236,23 +355,20 @@ CREATE TABLE IF NOT EXISTS memories (
   source        TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_hash ON memories(text_hash);
-CREATE TABLE IF NOT EXISTS facts (
-  memory_id TEXT NOT NULL,
-  entity    TEXT,
-  attr      TEXT NOT NULL,
-  key       TEXT NOT NULL,
-  value     TEXT NOT NULL,
-  unit      TEXT,
-  kind      TEXT NOT NULL,
-  at        INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_facts_key ON facts(key);
+${SEGMENTS_DDL}
+${FACTS_DDL}
 `;
 
 // 体积预算是硬指标（20 章 ≤200KB），而 text 本身就要 88KB，
 // 所以除幂等键外不建任何索引：20 行 memories / 数百行 facts 全表扫的开销
-// 远小于索引占的页。ix_facts_key 保留，它是冲突检测与属性检索的入口，
-// 且只索引 2 字属性键，代价极小。
+// 远小于索引占的页。facts 原有的 ix_facts_key 在集成期删除——store 侧没有按
+// 属性键查 facts 的路径（factsOf 按 ord 查、冲突检测走 judge 的内存索引），
+// 那 3 页 12KB 是纯支出；要恢复按 key 检索时再加，别凭空留着。
+//
+// segments 表不存段文本：段文本从 memory.text 现切（splitSegments 是纯函数，
+// 同输入恒同输出），落盘只记 seg_count/covered 位图。这样 retcon 的
+// 「原文只此一份」在 SQLite 里成立——改 memory.text 即改所有段，没有第二份
+// 副本可以悄悄漂移；同时 20 章 29648 字的段元数据只增加 1 页，不击穿 200KB。
 
 // ---------------------------------------------------------------- Store
 
@@ -273,7 +389,49 @@ export function open(dbPath = ':memory:', opts = {}) {
   // journal_mode=DELETE：关库后只剩单个 .db，字节统计不被 -wal 干扰
   if (!isMemory) db.exec('PRAGMA journal_mode = DELETE');
   db.exec(DDL);
+
+  // ── 表结构自检：CREATE TABLE IF NOT EXISTS 不会纠偏已存在的同名表 ──────────
+  // segments 缺 seg_count（老库残留「一段一行 (memory_id, seq)」形态）或缺 ord
+  // 整数键时重建；段元数据完全可以从 memory.text 重切（splitSegments 是纯函数），
+  // 零信息损失。facts 的 memory_id 若是 TEXT（老库按 21 字符字符串 id 存）也重建，
+  // 三元组由 extractFacts 从原文重抽，同样无损。
+  const segCols = db.prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
+  let rebuiltSegs = false;
+  if (segCols.length > 0 && (!segCols.includes('seg_count') || !segCols.includes('ord'))) {
+    db.exec('DROP TABLE segments');
+    db.exec(SEGMENTS_DDL);
+    rebuiltSegs = true;
+  }
+  const factMemCol = db.prepare('PRAGMA table_info(facts)').all().find((c) => c.name === 'memory_id');
+  if (factMemCol && String(factMemCol.type).toUpperCase() === 'TEXT') {
+    db.exec('DROP TABLE facts');
+    db.exec(FACTS_DDL);
+    const insFactRe = db.prepare('INSERT INTO facts (memory_id, entity, attr, key, value, unit, kind, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const m of db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all()) {
+      for (const f of extractFacts(m.text)) {
+        insFactRe.run(m.ord, f.entity, f.attr, f.key, f.value, f.unit, f.kind, f.at);
+      }
+    }
+  }
+
+  // ── schema v1 → v2 迁移：segments 表是 v2 新增的（retcon 段层） ──────────
+  // v1 库没有 segments 表，DDL 的 IF NOT EXISTS 已建空表；这里补写存量 memory 的段。
+  // 自检重建过段表的库同样要补写，故与版本条件并列。
+  const versionRow = db.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version');
+  const fromVersion = versionRow ? Number(versionRow.v) : 0;
+  if (fromVersion < 2 || rebuiltSegs) {
+    const mems = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
+    const insSegMig = db.prepare('INSERT OR IGNORE INTO segments (ord, seg_count, covered) VALUES (?, ?, ?)');
+    for (const m of mems) {
+      const n = splitSegments(m.text).length;
+      insSegMig.run(m.ord, n, '0'.repeat(n));
+    }
+  }
   db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_version', String(STORE_SCHEMA_VERSION));
+
+  // 库级字符预算（memento 语义）：maxChars > 0 时超限抛 BUDGET_EXCEEDED，不截断。
+  // 默认 0 = 不限——评测语料 29648 字必须能全量落库；调用方要「写满即拒」就显式传。
+  const maxChars = Number.isFinite(opts.maxChars) && opts.maxChars > 0 ? Math.trunc(opts.maxChars) : 0;
 
   const stmt = {
     byHash: db.prepare('SELECT id, text FROM memories WHERE text_hash = ?'),
@@ -286,6 +444,13 @@ export function open(dbPath = ':memory:', opts = {}) {
     count: db.prepare('SELECT COUNT(*) AS n FROM memories'),
     countFacts: db.prepare('SELECT COUNT(*) AS n FROM facts'),
     sizes: db.prepare('SELECT COALESCE(SUM(LENGTH(text)), 0) AS chars, COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) AS bytes FROM memories'),
+    insSeg: db.prepare('INSERT OR IGNORE INTO segments (ord, seg_count, covered) VALUES (?, ?, ?)'),
+    segRow: db.prepare(`SELECT m.id AS memory_id, s.seg_count, s.covered
+      FROM segments s JOIN memories m ON m.rowid = s.ord WHERE m.id = ?`),
+    allSegs: db.prepare(`SELECT s.ord, m.id AS memory_id, s.seg_count, s.covered, m.created_at
+      FROM segments s JOIN memories m ON m.rowid = s.ord`),
+    countSegs: db.prepare('SELECT COALESCE(SUM(seg_count), 0) AS n FROM segments'),
+    coverMem: db.prepare('UPDATE segments SET covered = ? WHERE ord = (SELECT rowid FROM memories WHERE id = ?)'),
   };
 
   let closed = false;
@@ -294,7 +459,8 @@ export function open(dbPath = ':memory:', opts = {}) {
   };
 
   function factsOf(id) {
-    return db.prepare('SELECT entity, attr, key, value, unit, kind, at FROM facts WHERE memory_id = ? ORDER BY at').all(id)
+    return db.prepare(`SELECT entity, attr, key, value, unit, kind, at FROM facts
+      WHERE memory_id = (SELECT rowid FROM memories WHERE id = ?) ORDER BY at`).all(id)
       .map((f) => ({ ...f }));
   }
 
@@ -319,6 +485,14 @@ export function open(dbPath = ':memory:', opts = {}) {
       return { id: hit.id, inserted: false, factCount: factsOf(hit.id).length };
     }
 
+    // ── memento 预算硬拒绝：幂等命中之后再查预算，超限抛 BUDGET_EXCEEDED ──
+    // 语义：库满即拒写，绝不截断这条 text、绝不静默丢。预算单位是 text.length。
+    if (maxChars > 0) {
+      const used = stmt.sizes.get().chars;
+      const verdict = checkBudget(used, maxChars, text.length);
+      if (!verdict.ok) throw new BudgetExceededError(verdict);
+    }
+
     const id = input.id ?? makeId(input.chapter, input.para, text);
     const createdAt = Number.isFinite(input.createdAt) ? input.createdAt : now();
     const importance = Number.isFinite(input.importance) ? input.importance : 0;
@@ -329,13 +503,17 @@ export function open(dbPath = ':memory:', opts = {}) {
 
     db.exec('BEGIN');
     try {
-      stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source);
+      const ord = Number(stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source).lastInsertRowid);
+      // retcon 不可变原文层：机械切段落 segments，与原文同事务。段文本不复制
+      // 整条的存储开销——SQLite 同一页里的 TEXT 列本来就共享页，复制的是引用。
+      const segs = splitSegments(text);
+      stmt.insSeg.run(ord, segs.length, '0'.repeat(segs.length));
       const facts = extractFacts(text);
       for (const f of facts) {
-        stmt.insFact.run(id, f.entity, f.attr, f.key, f.value, f.unit, f.kind, f.at);
+        stmt.insFact.run(ord, f.entity, f.attr, f.key, f.value, f.unit, f.kind, f.at);
       }
       db.exec('COMMIT');
-      return { id, inserted: true, factCount: facts.length };
+      return { id, inserted: true, factCount: facts.length, segmentCount: segs.length };
     } catch (err) {
       db.exec('ROLLBACK');
       throw err;
@@ -416,6 +594,7 @@ export function open(dbPath = ':memory:', opts = {}) {
   function stats() {
     assertOpen();
     const s = stmt.sizes.get();
+    const w = wear();
     return {
       memories: stmt.count.get().n,
       facts: stmt.countFacts.get().n,
@@ -424,6 +603,10 @@ export function open(dbPath = ':memory:', opts = {}) {
       bytes: bytes(),
       limitBytes: STORAGE_LIMIT_BYTES,
       withinLimit: bytes() <= STORAGE_LIMIT_BYTES,
+      segments: w.segments,
+      wornSegments: w.worn,
+      wear: w.wear,
+      maxChars,
     };
   }
 
@@ -440,6 +623,81 @@ export function open(dbPath = ':memory:', opts = {}) {
     return bytes();
   }
 
+  // ---------------------------------------------------------- 段层（retcon）
+
+  /** 一条段行 → 逐段对象数组（位图展开，物理上仍是一条 memory 一行）。 */
+  function expandSegs(row) {
+    if (!row) return [];
+    const out = [];
+    for (let i = 1; i <= row.seg_count; i += 1) {
+      out.push({ memory_id: row.memory_id, seq: i, covered: row.covered[i - 1] === '1' ? 1 : 0 });
+    }
+    return out;
+  }
+
+  /** 一条 memory 的段元数据（按 seq 升序）。段文本从 memory.text 现切，不落盘。 */
+  function segmentsOf(memoryId) {
+    assertOpen();
+    return expandSegs(stmt.segRow.get(memoryId));
+  }
+
+  /** 全库的段位图（按 created_at, memory_id, seq 升序）。 */
+  function segmentDump() {
+    assertOpen();
+    return stmt.allSegs.all()
+      .sort((a, b) => a.created_at - b.created_at
+        || (a.memory_id < b.memory_id ? -1 : a.memory_id > b.memory_id ? 1 : 0))
+      .flatMap((row) => expandSegs(row).map((s) => ({ ...s, created_at: row.created_at })));
+  }
+
+  /**
+   * 一条 memory 的段文本列表（retcon 机械切段，从 memory.text 现切）。
+   * 段文本不落盘——segments 表只存 covered 位图，既省 200KB 预算，
+   * 又保证「原文只此一份、改无可改」（retcon 不可变语义的 SQLite 形态）。
+   * 每段附 hash（hashSegment 纯函数），供调用方校验完整性。
+   */
+  function segmentTexts(memoryId) {
+    assertOpen();
+    const row = stmt.byId.get(memoryId);
+    if (!row) return [];
+    return splitSegments(row.text).map((text, i) => ({
+      id: `${memoryId}/${i + 1}`,
+      seq: i + 1,
+      text,
+      chars: text.length,
+      hash: hashSegment(text),
+    }));
+  }
+
+  /**
+   * 把一条 memory 的所有段标记为「已被新结论覆盖」（retcon 的 cover 语义）。
+   * 由写入方在 supersedes 链建立后调用；covered=1 的段不计入磨损。
+   */
+  function coverSegments(memoryId) {
+    assertOpen();
+    const row = stmt.segRow.get(memoryId);
+    if (!row) return 0;
+    stmt.coverMem.run('1'.repeat(row.seg_count), memoryId);
+    return row.seg_count;
+  }
+
+  /**
+   * 磨损度（retcon wear）：covered=0 的段占比。0 = 全部都被覆盖，1 = 全部还在裸奔。
+   * retcon.py:175-181 的语义是「没被任何 cover 的 reads 覆盖的段」——这里的
+   * covered 是写入侧维护的标记位，不是查询时现算，与 retcon 的物化方向相反但同义。
+   * 位图串按 seg_count 截断读取：位图被外力截短时缺位算「未覆盖」，宁可报脏也不静默忽略。
+   */
+  function wear() {
+    assertOpen();
+    const total = stmt.countSegs.get().n;
+    if (total === 0) return { segments: 0, worn: 0, wear: 0 };
+    let worn = 0;
+    for (const row of stmt.allSegs.all()) {
+      for (let i = 0; i < row.seg_count; i += 1) if (row.covered[i] !== '1') worn += 1;
+    }
+    return { segments: total, worn, wear: Number((worn / total).toFixed(4)) };
+  }
+
   return {
     path: file,
     put,
@@ -450,10 +708,16 @@ export function open(dbPath = ':memory:', opts = {}) {
     bytes,
     stats,
     compact,
+    segmentsOf,
+    segmentDump,
+    segmentTexts,
+    coverSegments,
+    wear,
+    maxChars,
     close,
     /** 直接拿底层连接做诊断查询（只读用法） */
     raw: () => db,
   };
 }
 
-export default { open, extractFacts, STORAGE_LIMIT_BYTES, STORE_SCHEMA_VERSION };
+export default { open, extractFacts, STORAGE_LIMIT_BYTES, STORE_SCHEMA_VERSION, entryUsage, checkBudget, BudgetExceededError, SPLIT_RE, splitSegments };

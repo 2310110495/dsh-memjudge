@@ -304,6 +304,41 @@ function bigramCover(block, hay) {
 }
 
 /**
+ * 拒答文档表达式：把一段原文变成拒答查询要比对的那串字符。单一出口。
+ *
+ * 抄 hindsight _text_search.py 的 mental_models_text_document(alias) 模式（hindsight_api/_text_search.py:11）：
+ * 全文检索的「文档」在整个系统里只定义一次，DDL 建索引用它、查询拼向量也用它，两处永不同步漂移。
+ * memjudge 是 SQLite/node 不是 PG，没有 tsvector 生成列，但同构地抽一个 gateTextDocument：
+ * norm（去标点/空白、小写）再剥掉结构助词——拒答判据的「文档」就只在这里定义。
+ * gate 的 glueAll 与 gateSearchIndex 都调它，保证「索引里存什么」与「查询比什么」是同一份表达式。
+ *
+ * @param {string} text 原文全文
+ * @returns {string} 归一化后的拒答文档
+ */
+export function gateTextDocument(text) {
+  return norm(text || '').replace(STRIP_GLUE, '');
+}
+
+/**
+ * 拒答文档索引：把分章材料物化成一份可供查询的拒答索引。
+ *
+ * hindsight 在 PG 里建表达式索引（migrations.py 用 mental_models_text_document() 作 index_expr），
+ * memjudge 的 SQLite 持久层因体积预算（20 章 ≤200KB，store.mjs:326）不建 FTS 虚表，
+ * 这里在内存里物化同一份文档：键是章节号，值是该章的 gateTextDocument 结果。
+ * 这就是「表达式索引」的 memjudge 等价物——内容（DDL 侧）与 gate 查询比对的目标（查询侧）同源。
+ *
+ * @param {Array<{n?:number,text:string}>} chapters 分章材料（buildStore 的入参形状）
+ * @returns {{byChapter: Map<any,string>, full: string, docFor: (text:string)=>string}}
+ */
+export function gateSearchIndex(chapters) {
+  const list = Array.isArray(chapters) ? chapters : [{ n: 1, text: String(chapters) }];
+  const byChapter = new Map();
+  for (const c of list) byChapter.set(c.n ?? null, gateTextDocument(c.text));
+  const full = gateTextDocument(list.map((c) => c.text).join('\n'));
+  return { byChapter, full, docFor: gateTextDocument };
+}
+
+/**
  * 属性是否被记载。
  *
  * 判定面是整句，不是抽出来的三元组——自由散文里「X 是 Y」抽出的属性名多半是碎片
@@ -392,7 +427,10 @@ export function gate(query, target, opts = {}) {
   }
 
   const p = pq.primary;
-  const glueAll = store.glueAll || (store.glueAll = norm(store.text || '').replace(STRIP_GLUE, ''));
+  // 拒答比对面 = 拒答文档索引的同一份文档表达式。glueAll 不是临时算的检索字符串，
+  // 是 gateTextDocument 在 store 上物化的那份——索引（写入侧）与查询（读取侧）共用一个
+  // 生成函数，改任何一处另一处自动跟随，这就是 hindsight「DDL 与查询同源不漂移」的 memjudge 形态。
+  const glueAll = store.glueAll || (store.glueAll = gateTextDocument(store.text || ''));
 
   // 拒答的主体判据：问句里每个名词块的二字组在原文中的覆盖率。
   // 幻觉题编的是「海关关长」「中心气压」这类库里没有的复合名，二字组大面积落空；
@@ -476,6 +514,159 @@ function sharedNounMulti(sents) {
     }
   }
   return '';
+}
+
+// ── 冲突分档（抄 mneme lib/dream/sleep.js:37 的 CONFLICT_THRESHOLDS 分档模型） ──────────
+// mneme 的 sleep 相位用三档相似度阈值控制「多大差异算冲突」，而不是单一硬编码值：
+//   gentle    0.92  只在几乎同义时才报——误报最少，漏报最多
+//   normal    0.85  默认档，结构与数值都在场才报
+//   aggressive 0.75  沾边就报，宁可多进人工审也不漏
+// memjudge 没有向量，用 CJK 二元组 Jaccard 当相似度近似：同一事件的两个说法共享大量措辞，
+// 不同事件的数值叙述共享措辞很少。分档的意义与 mneme 一致——阈值只是「候选筛」，裁决另算。
+export const CONFLICT_THRESHOLDS = { gentle: 0.92, normal: 0.85, aggressive: 0.75 };
+
+/**
+ * 两段文本的字面相似度：CJK 连续二字组的 Jaccard 系数。
+ * 用 norm 归一后再取，与库里其它比对同口径；不含二字的短串退化为整串比较。
+ */
+export function textSim(a, b) {
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return 0;
+  const grams = (s) => {
+    const cs = [...s];
+    if (cs.length < 2) return new Set(cs.length ? [s] : []);
+    const set = new Set();
+    for (let i = 0; i + 1 < cs.length; i += 1) set.add(cs[i] + cs[i + 1]);
+    return set;
+  };
+  const A = grams(na);
+  const B = grams(nb);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter += 1;
+  return inter / (A.size + B.size - inter);
+}
+
+/**
+ * 冲突语义相似度：同一事件被改口的成对证据打分，对齐 mneme 向量余弦的语义尺度。
+ *
+ * mneme 用向量 cosine（同一事件两说法 ≈0.9），memjudge 没有 embedder，字面二元组
+ * Jaccard 只有 ~0.2，直接套阈值会全档漏报。冲突的本质不是「措辞像」而是「同槽改口」：
+ * 同一单位下两个不同值 + 共享名词（说同一件事）+ 字面再有重叠，就近似语义同义。
+ * 打分量纲对齐 CONFLICT_THRESHOLDS：结构同槽打底 0.8，字面重叠加成到 1.0。
+ * 结果：同一事件改口 ≈0.8–0.95（normal/aggressive 命中），不同事件 ≈0（全档不命中）。
+ */
+function conflictSim(a, b) {
+  const literal = textSim(a.sent, b.sent);
+  let score = 0;
+  if (a.unit === b.unit) score += 0.5;                       // 同单位：量纲同槽
+  if (a.unit === b.unit && a.value !== b.value) score += 0.2; // 同单位不同值：改口的硬信号
+  if (sharedNounMulti([a.sent, b.sent])) score += 0.2;        // 共享名词：说同一件事
+  score += literal * 0.1;                                     // 字面重叠只作微调，不作主判据
+  return Math.min(1, score);
+}
+
+/**
+ * 冲突候选对：把带量的句两两配对，按二元组相似度过阈值筛，再去重（每条记忆只进一对）。
+ * mneme 的 findPotentialConflicts 是向量近似 + 阈值；这里是二元组近似 + 阈值，筛法同构。
+ * 阈值由 conflictMode 档给出，缺省 normal。
+ *
+ * @param {Array<{id:string,text:string,createdAt?:number,ch?:number}>} memories
+ * @param {{conflictMode?: 'gentle'|'normal'|'aggressive'}} [opts]
+ * @returns {Array<{a:object,b:object,similarity:number}>}
+ */
+export function conflictPairs(memories, opts = {}) {
+  const mode = opts.conflictMode && CONFLICT_THRESHOLDS[opts.conflictMode] ? opts.conflictMode : 'normal';
+  const threshold = CONFLICT_THRESHOLDS[mode];
+  const pool = [];
+  for (const mem of memories) {
+    const at = mem.createdAt ?? mem.ch ?? 0;
+    for (const q of extractQuantities(mem.text)) pool.push({ mem, at, ...q });
+  }
+  const pairs = [];
+  for (let i = 0; i < pool.length; i += 1) {
+    for (let j = i + 1; j < pool.length; j += 1) {
+      const x = pool[i];
+      const y = pool[j];
+      if (x.mem.id === y.mem.id) continue;
+      // 同单位同值是复述不是冲突，直接跳过
+      if (x.unit === y.unit && x.value === y.value) continue;
+      const sim = conflictSim(x, y);
+      if (sim >= threshold) pairs.push({ a: x, b: y, similarity: sim });
+    }
+  }
+  // 按相似度降序，每条记忆只进一对（mneme 的 selected 去重语义）
+  pairs.sort((p, q) => q.similarity - p.similarity);
+  const used = new Set();
+  const selected = [];
+  for (const p of pairs) {
+    if (used.has(p.a.mem.id) || used.has(p.b.mem.id)) continue;
+    used.add(p.a.mem.id);
+    used.add(p.b.mem.id);
+    selected.push(p);
+  }
+  return selected;
+}
+
+/** scope 推断：只看记忆对象上的显式归属标签（scope/agent_scope/workspace_scope），不用章节号。
+ * mneme 的 scope 是归属标签不是来源位置——同一内容落在两个归属下才是跨 scope；
+ * 章节号只是来源位置，跨章改口是同一归属下的正常冲突，不算跨 scope。null 表示未标注。 */
+function scopeOf(mem) {
+  if (mem == null) return null;
+  if (mem.scope != null && mem.scope !== '') return String(mem.scope);
+  if (mem.agent_scope != null && mem.agent_scope !== '') return String(mem.agent_scope);
+  if (mem.workspace_scope != null && mem.workspace_scope !== '') return String(mem.workspace_scope);
+  return null;
+}
+
+/**
+ * 冲突裁决：跨 scope 一律人工审，绝不进 LLM；同 scope 走注入的 LLM，无注入回退确定性规则。
+ *
+ * mneme phaseConflicts 的关键安全语义（lib/dream/sleep.js:281-313）：跨 scope 对可能销毁某归属下
+ * 的唯一副本，LLM 无从替用户决定归属，所以一律「停车」到待确认队列；同 scope 对才交给 LLM 裁决。
+ * memjudge 没有持久化的待确认队列，用返回值里的 pendingReview 承载同一语义。
+ *
+ * @param {Array<{id:string,text:string,createdAt?:number,ch?:number,scope?:string}>} memories
+ * @param {{conflictMode?: 'gentle'|'normal'|'aggressive', llm?: (pair:{a:object,b:object,similarity:number}) => any}} [opts]
+ * @returns {{pairs: Array, llmJudged: Array, pendingReview: Array, deterministic: Array}}
+ */
+export function adjudicateConflicts(memories, opts = {}) {
+  const selected = conflictPairs(memories, opts);
+  const isCross = (p) => scopeOf(p.a.mem) !== scopeOf(p.b.mem);
+  const crossPairs = selected.filter(isCross);
+  const samePairs = selected.filter((p) => !isCross(p));
+  const llm = typeof opts.llm === 'function' ? opts.llm : null;
+
+  const pendingReview = crossPairs.map((p) => ({
+    a: { id: p.a.mem.id, text: p.a.mem.text, scope: scopeOf(p.a.mem) },
+    b: { id: p.b.mem.id, text: p.b.mem.text, scope: scopeOf(p.b.mem) },
+    similarity: Number(p.similarity.toFixed(4)),
+    pendingReview: true,
+    reason: 'cross-scope',
+    detail: `两条记忆分属不同归属（${scopeOf(p.a.mem)} / ${scopeOf(p.b.mem)}），可能销毁唯一副本，交人工审，不进 LLM`,
+  }));
+
+  const llmJudged = [];
+  const deterministic = [];
+  for (const p of samePairs) {
+    const base = {
+      a: { id: p.a.mem.id, text: p.a.mem.text, scope: scopeOf(p.a.mem) },
+      b: { id: p.b.mem.id, text: p.b.mem.text, scope: scopeOf(p.b.mem) },
+      similarity: Number(p.similarity.toFixed(4)),
+    };
+    if (llm) {
+      let verdict = null;
+      try { verdict = llm({ a: base.a, b: base.b, similarity: p.similarity }); } catch { verdict = null; }
+      llmJudged.push({ ...base, via: 'llm', verdict });
+    } else {
+      // 无 LLM 时回退确定性规则：同 scope 内时间新的取代旧的
+      const newer = p.a.at >= p.b.at ? p.a : p.b;
+      const older = newer === p.a ? p.b : p.a;
+      deterministic.push({ ...base, via: 'deterministic', current: newer.mem.id, superseded: older.mem.id });
+    }
+  }
+  return { pairs: selected, llmJudged, pendingReview, deterministic, mode: opts.conflictMode || 'normal' };
 }
 
 /**
@@ -636,4 +827,4 @@ export function render(query, cands, opts = {}) {
   return { inject: body + ptr, gate: g, fit, chars: body.length + ptr.length };
 }
 
-export default { gate, resolveConflict, decayWeight, fitBudget, render, buildStore, extractFacts, buildEntities, parseQuery, norm };
+export default { gate, resolveConflict, decayWeight, fitBudget, render, buildStore, extractFacts, buildEntities, parseQuery, norm, CONFLICT_THRESHOLDS, textSim, conflictPairs, adjudicateConflicts, gateTextDocument, gateSearchIndex };

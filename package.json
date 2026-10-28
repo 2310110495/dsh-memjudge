@@ -9,6 +9,7 @@
     "./store": "./src/store.mjs",
     "./search": "./src/search.mjs",
     "./judge": "./src/judge.mjs",
+    "./layer": "./src/layer.mjs",
     "./schema": "./src/schema.mjs",
     "./package.json": "./package.json"
   },

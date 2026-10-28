@@ -98,10 +98,11 @@ node scripts/verify-install.mjs --mock   # 不依赖 dsh CLI 的模拟验证
 ## 测试
 
 ```bash
-node test/store.test.mjs    # 34 断言：SQLite 读写、三元组抽取、dump 逐字相等
+node test/store.test.mjs    # 61 断言：SQLite 读写、三元组抽取、段层位图、v1→v2 迁移、200KB 预算
 node test/search.test.mjs   # 14 断言：recall 0.989、衰减下限曲线、倒排 17.5%
 node test/judge.test.mjs    # 11 断言：拒答 5/6、冲突 4/4、衰减 0.150 地板、预算 1945
-node test/plugin.test.mjs   # 15 断言：5 工具注册、注入 section、dispose 幂等、cordis 冒烟
+node test/layer.test.mjs    # 12 断言：索引渲染、字段加权检索、四阶段后台整理 fail-safe
+node test/plugin.test.mjs   # 17 断言：5 工具注册、注入 section、全新空库冒烟、dispose 幂等、cordis 冒烟
 ```
 
 ## 已知边界
@@ -115,8 +116,8 @@ node test/plugin.test.mjs   # 15 断言：5 工具注册、注入 section、disp
 
 | 文件 | 说明 |
 |---|---|
-| `src/` | 插件本体（5 个模块，3889 行） |
-| `test/` | 74 断言全绿 |
+| `src/` | 插件本体（6 个模块：index / store / search / judge / schema / layer） |
+| `test/` | 115 断言全绿 |
 | `docs/SPEC.md` | 12 项能力验收标准（v1.1，463 行） |
 | `docs/AUDIT.md` | 独立审查报告（14 条 findings，3 条已修） |
 | `docs/FINAL.md` | 最终报告（12 项状态 + 26 行对比 + 已知局限） |

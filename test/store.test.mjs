@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { open, extractFacts, STORAGE_LIMIT_BYTES } from '../src/store.mjs';
+import { open, extractFacts, STORAGE_LIMIT_BYTES, entryUsage, checkBudget, BudgetExceededError, splitSegments, SPLIT_RE } from '../src/store.mjs';
 import { chapters } from '../../mem-eval/corpus/novel.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -214,6 +214,71 @@ check('未访问的条目 lastAccessed 不变', () => {
   assert.equal(store.get(putResults[1].id, false).last_accessed, FIXED_NOW);
 });
 
+// ---------------------------------------------------------------- 段层（retcon）
+
+section('段层（retcon 机械切段）');
+check('20 章写入后 segments 表已建且条数 > memories 条数', () => {
+  const st = store.stats();
+  assert.ok(st.segments > st.memories, `segments=${st.segments} 应大于 memories=${st.memories}`);
+});
+
+check('segmentDump 按 created_at, memory_id, seq 升序', () => {
+  const rows = store.segmentDump();
+  assert.ok(rows.length > 20);
+  for (let i = 1; i < rows.length; i += 1) {
+    const a = rows[i - 1];
+    const b = rows[i];
+    const key = (r) => `${r.created_at}|${r.memory_id}|${String(r.seq).padStart(4, '0')}`;
+    assert.ok(key(a) <= key(b), `乱序：${key(a)} > ${key(b)}`);
+  }
+});
+
+check('segmentsOf(ch5) 的 seq 从 1 开始连续', () => {
+  const segs = store.segmentsOf(putResults[4].id);
+  assert.ok(segs.length >= 1);
+  segs.forEach((s, i) => assert.equal(s.seq, i + 1));
+});
+
+check('段元数据不落盘正文：segments 行只有 memory_id/seq/covered，无 text/hash 列', () => {
+  const segs = store.segmentsOf(putResults[4].id);
+  assert.ok(segs.length >= 1);
+  for (const s of segs) {
+    assert.deepEqual(Object.keys(s).sort(), ['covered', 'memory_id', 'seq']);
+    assert.equal(s.covered, 0);
+  }
+});
+
+check('segmentTexts 从 memory.text 现切段文本（不落盘、与 splitSegments 一致）', () => {
+  const rows = store.segmentTexts(putResults[4].id);
+  const expected = splitSegments(chapters[4].text);
+  assert.deepEqual(rows.map((r) => r.text), expected);
+  assert.ok(rows.every((r) => Number.isInteger(r.hash) && r.hash >= 0), '段 hash 应为非负整数');
+  assert.ok(rows.every((r) => r.chars === r.text.length), 'chars 应与 text.length 一致');
+});
+
+check('段文本拼接后能复原原文核心字（去空白比对）', () => {
+  const rows = store.segmentTexts(putResults[4].id);
+  const rebuilt = rows.map((r) => r.text).join('').replace(/\s/g, '');
+  const original = chapters[4].text.replace(/[，。！？；：\n、—-]/g, '').replace(/\s/g, '');
+  assert.ok(rebuilt.length > 0);
+  assert.ok(rebuilt.length <= original.length, `段拼接 ${rebuilt.length} 应 ≤ 原文去分隔符 ${original.length}`);
+});
+
+check('splitSegments 短碎片合并到前段（<2 汉字）', () => {
+  const segs = splitSegments('白鲸号收到报告，焊缝凹陷九厘米。');
+  assert.ok(segs.every((s) => (s.match(/[一-鿿]/g) ?? []).length >= 2 || segs.length === 1), `存在孤立短碎片：${JSON.stringify(segs)}`);
+});
+
+check('SPLIT_RE 覆盖——与--两种破折号', () => {
+  const segs = splitSegments('前段——后段--再后段');
+  assert.ok(segs.length >= 2, `破折号未切开：${JSON.stringify(segs)}`);
+});
+
+check('SPLIT_RE 与 retcon-form 原文一致（不含英文逗号句号）', () => {
+  assert.ok(!SPLIT_RE.source.includes(','), 'SPLIT_RE 不应含英文逗号');
+  assert.ok(!SPLIT_RE.source.includes('.') || SPLIT_RE.source.includes('\\.'), 'SPLIT_RE 不应含未转义英文句号');
+});
+
 // ---------------------------------------------------------------- 取代链
 
 section('取代链（supersedes / supersededBy）');
@@ -240,12 +305,177 @@ check('旧条目 text 未被改写', () => {
   assert.equal(d.find((m) => m.id === oldId).text, chapters[5].text);
 });
 
+// ---------------------------------------------------------------- 磨损（retcon wear）
+
+section('磨损（retcon wear = 没被覆盖的段）');
+check('supersedes 写入后 coverSegments 把旧条段全标记', () => {
+  const n = store.coverSegments(oldId);
+  const meta = store.segmentsOf(oldId);
+  assert.equal(n, meta.length);
+  assert.ok(meta.every((s) => s.covered === 1), `存在未覆盖段：${meta.filter((s) => !s.covered).map((s) => `${s.memory_id}#${s.seq}`).join(',')}`);
+});
+
+check('wear() 返回 segments/worn/wear 三字段，0 ≤ wear ≤ 1', () => {
+  const w = store.wear();
+  assert.ok(Number.isInteger(w.segments) && w.segments > 0);
+  assert.ok(Number.isInteger(w.worn) && w.worn >= 0 && w.worn <= w.segments);
+  assert.ok(w.wear >= 0 && w.wear <= 1, `wear=${w.wear} 越界`);
+});
+
+check('覆盖一条 memory 后 wear 下降（worn 减少 = 被覆盖段数）', () => {
+  const before = store.wear();
+  const segCount = store.segmentsOf(putResults[6].id).length;
+  store.coverSegments(putResults[6].id);
+  const after = store.wear();
+  assert.equal(after.worn, before.worn - segCount, `worn 应减少 ${segCount}：${before.worn} → ${after.worn}`);
+});
+
+check('全部段被覆盖时 wear = 0', () => {
+  const s = open(':memory:');
+  const r1 = s.put({ text: '第一条记忆，有深度九厘米。' });
+  const r2 = s.put({ text: '第二条记忆，有深度十厘米。' });
+  s.coverSegments(r1.id);
+  s.coverSegments(r2.id);
+  const w = s.wear();
+  assert.equal(w.worn, 0);
+  assert.equal(w.wear, 0);
+  s.close();
+});
+
+check('空库 wear = 0（不除零）', () => {
+  const s = open(':memory:');
+  const w = s.wear();
+  assert.equal(w.segments, 0);
+  assert.equal(w.wear, 0);
+  s.close();
+});
+
+// ---------------------------------------------------------------- 预算（memento）
+
+section('预算（memento 硬拒绝）');
+check('entryUsage 单位是 text.length（Σ 各条 text 长度）', () => {
+  assert.equal(entryUsage([{ text: '白鲸号' }, { text: '收到报告' }]), 7);
+  assert.equal(entryUsage([]), 0);
+  assert.equal(entryUsage(null), 0);
+});
+
+check('checkBudget 纯函数：used+addition ≤ limit → ok', () => {
+  assert.deepEqual(checkBudget(3990, 4000, 10), { ok: true });
+});
+
+check('checkBudget 超限返回 {ok:false, used, limit, needed}，needed = 超出量', () => {
+  assert.deepEqual(checkBudget(3990, 4000, 20), { ok: false, used: 3990, limit: 4000, needed: 10 });
+});
+
+check('checkBudget 对非正 limit 直接放行（0/负数/NaN = 不限）', () => {
+  assert.deepEqual(checkBudget(100, 0, 9999), { ok: true });
+  assert.deepEqual(checkBudget(100, -1, 9999), { ok: true });
+  assert.deepEqual(checkBudget(100, NaN, 9999), { ok: true });
+});
+
+check('maxChars 预算：写入刚好到上限成功，再写一条抛 BUDGET_EXCEEDED', () => {
+  const s = open(':memory:', { maxChars: 10 });
+  s.put({ text: '一二三四五六七八九十' }); // 恰好 10 字符
+  assert.throws(
+    () => s.put({ text: '一' }),
+    (err) => err instanceof BudgetExceededError && err.code === 'BUDGET_EXCEEDED' && err.details.needed === 1,
+  );
+  s.close();
+});
+
+check('超限抛错后库未被污染（行数不变、可继续写更短的）', () => {
+  const s = open(':memory:', { maxChars: 10 });
+  s.put({ text: '一二三四五六七八九十' }); // 恰好 10
+  assert.throws(() => s.put({ text: '一' }), BudgetExceededError);
+  assert.equal(s.stats().memories, 1);
+  s.close();
+});
+
+check('幂等同文写入不触发预算（hash 命中提前 return）', () => {
+  const s = open(':memory:', { maxChars: 5 });
+  s.put({ text: '一二三四五' });
+  const r = s.put({ text: '一二三四五' }); // 同文，幂等，不应触发预算
+  assert.equal(r.inserted, false);
+  assert.equal(s.stats().memories, 1);
+  s.close();
+});
+
+check('maxChars=0（默认）不限预算：29648 字语料可全量落库', () => {
+  const s = open(':memory:');
+  for (const c of chapters) s.put({ text: c.text, chapter: c.n });
+  assert.equal(s.stats().memories, 20);
+  s.close();
+});
+
+check('错误码与 memento 一致：BUDGET_EXCEEDED + details{used,limit,needed}', () => {
+  const s = open(':memory:', { maxChars: 5 });
+  s.put({ text: '一二三四五' });
+  try {
+    s.put({ text: '六七八' });
+    assert.fail('应抛错');
+  } catch (err) {
+    assert.equal(err.code, 'BUDGET_EXCEEDED');
+    assert.deepEqual(err.details, { used: 5, limit: 5, needed: 3 });
+  }
+  s.close();
+});
+
+check('put 返回新增 segmentCount 字段（retcon 段数）', () => {
+  const s = open(':memory:');
+  const r = s.put({ text: '白鲸号收到报告。焊缝凹陷九厘米，实测属实。' });
+  assert.equal(r.segmentCount, splitSegments('白鲸号收到报告。焊缝凹陷九厘米，实测属实。').length);
+  s.close();
+});
+
+check('v1 库重开自动迁移：segments 表补写存量 memory 的段', () => {
+  const v1Path = path.join(TMP, 'v1.db');
+  fs.rmSync(v1Path, { force: true });
+  const s1 = open(v1Path);
+  s1.put({ text: '白鲸号收到报告。焊缝凹陷九厘米。' });
+  s1.raw().prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_version', '1');
+  s1.close();
+  const s2 = open(v1Path);
+  const segs = s2.segmentDump();
+  assert.ok(segs.length >= 1, `迁移后段数应 ≥1，实际 ${segs.length}`);
+  s2.close();
+  fs.rmSync(v1Path, { force: true });
+});
+
 // ---------------------------------------------------------------- 体积
 
 section('存储体积（能力 7）');
 const bytes = store.compact();
-check(`20 章 29648 字库体积 ≤ 200KB（实测 ${bytes} 字节 / ${(bytes / 1024).toFixed(1)} KB）`, () => {
+check(`20 章整章写入（2704 句级段）库体积 ≤ 200KB（实测 ${bytes} 字节 / ${(bytes / 1024).toFixed(1)} KB）`, () => {
   assert.ok(bytes <= STORAGE_LIMIT_BYTES, `超预算：${bytes} > ${STORAGE_LIMIT_BYTES}`);
+});
+
+// 段级写入口径（adapters 默认 GRANULARITY=seg，294 条 memory、句级段数与章级相同）
+const SEG_DB = path.join(TMP, 'seg.db');
+const segStore = open(SEG_DB, { now: () => FIXED_NOW });
+let segMemCount = 0;
+for (const c of chapters) {
+  const parts = String(c.text).split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  for (let i = 0; i < parts.length; i += 1) {
+    segStore.put({ text: parts[i], chapter: c.n, para: i + 1 });
+    segMemCount += 1;
+  }
+}
+const segBytes = segStore.compact();
+const segStats = segStore.stats();
+segStore.close();
+check(`段级写入（${segMemCount} 条 memory）库体积 ≤ 200KB（实测 ${segBytes} 字节 / ${(segBytes / 1024).toFixed(1)} KB）`, () => {
+  assert.ok(segBytes <= STORAGE_LIMIT_BYTES, `超预算：${segBytes} > ${STORAGE_LIMIT_BYTES}`);
+});
+check('段级写入的段数与章级一致（同一语料、同一 SPLIT_RE）', () => {
+  // 章级库到这一步已多写了 override 记忆（'第六章节的更正…' 切 2 段），拿它的
+  // stats().segments 直接比会把那段算进「同一语料」。口径应是纯语料，故另开一个
+  // 内存库写 20 章取基准。
+  const ref = open(':memory:');
+  for (const c of chapters) ref.put({ text: c.text, chapter: c.n });
+  const chapterSegments = ref.stats().segments;
+  ref.close();
+  assert.equal(segStats.segments, chapterSegments,
+    `段级 ${segStats.segments} 段 vs 章级 ${chapterSegments} 段`);
 });
 
 const finalStats = store.stats();

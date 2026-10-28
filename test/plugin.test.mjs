@@ -381,6 +381,62 @@ await check('dispose 后重装成功，且能读回上一次写入的数据', as
   second.dispose();
 });
 
+await check('全新空库路径：目录不存在 → open() 建表 + 五工具逐个冒烟', async () => {
+  // 集成期踩过的坑：DDL 的列名与 INSERT 语句错位只在**全新库**暴露（老库里表已存在，
+  // CREATE TABLE IF NOT EXISTS 不会纠偏），五工具会全废。所以这条必须用不存在的
+  // 多级目录 + 从没建过的 db 文件跑，不能借 test/.tmp 里已有的库。
+  const freshDir = path.join(TMP, 'fresh', 'nested', 'leaf');
+  const dbPath = path.join(freshDir, 'brand-new.db');
+  assert.equal(existsSync(dbPath), false, '前置条件：db 文件必须不存在');
+
+  const ctx = hostCtx();
+  apply(ctx, { dbPath, autoInject: true, now: () => T0 });
+  assert.equal(ctx.tools.map.size, 5);
+
+  const ch5 = chapters.find((c) => c.n === 5);
+  const firstSeg = ch5.text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean)[0];
+  const wrote = await tool(ctx, 'memjudge_remember').execute({ text: firstSeg, chapter: 5, para: 1 });
+  assert.equal(wrote.inserted, true, '全新库首次写入失败');
+  assert.ok(wrote.factCount > 0, '三元组未抽出');
+
+  const read = await tool(ctx, 'memjudge_recall').execute({ query: firstSeg.slice(0, 8) });
+  assert.equal(read.denied, false, '全新库检索失败');
+  assert.ok(read.hits.length > 0, '全新库无命中');
+
+  const conf = await tool(ctx, 'memjudge_conflicts').execute({});
+  assert.equal(conf.total, 0, '单条记忆不应报矛盾');
+
+  const st = await tool(ctx, 'memjudge_stats').execute({ verbose: true });
+  assert.equal(st.memories, 1);
+  assert.equal(st.withinLimit, true);
+  assert.match(st.tidy, /组待审矛盾/, 'stats 缺 layer 后台整理结论');
+
+  const del = await tool(ctx, 'memjudge_forget').execute({ id: wrote.id });
+  assert.equal(del.count, 1, '全新库删除失败');
+  assert.equal((await tool(ctx, 'memjudge_stats').execute({})).memories, 0);
+
+  ctx.dispose();
+});
+
+await check('注入块由 layer.renderRecall 渲染：descriptor 行 + 零正文', async () => {
+  // t4 的 layer.mjs 必须真的被注入路径消费。索引行的契约是
+  // `- "id" — 首行：来源`，正文一个字都不进 prompt（soul-md 的索引型记忆）。
+  // 用 >90 字的长正文才分辨得出「首行 descriptor」与「全文倾倒」。
+  const ctx = hostCtx();
+  apply(ctx, { dbPath: path.join(TMP, 'm.db'), autoInject: true, now: () => T0 });
+  const remember = tool(ctx, 'memjudge_remember');
+  const longText = `第 7 章舱壁焊缝凹陷九厘米，需返厂复检。${'压载水舱在左舷第三肋位出现渗漏，'.repeat(10)}尾部标记：密封胶型号 AK-77。`;
+  await remember.execute({ text: longText, chapter: 7, para: 1 });
+  const text = sectionText(ctx);
+  assert.ok(text.startsWith('## memjudge 记忆索引'), `注入块标题异常：${text.slice(0, 40)}`);
+  assert.match(text, /^- "/m, '缺 layer.renderRecall 的 descriptor 行格式');
+  assert.ok(text.includes('ch7'), '来源章号未渲染');
+  assert.ok(text.includes('memjudge_recall 取全文'), '缺调用提示尾巴');
+  assert.ok(text.includes('第 7 章舱壁焊缝凹陷九厘米'), 'descriptor 行缺正文首行');
+  assert.ok(!text.includes('AK-77'), '正文尾巴被注入——索引型渲染退化成了全文倾倒');
+  ctx.dispose();
+});
+
 // ---------------------------------------------------------------- 真 cordis 冒烟
 
 let cordisNote = 'cordis: skipped (host modules not found)';

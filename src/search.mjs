@@ -1,4 +1,4 @@
-// memjudge 检索层 —— BM25 + CJK 二元组 + 倒排索引 + 混合排序（t11）
+// memjudge 检索层 —— BM25 + CJK 二元组 + 倒排索引 + 混合排序（t11 + t1 升级）
 //
 // 为什么不是「整章当候选」：
 //   baseline-bm25 把整章（1480 字）当一条文档，top-3 返回 5566 字符/次，recall 0.989。
@@ -16,47 +16,194 @@
 //   「为减小受力，船长把航速减到多少？」这类问题会被一堆含「船」的段落淹没。
 //   规则：单字 token 进索引、参与打分（乘 singleCharDiscount=0.35），但一条候选必须
 //   至少有 1 个长度 ≥2 的 token 命中，否则整条丢弃（hasStrongHit 闸门）。
+//
+// t1 升级（来源：meow bm25.ts + RestRegular scoring.ts）：
+//   1. 分词器 → meow 类别路由：CJK bigram + Latin 整词（小写化） + NFKC +
+//      英语停用词 + Porter 词干还原。NFKC 解决全角ＢＭ２５→bm25、半角片假名→全角；
+//      停用词+Porter 解决英语查询的屈折变化（caches/caching/cached 归同一词干）。
+//   2. 打分 → RestRegular recordScore()：lexical × recency × importance × access × penalty
+//      五因子乘性。公式与 schema.rankWeight 同源，但 halfLifeDays 暴露为可配置参数。
+//   3. 衰减 → RestRegular recencyFactor(ageDays, halfLifeDays)：
+//      Math.pow(0.5, ageDays/halfLifeDays)，半衰期可配置（SEARCH_DEFAULTS.halfLifeDays）。
+//      null = 沿用 schema 双档（warm 120 天 / cold 12 天）；数值 = 统一覆盖。
 
-import { rankWeight } from './schema.mjs';
+import { rankWeight, decayFactor, DECAY } from './schema.mjs';
 
 export const SEARCH_DEFAULTS = Object.freeze({
   k1: 1.5, // BM25 词频饱和参数（与 mem-eval worker 的 buildBM25Index 同值）
   b: 0.75, // 长度归一化强度。1=完全归一，0=不归一；段级语料取 0.75 让长段不吃亏
   singleCharDiscount: 0.35, // 单汉字 token 的分数折扣（只降权，不禁止）
-  decayFloor: 0, // 0 = 严格按 schema.decayFactor（能力 12 要求 30 天 ≤0.25）；>0 会放宽旧条目，见 test 的对照曲线
+  decayFloor: 0, // 0 = 严格按衰减公式（能力 12 要求 30 天 ≤0.25）；>0 会放宽旧条目
+  halfLifeDays: null, // null = 用 schema 双档（warm 120 / cold 12）；数值 = 统一覆盖（RestRegular 风格）
   topChapters: 2, // 章级聚合取前几章（实测：1→0.946，2→0.989，3→0.978）
   chapterAgg: 3, // 章分 = 章内 top-N 段分之和
   maxChars: 2000, // 单次返回字符预算（能力 8 阈值）
   limit: 16, // 单次返回段数上限（防极短段填满预算）
 });
 
-const CJK_RUN = /[\u3400-\u4dbf\u4e00-\u9fff]+/g;
-const LATIN_WORD = /[A-Za-z][A-Za-z0-9._:-]*|\d[A-Za-z0-9._:-]*/g;
+// ── meow 分词器（类别路由 v0.20.0 + en 归一化） ────────────────────────────
+// CJK 类：汉字（\p{Script=Han} 覆盖基本区+Ext A~I）+ 假名 + 日文词内符号（々 叠字 / ー
+// 长音符——script=Common，但必须随 CJK run，"人々/タワー"才能整体成词）
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ー々]/u;
+// 字母/数字类：é ü ñ、西里尔、希腊、谚文、全角英数（NFKC 后）……一切语言的字母数字
+const WORD = /[\p{L}\p{N}]/u;
+
+/** 单字符分类：CJK → bigram 路径；字母/数字 → 整词路径；其余（标点/符号/emoji）→ 丢弃。 */
+function classify(cp) {
+  if (CJK.test(cp)) return 'cjk';
+  if (WORD.test(cp)) return 'word';
+  return 'skip';
+}
+
+// 英语停用词（含撇号切分碎片 s/t/d/ll/ve/re/m）。功能词不承载检索意义。
+const EN_STOPWORDS = new Set([
+  'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'as', 'at',
+  'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by',
+  'can', 'cannot', 'could', 'd', 'did', 'do', 'does', 'doing', 'don', 'down', 'during',
+  'each', 'few', 'for', 'from', 'further', 'had', 'has', 'have', 'having', 'he', 'her', 'here', 'hers',
+  'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in', 'into', 'is', 'it', 'its', 'itself',
+  'just', 'll', 'm', 'me', 'more', 'most', 'my', 'myself', 'no', 'nor', 'not', 'now',
+  'of', 'off', 'on', 'once', 'only', 'or', 'other', 'ought', 'our', 'ours', 'ourselves', 'out', 'over', 'own',
+  're', 's', 'same', 'she', 'should', 'so', 'some', 'such', 't', 'than', 'that', 'the', 'their', 'theirs',
+  'them', 'themselves', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'to', 'too',
+  'under', 'until', 'up', 've', 'very', 'was', 'we', 'were', 'what', 'when', 'where', 'which', 'while',
+  'who', 'whom', 'why', 'will', 'with', 'would', 'you', 'your', 'yours', 'yourself', 'yourselves',
+]);
+
+// Porter stemmer（Porter 1980 原始算法，零依赖移植）。词干只用于匹配，不入库、不展示。
+const PORTER_STEP2 = {
+  ational: 'ate', tional: 'tion', enci: 'ence', anci: 'ance', izer: 'ize', bli: 'ble',
+  alli: 'al', entli: 'ent', eli: 'e', ousli: 'ous', ization: 'ize', ation: 'ate',
+  ator: 'ate', alism: 'al', iveness: 'ive', fulness: 'ful', ousness: 'ous', aliti: 'al',
+  iviti: 'ive', biliti: 'ble', logi: 'log',
+};
+const PORTER_STEP3 = {
+  icate: 'ic', ative: '', alize: 'al', iciti: 'ic', ical: 'ic', ful: '', ness: '',
+};
+
+const CONS = '[^aeiou]';
+const VOW = '[aeiouy]';
+const CONS_SEQ = `${CONS}[^aeiouy]*`;
+const VOW_SEQ = `${VOW}[aeiou]*`;
+const MGR0 = new RegExp(`^(${CONS_SEQ})?${VOW_SEQ}${CONS_SEQ}`);
+const MEQ1 = new RegExp(`^(${CONS_SEQ})?${VOW_SEQ}${CONS_SEQ}(${VOW_SEQ})?$`);
+const MGR1 = new RegExp(`^(${CONS_SEQ})?${VOW_SEQ}${CONS_SEQ}${VOW_SEQ}${CONS_SEQ}`);
+const HAS_VOWEL = new RegExp(`^(${CONS_SEQ})?${VOW}`);
+
+/** Porter 词干还原（小写纯字母词；长度 ≤2 原样返回）。 */
+export function stemEn(word) {
+  let w = word;
+  if (w.length <= 2) return w;
+
+  // Step 1a — 复数
+  if (/(ss|i)es$/.test(w)) w = w.replace(/(ss|i)es$/, '$1');
+  else if (/([^s])s$/.test(w)) w = w.replace(/([^s])s$/, '$1');
+
+  // Step 1b — 过去式/进行时
+  if (/eed$/.test(w)) {
+    const stem = w.slice(0, -3);
+    if (MGR0.test(stem)) w = w.slice(0, -1);
+  } else if (/(ed|ing)$/.test(w)) {
+    const stem = w.replace(/(ed|ing)$/, '');
+    if (HAS_VOWEL.test(stem)) {
+      w = stem;
+      if (/(at|bl|iz)$/.test(w)) w += 'e';
+      else if (/([^aeiouylsz])\1$/.test(w)) w = w.slice(0, -1); // 双写辅音还原
+      else if (new RegExp(`^${CONS_SEQ}${VOW}[^aeiouwxy]$`).test(w)) w += 'e'; // *o 条件
+    }
+  }
+
+  // Step 1c — y → i
+  if (/y$/.test(w)) {
+    const stem = w.slice(0, -1);
+    if (HAS_VOWEL.test(stem)) w = `${stem}i`;
+  }
+
+  // Step 2 / 3 — 派生后缀归并
+  for (const [suffix, repl] of Object.entries(PORTER_STEP2)) {
+    if (w.endsWith(suffix)) {
+      const stem = w.slice(0, -suffix.length);
+      if (MGR0.test(stem)) w = stem + repl;
+      break;
+    }
+  }
+  for (const [suffix, repl] of Object.entries(PORTER_STEP3)) {
+    if (w.endsWith(suffix)) {
+      const stem = w.slice(0, -suffix.length);
+      if (MGR0.test(stem)) w = stem + repl;
+      break;
+    }
+  }
+
+  // Step 4 — 剥离剩余派生后缀（m>1）
+  const step4 = /(al|ance|ence|er|ic|able|ible|ant|ement|ment|ent|ou|ism|ate|iti|ous|ive|ize)$/;
+  if (step4.test(w)) {
+    const stem = w.replace(step4, '');
+    if (MGR1.test(stem)) w = stem;
+  } else if (/(s|t)(ion)$/.test(w)) {
+    const stem = w.replace(/(s|t)(ion)$/, '$1');
+    if (MGR1.test(stem)) w = stem;
+  }
+
+  // Step 5 — 收尾 e / 双写 l
+  if (/e$/.test(w)) {
+    const stem = w.slice(0, -1);
+    if (MGR1.test(stem) || (MEQ1.test(stem) && !new RegExp(`^${CONS_SEQ}${VOW}[^aeiouwxy]$`).test(stem))) w = stem;
+  }
+  if (/ll$/.test(w) && MGR1.test(w)) w = w.slice(0, -1);
+
+  return w;
+}
+
+/** 停用词丢弃 + 词干还原（纯字母词才还原；数字/混合 token 原样保留）。 */
+function normalizeEn(tokens) {
+  const out = [];
+  for (const t of tokens) {
+    if (EN_STOPWORDS.has(t)) continue;
+    out.push(/^[a-z]+$/.test(t) ? stemEn(t) : t);
+  }
+  return out;
+}
 
 /**
- * 分词：CJK 二元组 + 拉丁/数字词。
+ * 分词（meow 类别路由 + en 归一化）：
+ * - CJK 类（汉字+假名）：连续段相邻 bigram——中文稳定零依赖，日文 n-gram 基线；
+ *   run<2 单字不成词丢弃防噪音；汉字-假名交界不断 run，"行く/食べる"自然成词；
+ * - 字母/数字类（\p{L}\p{N}）：连续段整词 + 小写化（café/привет/한국어/全角英数…）；
+ * - 其余（标点/空白/符号/emoji）：跳过——信息量为零，不污染 IDF。
+ * 文本先 NFKC 归一化（全角ＢＭ２５→bm25、半角片假名→全角）；Array.from 按 code point
+ * 迭代，emoji/Ext B 汉字等 surrogate pair 不切半。
+ *
  * 返回三类结果，区分「进索引」与「算强命中」是两层：
  *   tokens —— 全部进索引的 token（含单汉字）
  *   strong —— 长度 ≥2 的 token（unicode bigram 或拉丁词），只有它们能单独支撑一条命中
  */
 export function tokenize(text) {
   const s = String(text ?? '');
-  const tokens = [];
-  const strong = [];
-  for (const run of s.match(CJK_RUN) ?? []) {
-    // 单字连续段（如「鲸」独立成句）只产单字 token
-    if (run.length === 1) tokens.push(run);
-    for (let i = 0; i < run.length - 1; i += 1) {
-      const g = run.slice(i, i + 2);
-      tokens.push(g);
-      strong.push(g);
+  const cps = Array.from(s.normalize('NFKC'));
+  const raw = [];
+  let i = 0;
+  while (i < cps.length) {
+    const cls = classify(cps[i]);
+    if (cls === 'skip') { i += 1; continue; }
+    let j = i + 1;
+    while (j < cps.length && classify(cps[j]) === cls) j += 1;
+    const run = cps.slice(i, j);
+    if (cls === 'cjk') {
+      // 连续 CJK → 相邻 bigram（单字不成词，避免噪音）
+      if (run.length >= 2) {
+        for (let k = 0; k + 1 < run.length; k += 1) raw.push(run[k] + run[k + 1]);
+      } else {
+        raw.push(run[0]); // 单字保留（memjudge 需要单字 token 进索引，打分时降权）
+      }
+    } else {
+      raw.push(run.join('').toLowerCase());
     }
+    i = j;
   }
-  for (const w of s.match(LATIN_WORD) ?? []) {
-    const lw = w.toLowerCase();
-    tokens.push(lw);
-    if (lw.length >= 2) strong.push(lw);
-  }
+  // 英语归一化：停用词 + Porter 词干还原
+  const tokens = normalizeEn(raw);
+  const strong = tokens.filter((t) => t.length >= 2);
   return { tokens, strong, hasStrong: strong.length > 0 };
 }
 
@@ -70,15 +217,51 @@ function normNum(v, dflt) {
   return Number.isFinite(n) ? n : dflt;
 }
 
+// ── RestRegular 衰减/打分 ────────────────────────────────────────────────────
+
+/**
+ * RestRegular 风格衰减：Math.pow(0.5, ageDays / halfLifeDays)。
+ * halfLifeDays 可配置；传入 null 时回退到 schema 双档（warm 120 / cold 12）。
+ */
+export function recencyFactor(ageDays, halfLifeDays) {
+  return Math.pow(0.5, Math.max(0, ageDays) / Math.max(halfLifeDays, 0.001));
+}
+
 /**
  * 混合排序分：bm25 × 衰减 × 重要度 × 访问惯量。
  * 衰减挂 lastAccessed（不是 createdAt）—— 这是本层与 mem-eval 里 11 个插件的
  * 关键分歧：它们全部用 createdAt，于是「30 天前写、但每天在用的规矩」会沉底。
- * 复用 schema.rankWeight 保证与能力 11/12 的验收口径是同一份公式。
+ *
+ * halfLifeDays 配置链：opts.halfLifeDays > SEARCH_DEFAULTS.halfLifeDays > schema 双档。
+ * 公式与 schema.rankWeight 同源（五因子乘性），但半衰期暴露为可配置参数。
  */
 export function finalScore(bm25, mem, nowMs = Date.now(), opts = {}) {
   const o = { ...SEARCH_DEFAULTS, ...opts };
-  const rw = rankWeight(mem, nowMs);
+  const hl = o.halfLifeDays;
+  let rw;
+  if (hl !== null && hl !== undefined) {
+    // RestRegular 风格：统一半衰期，不走 schema 双档
+    const last = normNum(mem?.lastAccessed, nowMs);
+    const ageDays = Math.max(0, (nowMs - last) / 86_400_000);
+    const decay = recencyFactor(ageDays, hl);
+    const importance = Math.min(1, Math.max(0, Number(mem?.importance ?? 0.5)));
+    const accessCount = Math.max(0, Number(mem?.accessCount ?? 0));
+    const importanceFactor = 0.5 + 0.5 * importance;
+    const accessFactor = 1 + 0.1 * Math.log1p(accessCount);
+    const supersededPenalty = mem?.supersededBy ? 0.3 : 1;
+    rw = {
+      value: Number(decay.toFixed(6)),
+      ageDays: Number(ageDays.toFixed(3)),
+      halfLifeDays: hl,
+      tier: 'custom',
+      importanceFactor: Number(importanceFactor.toFixed(4)),
+      accessFactor: Number(accessFactor.toFixed(4)),
+      supersededPenalty,
+      weight: Number((decay * importanceFactor * accessFactor * supersededPenalty).toFixed(6)),
+    };
+  } else {
+    rw = rankWeight(mem, nowMs);
+  }
   // decayFloor 只覆盖时间项，其余因子仍走 rankWeight，避免两处公式漂移
   const decay = o.decayFloor > 0 ? Math.max(o.decayFloor, rw.value) : rw.value;
   const weight = Number((decay * rw.importanceFactor * rw.accessFactor * rw.supersededPenalty).toFixed(6));
