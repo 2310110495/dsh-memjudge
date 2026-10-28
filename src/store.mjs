@@ -414,6 +414,16 @@ CREATE TABLE IF NOT EXISTS memories (
   source        TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_hash ON memories(text_hash);
+-- 向量：只在开启融合检索时写。**整库压成一行 BLOB**，不逐条建行。
+-- 逐行存 294 × (8B id + 64B int8) 实测要 +40960 B（SQLite 页与行头把 19KB 撑成 40KB），
+-- 直接顶穿 199680 的验收线；打包成一行的页开销只有一页。槽位按 memories.rowid 排，
+-- 空槽全 0（读侧按 rowid 反查 id，天然对齐）。dim 随行存，换维后旧行长度不符即失效。
+CREATE TABLE IF NOT EXISTS vector_blob (
+  id    TEXT PRIMARY KEY,
+  dim   INTEGER NOT NULL,
+  slots INTEGER NOT NULL,
+  q     BLOB NOT NULL
+);
 ${SEGMENTS_DDL}
 ${FACTS_DDL}
 `;
@@ -534,6 +544,24 @@ export function open(dbPath = ':memory:', opts = {}) {
   // 表结构定稿后重建内存 facts（captain 要的重建耗时在这里打印）。
   const rebuildStats = rebuildFacts('startup');
 
+  /**
+   * 异步刷新：有 LLM key 时用 LLM 结果重建内存 facts，失败/无 key 时什么都不做。
+   * 启动路径永远走同步规则版（43ms、不等网络），这个入口给「显式刷新」用。
+   */
+  async function rebuildFactsHybrid(opts = {}) {
+    const { extractL1Hybrid } = await import('./extract.mjs');
+    const rows = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
+    const r = await extractL1Hybrid(rows.map((x) => ({ text: x.text })), opts);
+    if (r.source !== 'llm') return { facts: memFacts.total, memories: rows.length, source: r.source };
+    memFacts.byOrd.clear();
+    memFacts.slot.clear();
+    memFacts.total = 0;
+    rows.forEach((row, i) => {
+      for (const f of r.perEntry[i] || []) addMemFact(row.ord, f);
+    });
+    return { facts: memFacts.total, memories: rows.length, source: 'llm' };
+  }
+
   // 库级字符预算（memento 语义）：maxChars > 0 时超限抛 BUDGET_EXCEEDED，不截断。
   // 默认 0 = 不限——评测语料 29648 字必须能全量落库；调用方要「写满即拒」就显式传。
   const maxChars = Number.isFinite(opts.maxChars) && opts.maxChars > 0 ? Math.trunc(opts.maxChars) : 0;
@@ -570,6 +598,87 @@ export function open(dbPath = ':memory:', opts = {}) {
     if (!row) return [];
     const list = memFacts.byOrd.get(row.ord) || [];
     return list.slice().sort((a, b) => a.at - b.at);
+  }
+
+  // ── 向量表（融合检索用；不参与 put 事务，由上层异步补） ──────────────────
+
+  let _vecStmt = null;
+  function vecStmts() {
+    if (_vecStmt) return _vecStmt;
+    _vecStmt = {
+      put: db.prepare('INSERT OR REPLACE INTO vector_blob (id, dim, slots, q) VALUES (?,?,?,?)'),
+      get: db.prepare('SELECT dim, slots, q FROM vector_blob WHERE id = ?'),
+      clear: db.prepare('DELETE FROM vector_blob'),
+      rowids: db.prepare('SELECT rowid AS r, id FROM memories ORDER BY rowid'),
+      count: db.prepare('SELECT dim, slots, LENGTH(q) AS bytes FROM vector_blob WHERE id = ?'),
+      del: db.prepare('DELETE FROM vector_blob'),
+    };
+    return _vecStmt;
+  }
+
+  const VEC_SHARD = 'all';
+
+  /**
+   * 批量写向量（覆盖）。entries: Map<id, Int8Array> 或 [[id, Int8Array]]。
+   * 全部塞进一行 BLOB，槽位按 memories.rowid 对齐；没给向量的记忆留全 0 槽。
+   */
+  function putVectors(entries) {
+    assertOpen();
+    const list = entries instanceof Map ? [...entries.entries()] : [...(entries ?? [])];
+    if (!list.length) return 0;
+    const byId = new Map(list.filter(([id, v]) => id && v && v.length).map(([id, v]) => [String(id), v]));
+    if (!byId.size) return 0;
+    const rows = vecStmts().rowids.all();
+    let dim = 0;
+    for (const v of byId.values()) { dim = v.length; break; }
+    const slots = rows.reduce((m, r) => Math.max(m, Number(r.r) + 1), 1);
+    const buf = Buffer.alloc(slots * dim);
+    let n = 0;
+    for (const r of rows) {
+      const v = byId.get(r.id);
+      if (!v || v.length !== dim) continue;
+      Buffer.from(v.buffer ?? v).copy(buf, Number(r.r) * dim);
+      n += 1;
+    }
+    vecStmts().put.run(VEC_SHARD, dim, slots, buf);
+    return n;
+  }
+
+  /** 删掉整块向量（换维或关掉融合检索时用；单条删除靠下次全量重写对齐）。 */
+  function deleteVector() {
+    assertOpen();
+    return vecStmts().del.run().changes;
+  }
+
+  /** 读全部向量：Map<id, Int8Array>。维度不符（换维后的旧块）返回空表。 */
+  function allVectors(dim = 0) {
+    assertOpen();
+    const row = vecStmts().get.get(VEC_SHARD);
+    if (!row) return new Map();
+    if (dim && row.dim !== dim) return new Map();
+    const d = Number(row.dim);
+    const slots = Number(row.slots);
+    const buf = Buffer.from(row.q);
+    const out = new Map();
+    const rows = vecStmts().rowids.all();
+    for (const r of rows) {
+      const off = Number(r.r) * d;
+      if (off + d > buf.length) continue;
+      const slice = buf.subarray(off, off + d);
+      let nonZero = false;
+      for (let i = 0; i < slice.length; i += 1) if (slice[i] !== 0) { nonZero = true; break; }
+      if (!nonZero) continue;
+      out.set(r.id, new Int8Array(slice));
+    }
+    return out;
+  }
+
+  /** 向量块体量（诊断用）。 */
+  function vectorStats() {
+    assertOpen();
+    const row = vecStmts().count.get(VEC_SHARD);
+    if (!row) return { rows: 0, dims: 0, bytes: 0 };
+    return { rows: Number(row.slots), dims: Number(row.dim), bytes: Number(row.bytes) };
   }
 
   /** 删除某条记忆的内存 facts（forget 路径用；落盘层已没有 facts 表）。 */
@@ -835,8 +944,13 @@ export function open(dbPath = ':memory:', opts = {}) {
     stats,
     compact,
     rebuildFacts,
+    rebuildFactsHybrid,
     rebuildStats,
     dropFactsOf,
+    putVectors,
+    deleteVector,
+    allVectors,
+    vectorStats,
     factsSlot: (attr) => memFacts.slot.get(attr) || [],
     allFacts: () => {
       // 供 gate 做 (entity, attr) 存在性判定：扁平数组，形状与 extractL1 输出一致。

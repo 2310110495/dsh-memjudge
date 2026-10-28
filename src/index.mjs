@@ -22,6 +22,7 @@ import path from 'node:path';
 
 import { open as openStore } from './store.mjs';
 import { SearchIndex } from './search.mjs';
+import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict } from './judge.mjs';
 import { renderRecall, sleepPhase, conflictJudgments } from './layer.mjs';
 
@@ -49,6 +50,10 @@ export const TOOL_NAMES = Object.freeze([
   'memjudge_stats',
 ]);
 
+/** 向量维度。64 与 128 在 92 题召回、12 题综合上完全同分（91/92、0.792），
+ *  但 64 维打包落盘只 +16KB（188416 B），128 维要 +31KB 顶穿 199680 的验收线。 */
+const VEC_DIMS = 64;
+
 export const DEFAULTS = Object.freeze({
   /** 空串 = <DSH_HOME|~/.dsh>/memjudge/memjudge.db。绝不写用户主 profile 之外的位置。 */
   dbPath: '',
@@ -64,6 +69,15 @@ export const DEFAULTS = Object.freeze({
   touchOnRecall: true,
   /** 注入索引最多列几条。 */
   injectLimit: 8,
+  /** 融合检索（BM25 + 向量 RRF）。默认关：开启需要 key 与 32s 首次 embed，
+   *  测试与离线场景必须走纯 BM25。env MEMJUDGE_VECTOR=1 打开。 */
+  vector: process.env.MEMJUDGE_VECTOR === '1',
+  /** 查询扩展：LLM 把长问句拆成子查询分别检索。不落盘、不占库体；MEMJUDGE_EXPAND=1 打开。 */
+  expand: process.env.MEMJUDGE_EXPAND === '1',
+  /** LLM 在环选段：把候选段原文交给 chat 模型挑能回答的段。MEMJUDGE_LLMSELECT=1 打开。 */
+  llmSelect: process.env.MEMJUDGE_LLMSELECT === '1',
+  /** 向量缓存目录，null = <dbPath 同级>/.vec-cache。 */
+  vectorCacheDir: '',
 });
 
 // ---------------------------------------------------------------- 配置
@@ -94,6 +108,8 @@ export function resolveConfig(raw) {
     decayFloor: clampNum(src.decayFloor, 0, 1, DEFAULTS.decayFloor),
     touchOnRecall: src.touchOnRecall !== false,
     injectLimit: clampInt(src.injectLimit, 1, 50, DEFAULTS.injectLimit),
+    vector: src.vector === undefined ? DEFAULTS.vector : src.vector === true,
+    vectorCacheDir: typeof src.vectorCacheDir === 'string' ? src.vectorCacheDir : DEFAULTS.vectorCacheDir,
     // 假时钟注入点。不进 DEFAULTS（函数不可共享），只在这里透传。
     now: typeof src.now === 'function' ? src.now : null,
   };
@@ -218,8 +234,38 @@ export function apply(ctx, config) {
       built.addAll(store.dump().map(toDoc));
       index = built;
       indexDirty = false;
+      if (cfg.vector && store) {
+        // 先吃落盘的向量块（同步、零网络）。没有就后台补，绝不阻塞启动：
+        // 启动重建现在 43ms，接一次 32s 的 embed 会让插件装载卡死。
+        const cached = store.allVectors(VEC_DIMS);
+        if (cached.size) built.setVectors(cached);
+        else warmVectors(built);
+      }
     }
     return index;
+  };
+
+  /** 后台补向量：失败/无 key 时静默返回，索引保持纯 BM25。 */
+  let vectorWarming = null;
+  const warmVectors = (built) => {
+    if (vectorWarming) return vectorWarming;
+    vectorWarming = (async () => {
+      try {
+        const rows = store.dump();
+        const vecs = await embedVec(rows.map((r) => r.text), { dims: VEC_DIMS, cacheDir: cfg.vectorCacheDir });
+        if (!vecs) return;
+        const m = new Map();
+        rows.forEach((r, i) => { if (vecs[i]) m.set(r.id, vecs[i]); });
+        store.putVectors(m);
+        built.setVectors(m);
+        if (injectCache !== null) injectCache = null;
+      } catch {
+        // 静默：融合检索是增强项，失败就退回纯 BM25
+      } finally {
+        vectorWarming = null;
+      }
+    })();
+    return vectorWarming;
   };
 
   /**
@@ -412,7 +458,17 @@ export function apply(ctx, config) {
       const budget = clampInt(args?.budget, 1, INJECT_HARD_LIMIT, cfg.injectBudget);
       const topChapters = clampInt(args?.topChapters, 1, 4, 2);
 
-      const found = getIndex().search(query, { maxChars: budget, topChapters, now: now() });
+      // 融合检索开启且向量就绪时走异步双路；查询扩展开启时走多子查询；否则维持纯 BM25
+      // 同步路径（行为一字不变）。三条路径共用同一个 fillFromScored，装填语义不变。
+      const ix = getIndex();
+      const found = cfg.expand
+        ? await ix.searchExpanded(query, { maxChars: budget, topChapters, now: now() })
+        : (cfg.llmSelect || (cfg.vector && ix.hasVectors))
+          ? await ix.searchAsync(query, {
+            maxChars: budget, topChapters, now: now(),
+            dims: VEC_DIMS, cacheDir: cfg.vectorCacheDir, llmSelect: cfg.llmSelect,
+          })
+          : ix.search(query, { maxChars: budget, topChapters, now: now() });
       if (!found.hits.length) {
         return { denied: true, reason: 'no-candidates', detail: '检索无候选段', chars: 0, elapsedMs: found.elapsedMs, hits: [] };
       }

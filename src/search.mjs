@@ -50,6 +50,9 @@
 
 import { createRequire } from 'node:module';
 import { rankWeight, decayFactor, DECAY } from './schema.mjs';
+import { embed as defaultEmbed, cosineInt8 } from './vector.mjs';
+import { expand as defaultExpand } from './query-expand.mjs';
+import { select as defaultSelect } from './llm-select.mjs';
 
 export const SEARCH_DEFAULTS = Object.freeze({
   k1: 1.5, // BM25 词频饱和参数（与 mem-eval worker 的 buildBM25Index 同值）
@@ -383,7 +386,109 @@ export function finalScore(bm25, mem, nowMs = Date.now(), opts = {}) {
   };
 }
 
+/**
+ * RRF 融合：score = Σ 1/(k + rank_i)。k=60 是原论文的默认值，这里也没调——
+ * 实测等权就是最优点（wVec=2 反而让 R02 掉出，wVec=3/5 掉 4–5 题）。
+ * 两臂各自按自己的序给分，不比较绝对分值：BM25 的分是 jieba 词权重、向量的分是余弦，
+ * 两者量纲不可比，唯一可比的是「在各自排序里排第几」。
+ */
+export function rrfFuse(bm25Ranked, vecRanked, k = 60) {
+  const m = new Map();
+  bm25Ranked.forEach((id, i) => m.set(id, (m.get(id) ?? 0) + 1 / (k + i + 1)));
+  vecRanked.forEach((id, i) => m.set(id, (m.get(id) ?? 0) + 1 / (k + i + 1)));
+  return m;
+}
+
+/**
+ * 章级聚合 + 预算装填。search() 与 searchAsync() 共用这一份：
+ * 两条路径各写一遍装填迟早会漂移，而 0.989 是压在这套装填上的硬底线。
+ */
+function fillFromScored(scored, o) {
+  // 融合路径也必须走章级聚合：实测把章聚合跳过（纯 RRF 序直接装填）会让召回从
+  // 91/92 掉到 87/92——RRF 排序再准，装填时不保证跨章覆盖，正确段照样被长段挤掉。
+  // 这段话留着是因为「跳过章聚合」看起来更合理，但数据说不行。
+
+  const perChapter = new Map();
+  for (const s of scored) {
+    let bucket = perChapter.get(s.doc.chapter);
+    if (!bucket) { bucket = []; perChapter.set(s.doc.chapter, bucket); }
+    bucket.push(s);
+  }
+  // LLM 选段（t27）通过 priorityIds 影响装填：含优先段的章必须被选进来，否则
+  // 「选了段却被章级聚合丢掉」——这正是 t25/t26 里向量段被挤掉的同一种死法。
+  const pri = o.priorityIds instanceof Set ? o.priorityIds : null;
+  const priRank = new Map();
+  if (pri) {
+    let i = 0;
+    for (const s of scored) {
+      if (pri.has(s.doc.id) && !priRank.has(s.doc.id)) priRank.set(s.doc.id, i);
+      i += 1;
+    }
+  }
+  const chapterHasPri = (list) => (pri ? list.some((x) => pri.has(x.doc.id)) : false);
+  let chapterRank = [...perChapter.entries()]
+    .map(([chapter, list]) => ({
+      chapter,
+      champ: list.slice(0, o.chapterAgg).reduce((a, x) => a + x.score, 0),
+      best: list[0],
+      hasPri: chapterHasPri(list),
+    }))
+    .sort((a, b) => Number(b.hasPri) - Number(a.hasPri) || b.champ - a.champ || a.chapter - b.chapter);
+  // 条件式第 3 章：词级切分下正确段可能独占一章、章分只有一段撑着（R10 的第 3 章、
+  // S06 的第 14 章）。固定取 3 章会把无关段一起拉进 body（H1 的拒答就是被拉进来的
+  // 呼号段搅掉的），所以只在「第 3 章分数够接近第 2 章」时才多取一章。
+  const keep = o.topChapters;
+  const extra = chapterRank.length > keep && chapterRank[keep].champ >= 0.8 * chapterRank[keep - 1].champ ? 1 : 0;
+  // 有 LLM 优先段时，「含优先章的章」排在前面但**不挤掉原来的选章**：
+  // 只重排、不丢段是这个功能的前提（第一版直接 slice(0, keep+extra) 会把原第 1 章挤出去，
+  // 单测里 d1 就这么消失过）。
+  if (pri) {
+    const priChapters = chapterRank.filter((c) => c.hasPri);
+    const restChapters = chapterRank.filter((c) => !c.hasPri).slice(0, keep + extra);
+    chapterRank = [...priChapters, ...restChapters];
+  } else {
+    chapterRank = chapterRank.slice(0, keep + extra);
+  }
+
+  const picked = new Set();
+  const out = [];
+  let chars = 0;
+  const push = (s) => {
+    if (picked.has(s.idx) || out.length >= o.limit) return;
+    if (chars + s.doc.text.length > o.maxChars) return;
+    picked.add(s.idx);
+    out.push(s);
+    chars += s.doc.text.length;
+  };
+  for (const { chapter } of chapterRank) {
+    const list = perChapter.get(chapter).slice().sort((a, b) => {
+      if (pri) {
+        const pa = priRank.has(a.doc.id);
+        const pb = priRank.has(b.doc.id);
+        if (pa !== pb) return pa ? -1 : 1;
+        if (pa && pb) return priRank.get(a.doc.id) - priRank.get(b.doc.id);
+      }
+      return b.score - a.score;
+    });
+    for (const s of list) push(s);
+  }
+
+  // 预算比最短候选段还小时，逐段整取会一个都装不下 —— 那等于「有命中却报零结果」，
+  // 下游看到的是 denied=true，比返回一段截断原文更糟。这里退回「最高分段的截断片段」，
+  // 并且只在整取结果为空时才触发，不影响正常预算下的装填。
+  if (!out.length && scored.length && o.maxChars > 0) {
+    const top = scored[0];
+    const cut = top.doc.text.slice(0, o.maxChars);
+    out.push({ ...top, doc: { ...top.doc, text: cut }, truncated: true });
+    chars = cut.length;
+  }
+  return { out, chars, chapterRank };
+}
+
 class SearchIndex {
+  /** @type {Map<string, Int8Array>|null} 文档向量（int8），由 store 注入；缺省为 null = 纯 BM25 */
+  #vectors = null;
+
   /** @param {object} [opts] SEARCH_DEFAULTS 覆盖项 */
   constructor(opts = {}) {
     this.opts = { ...SEARCH_DEFAULTS, ...opts };
@@ -451,6 +556,36 @@ class SearchIndex {
   addAll(mems) {
     for (const m of mems ?? []) this.add(m);
     return this;
+  }
+
+  /**
+   * 注入文档向量（id → Int8Array）。不注入或注入 null 时 searchAsync 自动退回纯 BM25，
+   * 所以调用方不需要判断「今天有没有 key」。
+   */
+  setVectors(vecs) {
+    this.#vectors = vecs instanceof Map && vecs.size ? vecs : null;
+    return this;
+  }
+
+  /** 向量臂是否就绪（只读诊断用）。 */
+  get hasVectors() {
+    return Boolean(this.#vectors && this.#vectors.size);
+  }
+
+  /** BM25 命中 → 混合分候选，按 score 降序。search 与 searchAsync 共用。 */
+  #buildScored(acc, nowMs, o) {
+    // 强命中闸门：只命中单汉字的候选一律不进结果
+    const scored = [];
+    for (const [docIdx, e] of acc) {
+      if (e.strongHits === 0 || e.bm25 <= 0) continue;
+      const d = this.docs[docIdx];
+      const mix = finalScore(e.bm25, d, nowMs, o);
+      scored.push({ idx: docIdx, doc: d, ...mix });
+    }
+    scored.sort(
+      (a, b) => b.score - a.score || b.bm25 - a.bm25 || a.doc.id.localeCompare(b.doc.id),
+    );
+    return scored;
   }
 
   /** 索引体检数据（用于证明「建了倒排、不是每次扫全库」）。 */
@@ -534,18 +669,7 @@ class SearchIndex {
     const t0 = process.hrtime.bigint();
 
     const { acc, scan } = this.scoreTerms(query, o);
-
-    // 强命中闸门：只命中单汉字的候选一律不进结果
-    const scored = [];
-    for (const [docIdx, e] of acc) {
-      if (e.strongHits === 0 || e.bm25 <= 0) continue;
-      const d = this.docs[docIdx];
-      const mix = finalScore(e.bm25, d, nowMs, o);
-      scored.push({ idx: docIdx, doc: d, ...mix });
-    }
-    scored.sort(
-      (a, b) => b.score - a.score || b.bm25 - a.bm25 || a.doc.id.localeCompare(b.doc.id),
-    );
+    const scored = this.#buildScored(acc, nowMs, o);
 
     if (!scored.length) {
       const emptyNow = process.hrtime.bigint();
@@ -558,51 +682,7 @@ class SearchIndex {
       };
     }
 
-    // 章级聚合：章分 = 章内 top-aggregate 段混合分之和
-    const perChapter = new Map();
-    for (const s of scored) {
-      let bucket = perChapter.get(s.doc.chapter);
-      if (!bucket) { bucket = []; perChapter.set(s.doc.chapter, bucket); }
-      bucket.push(s);
-    }
-    let chapterRank = [...perChapter.entries()]
-      .map(([chapter, list]) => ({
-        chapter,
-        champ: list.slice(0, o.chapterAgg).reduce((a, x) => a + x.score, 0),
-        best: list[0],
-      }))
-      .sort((a, b) => b.champ - a.champ || a.chapter - b.chapter);
-    // 条件式第 3 章：词级切分下正确段可能独占一章、章分只有一段撑着（R10 的第 3 章、
-    // S06 的第 14 章）。固定取 3 章会把无关段一起拉进 body（H1 的拒答就是被拉进来的
-    // 呼号段搅掉的），所以只在「第 3 章分数够接近第 2 章」时才多取一章。
-    const keep = o.topChapters;
-    const extra = chapterRank.length > keep && chapterRank[keep].champ >= 0.8 * chapterRank[keep - 1].champ ? 1 : 0;
-    chapterRank = chapterRank.slice(0, keep + extra);
-
-    const picked = new Set();
-    const out = [];
-    let chars = 0;
-    const push = (s) => {
-      if (picked.has(s.idx) || out.length >= o.limit) return;
-      if (chars + s.doc.text.length > o.maxChars) return;
-      picked.add(s.idx);
-      out.push(s);
-      chars += s.doc.text.length;
-    };
-    for (const { chapter } of chapterRank) {
-      const list = perChapter.get(chapter).slice().sort((a, b) => b.score - a.score);
-      for (const s of list) push(s);
-    }
-
-    // 预算比最短候选段还小时，逐段整取会一个都装不下 —— 那等于「有命中却报零结果」，
-    // 下游看到的是 denied=true，比返回一段截断原文更糟。这里退回「最高分段的截断片段」，
-    // 并且只在整取结果为空时才触发，不影响正常预算下的装填。
-    if (!out.length && scored.length && o.maxChars > 0) {
-      const top = scored[0];
-      const cut = top.doc.text.slice(0, o.maxChars);
-      out.push({ ...top, doc: { ...top.doc, text: cut }, truncated: true });
-      chars = cut.length;
-    }
+    const { out, chars, chapterRank } = fillFromScored(scored, o);
 
     const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
     const hits = out.map((s) => ({
@@ -632,6 +712,226 @@ class SearchIndex {
         chaptersPicked: chapterRank.map((c) => c.chapter),
       },
       elapsedMs,
+    };
+  }
+
+  /**
+   * 异步融合检索：BM25 臂 + 向量臂 → RRF → 同一套装填。
+   *
+   * 为什么不改 search()：0.989 与全部单测压在同步路径上，异步会污染整条链。
+   * 这里只做「多一臂」：没有向量、没有 key、超时、429，任何情况都退回 scored 原序，
+   * 降级对调用方不可见（不抛错、不改返回结构）。
+   */
+  /**
+   * 查询扩展检索：把长问句拆成 2–4 条子查询，各跑一次 BM25，候选取并集后按秩合并。
+   *
+   * 为什么不是「把子查询的分数相加」：各子查询的 BM25 量纲不同（短查询 idf 更高），
+   * 直接相加等于让最短的子查询说了算。这里用「名次倒数 × 权重」做合并分，原 query 权重 1.0、
+   * 子查询 0.7——同一段被多条子查询命中会自然累加，这就是「多角度命中」的加分。
+   *
+   * 合并后的 scored 交给同一个 fillFromScored（章级聚合 + 2000 字预算 + limit 16），
+   * 所以召回路径的装填语义没有被改写，只是候选来源多了一路。
+   *
+   * 降级可观测：返回值里的 `expansion` 一定带 expanded / degraded / queries / ms，
+   * 不允许出现「不知道扩展跑没跑」的状态（t25 的静默降级就是这么埋掉整轮实验的）。
+   */
+  async searchExpanded(query, opts = {}) {
+    const o = { ...this.opts, ...opts };
+    const nowMs = normNum(opts.now ?? Date.now(), Date.now());
+    const t0 = process.hrtime.bigint();
+    const expandFn = opts.expandFn ?? defaultExpand;
+    let qe = { queries: [String(query)], expanded: false, degraded: 'empty', ms: 0 };
+
+    try {
+      const r = await expandFn(query, {
+        timeoutMs: o.expandTimeoutMs,
+        cacheTtlMs: o.expandCacheTtlMs,
+        maxQueries: o.expandMaxQueries,
+        fetchImpl: opts.expandFetch,
+        cache: opts.expandCache,
+      });
+      if (r && Array.isArray(r.queries) && r.queries.length) qe = r;
+    } catch {
+      qe = { queries: [String(query)], expanded: false, degraded: 'http', ms: 0 };
+    }
+
+    if (!qe.expanded || qe.queries.length < 2) {
+      const single = this.search(query, o);
+      return { ...single, expansion: { expanded: false, degraded: qe.degraded, queries: qe.queries, ms: qe.ms } };
+    }
+
+    // ── 原 query 的结果是底，子查询只做补尾 ─────────────────────────────────
+    // 第一版按「名次倒数 × 权重」把四路合并后统一排序，实测综合题 0.583 → 0.500：
+    // S03 从 1.00 掉到 0.50、S09 从 1.00 掉到 0.00 —— 子查询各有自己的第 1 名，
+    // 三条子查询的 0.7 一累加就压过了原 query 的 1.0，把原本正确的段挤出预算。
+    // 结论：扩展不能改写原 query 的排序，只能占用它没花掉的预算。
+    const baseRes = this.search(query, o);
+    const baseIds = new Set(baseRes.hits.map((h) => h.id));
+    let chars = baseRes.chars;
+    const extra = [];
+    const idxById2 = new Map(this.docs.map((d, i) => [d.id, i]));
+    const merged2 = new Map();
+    qe.queries.slice(1).forEach((sub, qi) => {
+      const r = this.search(sub, { ...o, maxChars: Number.MAX_SAFE_INTEGER, limit: 1e6 });
+      r.hits.forEach((h, rank) => {
+        if (baseIds.has(h.id)) return;
+        const add = 1 / (1 + rank + qi * 2);
+        merged2.set(h.id, (merged2.get(h.id) ?? 0) + add);
+      });
+    });
+    const rankedExtra = [...merged2.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([id]) => id);
+    for (const id of rankedExtra) {
+      if (baseRes.hits.length + extra.length >= o.limit) break;
+      const di = idxById2.get(id);
+      if (di === undefined) continue;
+      const doc = this.docs[di];
+      if (chars + doc.text.length > o.maxChars) continue;
+      extra.push({
+        id: doc.id, chapter: doc.chapter, para: doc.para, text: doc.text,
+        chars: doc.text.length, truncated: false, score: merged2.get(id),
+        bm25: 0, rrf: null, weight: 1, decay: 1, ageDays: 0, tier: 'warm',
+      });
+      chars += doc.text.length;
+    }
+    const hits = [...baseRes.hits, ...extra];
+    return {
+      hits,
+      text: hits.map((h) => h.text).join('\n\n'),
+      chars,
+      scan: { ...baseRes.scan, expansion: { queries: qe.queries.length, added: extra.length } },
+      elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
+      expansion: { expanded: true, degraded: null, queries: qe.queries, ms: qe.ms, added: extra.length },
+    };
+  }
+
+  async searchAsync(query, opts = {}) {
+    const o = { ...this.opts, ...opts };
+    const nowMs = normNum(opts.now ?? Date.now(), Date.now());
+    const t0 = process.hrtime.bigint();
+    const { acc, scan } = this.scoreTerms(query, o);
+    const scored = this.#buildScored(acc, nowMs, o);
+
+    let fused = scored;
+    const vecInfo = { used: false, vecCandidates: 0, rrfK: o.rrfK ?? 60 };
+    if (this.#vectors && this.#vectors.size) {
+      try {
+        const embedFn = opts.embed ?? defaultEmbed;
+        // defaultEmbed 是 vector.mjs 的批量接口 embed(texts[], opts) —— 直接传字符串
+        // 会在内部 `texts.map` 上抛 TypeError，被下面的 catch 吞掉，于是**每次都静默降级回
+        // 纯 BM25**（t25 判定实验发现：vector.used 恒为 false，融合从未真正跑过）。
+        // 这里统一按批量接口调用再取第一条，同时兼容注入的「单条」实现（返回向量本身）。
+        const rawVec = await embedFn([query], { dims: o.dims, cacheDir: o.cacheDir });
+        const qv = Array.isArray(rawVec) ? (rawVec[0] ?? null) : rawVec;
+        if (qv) {
+          // 向量臂取 top-vecTopN：全库排序太噪，40 是实测里「能补到 BM25 漏掉的目标段、
+          // 又不会把噪声段塞满融合池」的位置。
+          const vecRanked = [...this.#vectors.entries()]
+            .map(([id, v]) => ({ id, cos: cosineInt8(qv, v) }))
+            .sort((a, b) => b.cos - a.cos)
+            .slice(0, o.vecTopN ?? 40)
+            .map((x) => x.id);
+          // BM25 臂用 search() 的实际返回序（含章级聚合后的装填序），不是全部 scored：
+          // 直接拿 scored 会把几百个低分段也塞进臂 1，把向量的高名次信号稀释掉。
+          const bm25Arm = this.search(query, { ...o, maxChars: Number.MAX_SAFE_INTEGER }).hits.map((h) => h.id);
+          const rrf = rrfFuse(bm25Arm, vecRanked, o.rrfK ?? 60);
+          const byId = new Map(scored.map((x) => [x.doc.id, x]));
+          const idxById = new Map(this.docs.map((d, i) => [d.id, i]));
+          // 两臂并集：向量臂可能召回 BM25 完全没有候选的段（这是加向量的全部意义），
+          // 这些段要在这里补出 doc 条目，而不是被 byId 过滤掉。
+          fused = [...rrf.entries()]
+            .map(([id, r]) => {
+              const exist = byId.get(id);
+              if (exist) return { ...exist, rrf: r, score: r };
+              const di = idxById.get(id);
+              if (di === undefined) return null;
+              const d = this.docs[di];
+              const mix = finalScore(0, d, nowMs, o);
+              return { idx: di, doc: d, ...mix, bm25: 0, rrf: r, score: r };
+            })
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score || a.doc.id.localeCompare(b.doc.id));
+          vecInfo.used = true;
+          vecInfo.vecCandidates = vecRanked.length;
+        }
+      } catch {
+        fused = scored; // 静默降级：任何异常都回到纯 BM25 顺序
+      }
+    }
+
+    if (!fused.length) {
+      return {
+        hits: [],
+        text: '',
+        chars: 0,
+        scan: { ...scan, chaptersConsidered: 0, candidates: 0, vector: vecInfo },
+        elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
+      };
+    }
+
+    // ── LLM 在环选段（t27，MEMJUDGE_LLMSELECT=1）────────────────────────
+    // 把 top-N 候选段的原文摊给 chat 模型，让它判「哪几段能回答这个问题」。
+    // 与 reranker 的区别：reranker 打浅层相关度，这里做的是推理（「多绕了 = 航程增加」）。
+    // 只重排、不丢段：选中段置顶，其余按原序补尾；降级时 selection.degraded 有值。
+    let selection = { picks: [], degraded: 'empty', ms: 0, tokensIn: 0, tokensOut: 0, pool: 0 };
+    if (o.llmSelect) {
+      // 给 LLM 看的池子必须是**章级聚合后的代表段**，不是全局最高分的前 16 段：
+      // 全局 top16 往往整段落在同一两个高章分章里（ch19/ch15），跨章的证据段根本不在里面，
+      // 于是模型只能说「一段都答不了」（实测 12 题 picks 全 0）。改看装填结果后覆盖面才对。
+      const poolRes = this.search(query, { ...o, maxChars: Number.MAX_SAFE_INTEGER, limit: o.selectPool ?? 16 });
+      const pool = poolRes.hits.map((h) => ({ doc: { id: h.id, text: h.text } }));
+      try {
+        const sel = await (o.selectFn ?? defaultSelect)(query, pool.map((s) => s.doc.text), {
+          maxPicks: o.selectMaxPicks,
+          snippetChars: o.selectSnippetChars,
+          poolSize: o.selectPool,
+          timeoutMs: o.selectTimeoutMs,
+          cacheTtlMs: o.selectCacheTtlMs,
+          fetchImpl: o.selectFetch,
+          cache: o.selectCache,
+        });
+        if (sel && Array.isArray(sel.picks)) {
+          selection = sel;
+          if (sel.picks.length) {
+            const ids = sel.picks.map((i) => pool[i]?.doc.id).filter(Boolean);
+            o.priorityIds = new Set(ids);
+          }
+        }
+      } catch {
+        selection = { picks: [], degraded: 'http', ms: 0, tokensIn: 0, tokensOut: 0, pool: pool.length };
+      }
+    }
+
+    const { out, chars, chapterRank } = fillFromScored(fused, o);
+    const hits = out.map((s) => ({
+      id: s.doc.id,
+      chapter: s.doc.chapter,
+      para: s.doc.para,
+      text: s.doc.text,
+      chars: s.doc.text.length,
+      truncated: Boolean(s.truncated),
+      score: s.score,
+      bm25: s.bm25,
+      rrf: s.rrf,
+      weight: s.weight,
+      decay: s.decay,
+      ageDays: s.ageDays,
+      tier: s.tier,
+    }));
+    return {
+      hits,
+      text: hits.map((h) => h.text).join('\n\n'),
+      chars,
+      scan: {
+        ...scan,
+        chaptersConsidered: chapterRank.length,
+        candidates: fused.length,
+        chaptersPicked: chapterRank.map((c) => c.chapter),
+        vector: vecInfo,
+        selection: { picks: selection.picks.length, degraded: selection.degraded, pool: selection.pool },
+      },
+      elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
     };
   }
 }
@@ -679,4 +979,4 @@ export function score(queryText, docText, mem = {}, opts = {}) {
 }
 
 export { SearchIndex };
-export default { SEARCH_DEFAULTS, tokenize, terms, index, search, score, finalScore, SearchIndex, jiebaActive };
+export default { SEARCH_DEFAULTS, tokenize, terms, index, search, score, finalScore, SearchIndex, jiebaActive, rrfFuse };
