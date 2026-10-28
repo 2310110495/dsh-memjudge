@@ -399,6 +399,51 @@ function hitBy(pool, pq, p) {
  * @param {string} query
  * @param {object|string} target buildStore 的结果，或一段材料（内部临时建库）
  */
+// 属性短语：「的 X」优先（「白鲸号的舵机型号是多少」→ 舵机型号），否则退回 primary。
+// 同义词只按「物理量名」归并，不登记任何题面，避免变成题库白名单。
+const ATTR_PHRASE_RE = /的([\u4e00-\u9fff]{2,6}?)(?=是|有|为|多少|什么|哪|几|怎么|如何|叫|称为|称作|$|[?？])/;
+const ATTR_SYNONYM = [
+  ['直径', '口径', '粗细', '外径'],
+  ['容量', '容积', '装载量'],
+  ['压力', '压强'],
+  ['功率', '马力'],
+  ['速度', '航速', '速率'],
+  ['吨位', '载重吨', '载重量'],
+  ['长度', '总长'],
+  ['编号', '代号'],
+];
+function canonAttr(s) {
+  const t = norm(s);
+  for (const group of ATTR_SYNONYM) {
+    if (group.some((g) => t === norm(g) || t.includes(g))) return norm(group[0]);
+  }
+  return t;
+}
+const ATTR_SUFFIX_WORDS = ['总额', '清单', '编号', '代号', '型号', '容量', '压力', '直径', '口径', '日期', '时间', '数量', '金额', '费用', '长度', '宽度', '高度', '深度', '重量', '功率', '速度', '航速', '吨位', '页码', '项数'];
+// 「修理费总额」的核心是「修理费」：材料里有「修理费」就说明这个属性存在，
+// 只是问句把量名后缀加长了。C 组「舵机型号」的核心「舵机」在材料里没有，仍然要拒。
+function attrCore(key) {
+  for (const suf of ATTR_SUFFIX_WORDS) if (key.endsWith(suf) && key.length > suf.length) return key.slice(0, -suf.length);
+  return key;
+}
+const ANSWER_TYPE_ONLY = /^(名字|名称|型号|编号|日期|时间|数量|金额|费用|长度|宽度|高度|深度|重量|吨位)$/;
+function cleanPhrase(s) {
+  return String(s)
+    .replace(/(一共|共计|总计|合计|不超过|超过|大约|约|时|共)$/u, '')
+    .replace(/^[时当近约共合总]/u, '');
+}
+function attrPhraseOf(query, pq) {
+  const m = String(query).match(ATTR_PHRASE_RE);
+  const raw = m && [...m[1]].length >= 2 ? m[1] : (pq?.primary || '');
+  const cand = cleanPhrase(raw);
+  // 短语里混进动词/量词（「未上船」「那批」）说明抽错了，宁可不判也不误伤。
+  if (/(未|没|导致|一批|那批|上船|下船|超过|不超过)/.test(cand)) return '';
+  // 「叫什么名字」问的是名字这个词本身，属性缺席判据对它没有信息量；
+  // 只放行这种纯答案类型词，复合短语（「舵机型号」）仍然要判。
+  if (ANSWER_TYPE_ONLY.test(cand)) return '';
+  return [...cand].length >= 2 ? cand : '';
+}
+
 export function gate(query, target, opts = {}) {
   const store = typeof target === 'string' ? buildStore([{ n: 1, text: target }]) : target;
 
@@ -487,6 +532,48 @@ export function gate(query, target, opts = {}) {
   // 「覆盖率偏低」与「对象不存在」在这份语料上不可分。所以拒答仍只走下面的覆盖率高/低两档，
   // 「被问实体整串缺席」这一现象交给评测器侧单独归档（mem-eval/harness/score.mjs 的 absent 档），
   // 在那里它不冒充拒答、也不冒充倾倒。
+
+  // ── 属性缺席硬门（t15）────────────────────────────────────────────────────
+  // 判据来源是 L1 事实的 (entity, attr) 集合，不是 coverage 阈值：
+  // 覆盖率低只说明问句措辞与原文偏移，属性缺席说明「这个实体根本没有这个槽」。
+  // 触发条件三条同时成立，避免误伤：
+  //   ① 实体在 L1 事实里当过主语；
+  //   ② 问句的属性短语（「的 X」优先）与该实体的 attr 集合无交集；
+  //   ③ 这个属性短语整串在全文里也不出现（出现说明只是叫法不同）。
+  if (Array.isArray(opts.l1Facts) && opts.l1Facts.length) {
+    // 实体可能没被抽进 facts 主语（「比通港的潮差」这种机构+属性），
+    // 退一步用「X 的 Y」里的 X，只要 X 在全文出现过就当作已知对象。
+    let subject = entity;
+    if (!subject) {
+      const m = String(query).match(/([\u4e00-\u9fff]{2,6})的[\u4e00-\u9fff]{2,6}?(?:是|有|为|多少|什么|哪|几|叫)/);
+      if (m && fullText.includes(norm(m[1]))) subject = m[1];
+    }
+    const phrase = attrPhraseOf(query, pq);
+    if (subject && phrase) {
+      const key = canonAttr(phrase);
+      const core = attrCore(key);
+      // 属性存在性看全库，不只看该实体的槽：材料里任何实体记过「修理费」，
+      // 就说明这个属性在这份材料里不是缺席的（主体归属问题不在这里判）。
+      const own = opts.l1Facts.filter((f) => f.entity === subject);
+      const has = opts.l1Facts.some((f) => {
+        const a = canonAttr(f.attr);
+        return a === key || a.includes(key) || key.includes(a)
+          || (core.length >= 2 && (a.includes(core) || core.includes(a)));
+      });
+      const inText = glueAll.includes(norm(phrase));
+      if ((own.length > 0 || fullText.includes(norm(subject))) && !has && !inText) {
+        return {
+          deny: true,
+          reason: 'attribute-not-recorded',
+          entity: subject,
+          attribute: phrase,
+          // 文案要复述完整问法：H1 的属性 key 是拉丁串「imo」，只回拉丁串会让
+          // SPEC §2.6 的 absent 整串（「IMO 编号」）落空，拒答被判成没拒。
+          detail: `「${subject}」有记载，但材料里没有「${attrPhrase(query, phrase) || phrase}」这一项`,
+        };
+      }
+    }
+  }
 
   const p = pq.primary;
 
