@@ -28,7 +28,7 @@ export const RERANK_DEFAULTS = Object.freeze({
 
 /** key 只从环境读，绝不落盘、不进日志、不进 commit。 */
 export function rerankEnabled() {
-  return Boolean(process.env.MEMJUDGE_LLM_KEY);
+  return Boolean(llmKey());
 }
 
 /**
@@ -44,6 +44,8 @@ export function rerankOptIn() {
   const v = String(process.env.MEMJUDGE_RERANK ?? '').trim().toLowerCase();
   return rerankEnabled() && (v === '1' || v === 'true' || v === 'yes' || v === 'on');
 }
+
+import { llmKey } from './config.mjs';
 
 const cache = new Map(); // `${digest}` → { at, results }
 export const rerankStats = {
@@ -119,7 +121,7 @@ export async function rerank(query, docs, opts = {}) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.MEMJUDGE_LLM_KEY}`,
+        Authorization: `Bearer ${llmKey()}`,
       },
       // 一次打包所有候选：逐条调用会把延迟与费用乘 20 倍
       body: JSON.stringify({ model: o.model, query: q, documents: list }),

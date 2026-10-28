@@ -13,6 +13,8 @@
 //      导致 t21 报的所有「融合」数字其实都是纯 BM25 的。这里不允许再出现「不知道跑没跑」的状态。
 //   3. 查询扩展是**查询时**算的，不落盘、不进索引，库体预算不受影响。
 
+import { llmKey } from './config.mjs';
+
 const ENDPOINT = 'https://api.siliconflow.cn/v1/chat/completions';
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 
@@ -83,7 +85,7 @@ export function expandCacheSize() {
 }
 
 export function expandEnabled() {
-  return Boolean(process.env.MEMJUDGE_LLM_KEY);
+  return Boolean(llmKey());
 }
 
 /**
@@ -134,7 +136,7 @@ export async function expand(query, opts = {}) {
   try {
     const res = await fetchImpl(ENDPOINT, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.MEMJUDGE_LLM_KEY}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${llmKey()}` },
       body: JSON.stringify({
         model: o.model,
         temperature: 0,

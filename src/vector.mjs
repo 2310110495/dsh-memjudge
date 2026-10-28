@@ -11,6 +11,7 @@
 // 缓存：按 sha256(text) 前 16 位索引，落 <cacheDir>/vec-cache.json，值存 int8 base64。
 // 同一段文本永不重复调用；文本一变 hash 就变，缓存自然失效。
 
+import { llmKey } from './config.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -118,7 +119,7 @@ function cache() {
 
 /** key 只在内存里读，绝不落盘、不进日志。 */
 function apiKey() {
-  const k = process.env.MEMJUDGE_LLM_KEY;
+  const k = llmKey();
   return k && k.length > 8 ? k : null;
 }
 

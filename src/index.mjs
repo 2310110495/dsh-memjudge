@@ -25,6 +25,7 @@ import { SearchIndex } from './search.mjs';
 import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict } from './judge.mjs';
 import { renderRecall, sleepPhase, conflictJudgments } from './layer.mjs';
+import { configReport, STATE_DIR } from './config.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
 export const name = 'memjudge';
@@ -704,11 +705,16 @@ export function apply(ctx, config) {
           injectBudget: { type: 'integer' },
           dbPath: { type: 'string' },
           tidy: { type: 'string', description: 'layer 四阶段后台整理（mneme sleep 同构）的一句话结论。' },
+          modules: { type: 'string', description: '各增强模块的开关状态（ON/OFF）与是否有密钥。' },
+          keyConfigured: { type: 'boolean' },
+          keySource: { type: 'string' },
+          panelPath: { type: 'string', description: '可视化面板 HTML 的生成路径。' },
         },
         required: [
           'memories', 'facts', 'textChars', 'bytes', 'limitBytes', 'withinLimit',
           'docs', 'terms', 'postings', 'chapters',
           'injectEnabled', 'injectChars', 'injectBudget', 'dbPath',
+          'modules', 'keyConfigured', 'keySource', 'panelPath',
         ],
       },
       render: (_args, value) => textBlock(
@@ -716,7 +722,10 @@ export function apply(ctx, config) {
         + `库体 ${(value.bytes / 1024).toFixed(1)}KB（上限 ${(value.limitBytes / 1024).toFixed(0)}KB，${value.withinLimit ? '在预算内' : '超预算'}）\n`
         + `倒排 ${value.terms} 词 / ${value.postings} 条 posting / ${value.chapters} 章\n`
         + `后台整理 ${value.tidy ?? '未运行'}\n`
-        + `注入 ${value.injectEnabled ? `开启（${value.injectChars}/${value.injectBudget} 字符）` : '关闭（0 字符）'}`,
+        + `注入 ${value.injectEnabled ? `开启（${value.injectChars}/${value.injectBudget} 字符）` : '关闭（0 字符）'}\n`
+        + `模块 ${value.modules}\n`
+        + `密钥 ${value.keyConfigured ? `已配置（${value.keySource}）` : '未配置——向量/重排/LLM 提取全部停用，走纯 BM25'}\n`
+        + `面板 ${value.panelPath}（node scripts/panel.mjs --open 刷新）`,
       ),
     },
     isConcurrencySafe: () => true,
@@ -745,6 +754,16 @@ export function apply(ctx, config) {
         tidy: `${tidy.conflicts.length} 组待审矛盾 / ${tidy.archived.length} 条待降级`
           + ` / ${tidy.relations.length} 条共现关系`
           + (tidy.errors.length ? ` / ${tidy.errors.length} 阶段失败` : ''),
+        modules: (() => {
+          const r = configReport();
+          const f = r.flags;
+          return `jieba ${f.jieba ? 'ON' : 'OFF'} / 向量 ${f.vector ? 'ON' : 'OFF'}`
+            + ` / rerank ${f.rerank ? 'ON' : 'OFF'} / 扩展 ${f.expand ? 'ON' : 'OFF'}`
+            + ` / 选段 ${f.llmSelect ? 'ON' : 'OFF'} / LLM提取 ${f.llmExtract ? 'ON' : 'OFF'}`;
+        })(),
+        keyConfigured: configReport().hasKey,
+        keySource: configReport().keySource,
+        panelPath: path.join(STATE_DIR, 'panel.html'),
       };
       return out;
     },

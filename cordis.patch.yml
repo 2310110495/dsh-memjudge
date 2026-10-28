@@ -1,3 +1,25 @@
+# memjudge 的 cordis 补丁：把插件挂进 profile。
+#
+# 这里只放**非敏感**配置。密钥不进这个文件，也不进 git：
+#   写到 <DSH_HOME>/memjudge/secrets.json → {"llmKey":"你自己的key"}
+#   或注入环境变量 MEMJUDGE_LLM_KEY（CI / 容器场景）。
+# 两者都没有时插件照常工作：检索走纯 BM25，向量/重排/LLM 提取自动停用，
+# memjudge_stats 与面板都会明写「未配置密钥」。
 - insert:
     - id: memjudge
       name: 'dsh-memjudge'
+      config:
+        # 固定注入。默认关——能力 8 的 0 字符是优点，不是缺陷。
+        autoInject: false
+        # 单次注入字符上限，1..2000
+        injectBudget: 2000
+        # 衰减半衰期（天），挂 lastAccessed
+        halfLifeDays: 30
+        # 检索命中即刷新访问时间
+        touchOnRecall: true
+        # 四个检索增强模块默认关：实测零收益的不进默认路径。
+        # 打开前先确认 secrets.json 里配了 key，否则它们会被强制关闭。
+        vector: false
+        rerank: false
+        expand: false
+        llmSelect: false

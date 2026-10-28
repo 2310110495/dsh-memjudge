@@ -9,6 +9,8 @@
 // 降级必须可观测（t25/t26 的教训）：返回值永远带 degraded ∈ no-key|timeout|http|parse|none。
 // 静默降级会让整轮实验测的都是降级版本而没人知道。
 
+import { llmKey } from './config.mjs';
+
 const ENDPOINT = 'https://api.siliconflow.cn/v1/chat/completions';
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 
@@ -92,7 +94,7 @@ export function selectCacheSize() {
 }
 
 export function selectEnabled() {
-  return Boolean(process.env.MEMJUDGE_LLM_KEY);
+  return Boolean(llmKey());
 }
 
 function digest(query, snippets) {
@@ -154,7 +156,7 @@ export async function select(query, candidates, opts = {}) {
   try {
     const res = await fetchImpl(ENDPOINT, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.MEMJUDGE_LLM_KEY}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${llmKey()}` },
       body: JSON.stringify({
         model: o.model,
         temperature: 0,

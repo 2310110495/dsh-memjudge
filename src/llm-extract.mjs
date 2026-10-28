@@ -4,10 +4,11 @@
 // 这一层在 key 可用时补语义三元组，失败一律静默降级，调用方不需要 try/catch。
 //
 // 三条硬约束：
-//   1. key 只从 process.env.MEMJUDGE_LLM_KEY 读，绝不落盘、不进日志、不进 commit。
+//   1. key 只从 llmKey() 读，绝不落盘、不进日志、不进 commit。
 //   2. grounding：LLM 给的 sent 必须在原文里逐字 indexOf 得到，否则整条丢弃并计数。
 //   3. 缓存按 text 的 sha256 去重，同一段文本永不重复调用（文本改了 hash 就变）。
 
+import { llmKey } from './config.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,7 +32,7 @@ export const llmStats = {
 };
 
 export function llmEnabled() {
-  return Boolean(process.env.MEMJUDGE_LLM_KEY);
+  return Boolean(llmKey());
 }
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 24);
@@ -165,7 +166,7 @@ async function callOnce(texts, apiKey) {
  * 失败/无 key 时返回 null，调用方据此降级（静默）。
  */
 export async function extractBatch(entries, opts = {}) {
-  const apiKey = process.env.MEMJUDGE_LLM_KEY;
+  const apiKey = llmKey();
   llmStats.enabled = Boolean(apiKey);
   if (!apiKey || !entries.length) return null;
 
