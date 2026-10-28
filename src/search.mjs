@@ -565,14 +565,19 @@ class SearchIndex {
       if (!bucket) { bucket = []; perChapter.set(s.doc.chapter, bucket); }
       bucket.push(s);
     }
-    const chapterRank = [...perChapter.entries()]
+    let chapterRank = [...perChapter.entries()]
       .map(([chapter, list]) => ({
         chapter,
         champ: list.slice(0, o.chapterAgg).reduce((a, x) => a + x.score, 0),
         best: list[0],
       }))
-      .sort((a, b) => b.champ - a.champ || a.chapter - b.chapter)
-      .slice(0, o.topChapters);
+      .sort((a, b) => b.champ - a.champ || a.chapter - b.chapter);
+    // 条件式第 3 章：词级切分下正确段可能独占一章、章分只有一段撑着（R10 的第 3 章、
+    // S06 的第 14 章）。固定取 3 章会把无关段一起拉进 body（H1 的拒答就是被拉进来的
+    // 呼号段搅掉的），所以只在「第 3 章分数够接近第 2 章」时才多取一章。
+    const keep = o.topChapters;
+    const extra = chapterRank.length > keep && chapterRank[keep].champ >= 0.8 * chapterRank[keep - 1].champ ? 1 : 0;
+    chapterRank = chapterRank.slice(0, keep + extra);
 
     const picked = new Set();
     const out = [];
