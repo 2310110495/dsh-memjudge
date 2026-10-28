@@ -1,3 +1,4 @@
+process.env.MEMJUDGE_NO_SECRETS = "1";
 // 向量层与 RRF 融合的契约测试 —— 全程不碰网络。
 //
 // 三条不变量在这里钉死：

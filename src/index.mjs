@@ -26,12 +26,13 @@ import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict } from './judge.mjs';
 import { renderRecall, sleepPhase, conflictJudgments } from './layer.mjs';
 import { configReport, STATE_DIR } from './config.mjs';
+import { installMemjudgeRpc } from './rpc.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
 export const name = 'memjudge';
 
 /** 需要宿主注入的服务。缺 tools 或 systemPrompt 时 apply 不会被调用。 */
-export const inject = ['tools', 'systemPrompt'];
+export const inject = ['tools', 'systemPrompt', 'connection'];
 
 /** 注入 section 名。带冒号前缀，与 soul-md 的 `soul:*`、宿主的 `dsh:*` 同风格。 */
 export const SECTION_NAME = 'memjudge:recall';
@@ -219,6 +220,10 @@ export function apply(ctx, config) {
     if (typeof disposer === 'function') disposers.push(disposer);
     return disposer;
   };
+
+  // 宿主 RPC 通道：给 browser 半侧（client.js 的设置页「记忆库」面板）提供只读数据。
+  // 无 Connection RPC 时静默空函数，不影响其它功能。
+  track(installMemjudgeRpc(ctx, { dbPath }));
 
   let index = null;
   let indexDirty = true;

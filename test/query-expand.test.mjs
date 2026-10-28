@@ -1,3 +1,4 @@
+process.env.MEMJUDGE_NO_SECRETS = "1";
 // query-expand 单测：全程不碰网络（fetchImpl / expandFn 注入）。
 //
 // 重点钉两件事：

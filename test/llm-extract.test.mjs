@@ -1,3 +1,4 @@
+process.env.MEMJUDGE_NO_SECRETS = "1";
 // LLM 提取层离线自检：不碰真 API，用注入的 fetch 验证 grounding/缓存/重试降级。
 import test from 'node:test';
 import assert from 'node:assert/strict';

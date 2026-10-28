@@ -1,3 +1,4 @@
+process.env.MEMJUDGE_NO_SECRETS = "1";
 // llm-select 单测：全程零网络（fetchImpl 注入）。重点钉住「降级必须可观测」与「只重排不丢段」。
 import assert from 'node:assert/strict';
 import { select, parsePicks, selectEnabled, clearSelectCache, selectCacheSize, LS_DEFAULTS } from '../src/llm-select.mjs';

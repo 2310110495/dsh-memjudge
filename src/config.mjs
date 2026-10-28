@@ -50,10 +50,19 @@ export function reloadConfig() {
   cache = null;
 }
 
+/** 测试钩子：不碰真实 secrets.json，overrides 优先级最高。传 null 清除。 */
+let keyOverride = null;
+export function _setKeyOverride(v) {
+  keyOverride = v == null ? null : String(v);
+}
+
 /** 密钥：env 优先，其次 secrets.json。空串表示未配置。 */
 export function llmKey() {
+  if (keyOverride !== null) return keyOverride;
   const env = process.env.MEMJUDGE_LLM_KEY;
   if (env && env.trim()) return env.trim();
+  // 测试隔离：测试进程不想读用户的 secrets.json 时置 1
+  if (process.env.MEMJUDGE_NO_SECRETS === '1') return '';
   const { secrets } = load();
   const k = secrets.llmKey;
   return typeof k === 'string' && k.trim() ? k.trim() : '';
@@ -73,6 +82,7 @@ export function maskKey(k = llmKey()) {
 /** 密钥来源，用于面板区分「自己的」和「环境里别人的」。 */
 export function keySource() {
   if (process.env.MEMJUDGE_LLM_KEY && process.env.MEMJUDGE_LLM_KEY.trim()) return 'env';
+  if (process.env.MEMJUDGE_NO_SECRETS === '1') return 'none';
   const { secrets } = load();
   if (typeof secrets.llmKey === 'string' && secrets.llmKey.trim()) return 'secrets.json';
   return 'none';

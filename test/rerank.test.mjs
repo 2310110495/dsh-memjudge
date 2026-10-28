@@ -1,3 +1,4 @@
+process.env.MEMJUDGE_NO_SECRETS = "1";
 // rerank.mjs 单测：不依赖网络（fetchImpl 注入），只验排序/截断/缓存/降级四条不变量。
 //
 // 用固定 mock 候选集，分数照 capten 实测的量级给（0.004579 / 0.002011 / 0.000044），

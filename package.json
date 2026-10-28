@@ -19,8 +19,9 @@
   "files": [
     "src",
     "docs",
-    "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "client.js",
+    "cordis.patch.yml"
   ],
   "dsh": {
     "bundle": {
@@ -29,6 +30,14 @@
     "compatibility": {
       "dsh": ">=0.2.0-rc.2 <0.3.0",
       "node": ">=22.5"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web",
+      "immediately": true
     }
   },
   "engines": {
