@@ -12,11 +12,14 @@
 //
 // 用法：node scripts/check-generality.mjs
 import { buildStore, gate } from '../src/judge.mjs';
+import { extractL1 } from '../src/extract.mjs';
 import { isHardDeny } from '../src/index.mjs';
 import { chapters, recall, synthesis } from '../../mem-eval/corpus/quiz.mjs';
 
 const store = buildStore(chapters.map((c) => ({ n: c.n, text: c.text })));
 const body = chapters.map((c) => c.text).join('\n');
+// t15：属性缺席判据要的是 L1 的 (entity, attr) 集合，不是旧的滑窗 facts。
+const l1Facts = chapters.flatMap((c) => extractL1(c.text, { ch: c.n }));
 
 // 括号内是语料中的 grep 计数，0 表示这个名字/属性从没出现过。
 const ABSENT_CASES = [
@@ -63,7 +66,7 @@ let denied = 0;
 let gapCount = 0;
 const misses = [];
 for (const [tag, q] of ABSENT_CASES) {
-  const g = gate(q, store);
+  const g = gate(q, store, { l1Facts });
   const hard = isHardDeny(g, q, body);
   if (hard) denied += 1;
   else {
@@ -75,7 +78,7 @@ for (const [tag, q] of ABSENT_CASES) {
 
 let falseDeny = [];
 for (const item of [...recall, ...synthesis]) {
-  const g = gate(item.q, store);
+  const g = gate(item.q, store, { l1Facts });
   if (isHardDeny(g, item.q, body)) falseDeny.push(`${item.id} ${item.q}（${g.reason}）`);
 }
 
