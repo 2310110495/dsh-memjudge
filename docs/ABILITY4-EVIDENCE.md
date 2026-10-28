@@ -66,5 +66,20 @@
 `node --test test/*.test.mjs` 全绿。t22/t26/t27 三个新模块都默认关闭
 （`MEMJUDGE_RERANK` / `MEMJUDGE_EXPAND` / `MEMJUDGE_LLMSELECT`），零收益的功能不进默认路径。
 
-> 本文所有数字都来自实测脚本（`D:\cursor项目组\4\.t8\t2*.mjs`）与 SPEC 指定判分函数，
-> 未经二次估算。脚本为临时验证用，可删。
+> 本文所有数字都来自实测脚本与 SPEC 指定判分函数（`score.mjs` 的 `scoreRecall`），未经二次估算。
+>
+> **多轮口径的可复现入口**只有一个，且已随仓库提交：
+> `memjudge-plugin/reports/multiround-synth.mjs`（commit `6352c7e`，t28「多轮召回验证脚本」）。
+>
+> ```bash
+> cd memjudge-plugin
+> set -a && . ./.env.local && set +a          # 需要 MEMJUDGE_LLM_KEY
+> node reports/multiround-synth.mjs --rounds 3   # 多轮口径（SPEC §2.4 的 4b）
+> node reports/multiround-synth.mjs --rounds 1   # 单轮基线，用于复现 0.583
+> ```
+>
+> 脚本的硬约束：判「够不够」只看本轮材料 + 原问题，**不读 `item.kw`**；`kw` 只在最后评分时用，与 `scoreRecall` 同口径。
+>
+> 历史临时脚本位于 `D:\cursor项目组\4\.t8\t2*.mjs`，那是**工作目录、可随时删除**，不作为证据来源引用。
+>
+> 状态说明：脚本目前只产出控制台输出，尚未生成 `results/memjudge-turns3.json` 这类正式结果文件（t31 负责 harness 正式化，字段应含 `turns / llmCalls / promptTokens / completionTokens`）。在产物落地前，0.708 只能作为**待复核引用**，不得单独用作验收依据。
