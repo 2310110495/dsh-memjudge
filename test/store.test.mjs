@@ -11,7 +11,9 @@ import { open, extractFacts, STORAGE_LIMIT_BYTES, entryUsage, checkBudget, Budge
 import { chapters } from '../../mem-eval/corpus/novel.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const TMP = path.join(HERE, '.tmp');
+// 进程唯一临时目录：多套测试并行（或上一条命令的库还没释放）时，共用的 .tmp
+// 会在 rmSync 上抛 EPERM，或删到别人正在写的库。pid 后缀把竞争面清零。
+const TMP = path.join(HERE, `.tmp-${process.pid}`);
 const DB = path.join(TMP, 'memjudge.db');
 
 const FIXED_NOW = Date.UTC(2026, 2, 23, 4, 0, 0); // 假时钟：2026-03-23T04:00:00Z
@@ -469,7 +471,7 @@ check('v2 库（covered 为 \'0\'/\'1\' 字符串位图）重开升级到 v3，�
   assert.equal(s2.stats().wornSegments, n0, '重建后段位图应回到未覆盖');
   const afterFirst = s2.segmentDump();
   const version = s2.raw().prepare('SELECT v FROM meta WHERE k = ?').get('schema_version').v;
-  assert.equal(Number(version), 3, `schema_version 应升到 3，实际 ${version}`);
+  assert.equal(Number(version), 5, `schema_version 应升到 5（facts 改内存派生层，不落盘），实际 ${version}`);
   s2.close();
 
   const s3 = open(v2Path);
