@@ -395,6 +395,67 @@ export function extractL1(text, opts = {}) {
 /** 兼容入口：store.mjs 的 facts 写入点调这个。 */
 export const extractFacts = extractL1;
 
+/** 把 LLM 五元组补齐成与规则层同形状的 fact（key/at/sentOff/sentLen 由原文定位）。 */
+function normalizeLLMFact(t, text, ch) {
+  const sent = String(t.sent || '');
+  const off = text.indexOf(sent);
+  const vOff = off >= 0 ? text.indexOf(t.value, off) : -1;
+  return {
+    entity: t.entity ?? null,
+    attr: t.attr,
+    key: keyOf(t.attr),
+    value: t.value,
+    unit: null,
+    kind: t.valueType === 'enum' ? 'role' : t.valueType === 'coord' ? 'coord' : t.valueType === 'id' ? 'id' : 'value',
+    valueType: t.valueType || 'text',
+    sent,
+    sentOff: off >= 0 ? off : 0,
+    sentLen: sent.length,
+    at: vOff >= 0 ? vOff : (off >= 0 ? off : 0),
+    ch: ch ?? null,
+  };
+}
+
+/**
+ * 两层抽取：LLM 优先，失败/无 key 静默降级到规则层。
+ *
+ * 返回 { facts, perEntry, source, dropped }：
+ *   source = 'llm' | 'rules' | 'rules-fallback'，调用方可以只记日志，不必分支。
+ * 启动路径不该调这个（会等网络）；它给的是「显式刷新」入口。
+ */
+export async function extractL1Hybrid(entries, opts = {}) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) return { facts: [], perEntry: [], source: 'rules', dropped: 0 };
+  const chOf = (e) => (e?.chapter ?? e?.ch ?? null);
+  const rule = list.map((e) => extractL1(String(e?.text ?? ''), { ch: chOf(e) }));
+
+  let llm = null;
+  let mod = null;
+  try {
+    mod = await import('./llm-extract.mjs');
+  } catch {
+    mod = null;
+  }
+  if (mod?.llmEnabled?.()) {
+    try {
+      llm = await mod.extractBatch(list.map((e) => ({ text: String(e?.text ?? '') })), opts);
+    } catch {
+      llm = null;
+    }
+  }
+  if (!llm) return { facts: rule.flat(), perEntry: rule, source: 'rules', dropped: 0 };
+
+  let dropped = 0;
+  const sources = list.map(() => 'rules');
+  const perEntry = rule.map((r, i) => {
+    const got = llm[i];
+    if (!Array.isArray(got) || !got.length) return r; // 该条没有 LLM 结果 → 用规则
+    sources[i] = 'llm';
+    return got.map((t) => normalizeLLMFact(t, String(list[i]?.text ?? ''), chOf(list[i])));
+  });
+  return { facts: perEntry.flat(), perEntry, sources, source: 'llm', dropped };
+}
+
 /**
  * 全量重建：给定一批 {id, text}，产出按 id 分组的三元组。
  * 纯函数——清表与写回由调用方在同一事务里完成，本函数不碰数据库。
