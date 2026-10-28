@@ -27,6 +27,25 @@ function readJson(path) {
   }
 }
 
+/** 库体展示上限的默认值。200KB 只够 SPEC 的验收语料，真实库要大得多。 */
+export const DEFAULT_STORAGE_LIMIT_BYTES = 2 * 1024 * 1024;
+/** 写入闸门默认值：0 = 不设硬限（要「写满即拒」得用户显式填）。 */
+export const DEFAULT_MAX_CHARS = 0;
+
+/** 正整数清洗：非法/非正 → 默认值。用于上限这类「0 无意义」的字段。 */
+function posInt(v, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.trunc(n);
+}
+
+/** 非负整数清洗：非法/负数 → 默认值。0 是合法值（= 不设限）。 */
+function nonNegInt(v, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.trunc(n);
+}
+
 let cache = null;
 function load() {
   if (cache) return cache;
@@ -41,6 +60,9 @@ function load() {
     embedModel: String(process.env.MEMJUDGE_EMBED_MODEL || cfg.embedModel || 'Qwen/Qwen3-Embedding-8B'),
     rerankModel: String(process.env.MEMJUDGE_RERANK_MODEL || cfg.rerankModel || 'Qwen/Qwen3-Reranker-8B'),
     dims: Number(process.env.MEMJUDGE_EMBED_DIMS || cfg.dims || 64) || 64,
+    // 存储上限两个字段与模型名同一条三来源优先级：env > config.json > 默认
+    storageLimitBytes: posInt(process.env.MEMJUDGE_STORAGE_LIMIT_BYTES || cfg.storageLimitBytes, DEFAULT_STORAGE_LIMIT_BYTES),
+    maxChars: nonNegInt(process.env.MEMJUDGE_MAX_CHARS || cfg.maxChars, DEFAULT_MAX_CHARS),
   };
   return cache;
 }
@@ -93,6 +115,10 @@ export function chatModel() { return load().chatModel; }
 export function embedModel() { return load().embedModel; }
 export function rerankModel() { return load().rerankModel; }
 export function embedDims() { return load().dims; }
+/** 库体上限（字节）：只用于展示与验收判定，不是写入闸门。 */
+export function storageLimitBytes() { return load().storageLimitBytes; }
+/** 写入闸门（字符）：0 = 不设硬限；>0 时超限抛 BUDGET_EXCEEDED，不截断。 */
+export function maxChars() { return load().maxChars; }
 export function rawConfig() { return load().config; }
 
 /** 写非敏感配置（合并）。 */
@@ -117,23 +143,73 @@ export function saveLlmKey(key) {
   return k !== '';
 }
 
+/** 五个可配模块 → 对应环境变量。开判定与锁判定共用这张表，避免两处各写一份而漂移。 */
+export const FLAG_ENV = {
+  vector: 'MEMJUDGE_VECTOR',
+  rerank: 'MEMJUDGE_RERANK',
+  expand: 'MEMJUDGE_EXPAND',
+  llmSelect: 'MEMJUDGE_LLMSELECT',
+  llmExtract: 'MEMJUDGE_LLMEXTRACT',
+};
+
+/**
+ * 哪些开关被环境变量钉死：env 里是 '1' 或 '0' 时 `on()` 先取 env，写 config.json 不生效。
+ * 面板必须能说出这句事实，否则用户只看到「点了开关、重拉还是关的」。
+ */
+export function envLockedFlags() {
+  const out = {};
+  for (const [flag, envName] of Object.entries(FLAG_ENV)) {
+    const e = process.env[envName];
+    out[flag] = e === '1' || e === '0';
+  }
+  return out;
+}
+
+/**
+ * 哪些「值型」设置被环境变量钉死：env 非空时 load() 先取 env，写 config.json 不生效。
+ * 七项与 RPC saveSettings 的白名单一一对应——同一张表，避免两处各写一份而漂移。
+ */
+export const SETTING_ENV = {
+  baseUrl: 'MEMJUDGE_LLM_BASE_URL',
+  chatModel: 'MEMJUDGE_CHAT_MODEL',
+  embedModel: 'MEMJUDGE_EMBED_MODEL',
+  rerankModel: 'MEMJUDGE_RERANK_MODEL',
+  dims: 'MEMJUDGE_EMBED_DIMS',
+  storageLimitBytes: 'MEMJUDGE_STORAGE_LIMIT_BYTES',
+  maxChars: 'MEMJUDGE_MAX_CHARS',
+};
+
+/**
+ * 哪些设置项被环境变量锁住。面板写了一圈发现「重拉还是旧值」时，靠它解释原因。
+ * 与 envLockedFlags() 分开：那个是五键布尔开关的形状，这个是七项值型设置，
+ * 混进同一对象会让前端对「开关」与「输入框」的渲染分支失配。
+ */
+export function envLockedSettings() {
+  const out = {};
+  for (const [key, envName] of Object.entries(SETTING_ENV)) {
+    const e = process.env[envName];
+    out[key] = e != null && String(e).trim() !== '';
+  }
+  return out;
+}
+
 /** 模块开关：env 覆盖 config，两者都没有就关。零收益的模块默认不进默认路径。 */
 export function moduleFlags() {
   const { config } = load();
-  const on = (envName, cfgName) => {
-    const e = process.env[envName];
+  const on = (flag) => {
+    const e = process.env[FLAG_ENV[flag]];
     if (e === '1') return true;
     if (e === '0') return false;
-    return config?.[cfgName] === true;
+    return config?.[flag] === true;
   };
   return {
     // 四个检索增强模块需要 key，没 key 时强制关（否则每次调用都在等超时）
-    vector: hasLlmKey() && on('MEMJUDGE_VECTOR', 'vector'),
-    rerank: hasLlmKey() && on('MEMJUDGE_RERANK', 'rerank'),
-    expand: hasLlmKey() && on('MEMJUDGE_EXPAND', 'expand'),
-    llmSelect: hasLlmKey() && on('MEMJUDGE_LLMSELECT', 'llmSelect'),
+    vector: hasLlmKey() && on('vector'),
+    rerank: hasLlmKey() && on('rerank'),
+    expand: hasLlmKey() && on('expand'),
+    llmSelect: hasLlmKey() && on('llmSelect'),
     // LLM 提取层是离线重建，不挂在查询路径上，有无 key 都如实报告
-    llmExtract: hasLlmKey() && on('MEMJUDGE_LLMEXTRACT', 'llmExtract'),
+    llmExtract: hasLlmKey() && on('llmExtract'),
     jieba: process.env.MEMJUDGE_NO_JIEBA !== '1',
   };
 }
@@ -153,10 +229,16 @@ export function configReport() {
     embedModel: embedModel(),
     rerankModel: rerankModel(),
     dims: embedDims(),
+    storageLimitBytes: storageLimitBytes(),
+    maxChars: maxChars(),
     flags,
+    // 哪些 flag 由 MEMJUDGE_* 环境变量决定（写 config.json 无效）
+    envLocked: envLockedFlags(),
+    // 值型设置（模型名/端点/上限）同理：面板据此把被锁的输入框置灰并说清原因
+    envLockedSettings: envLockedSettings(),
     // 别人拿到插件时最需要看到的一句
     hint: hasLlmKey()
       ? (src === 'env' ? '当前密钥来自环境变量（可能是别人注入的），换机器需自己配置' : '密钥来自 secrets.json，属于本机')
-      : '未配置密钥：检索走纯 BM25，向量/重排/LLM 提取全部停用。填自己的 key 见 secrets.json',
+      : '未配置密钥：检索走纯 BM25，向量、重排、查询扩展、LLM 选段、LLM 提取五项增强全部停用。',
   };
 }

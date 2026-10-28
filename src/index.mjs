@@ -25,7 +25,13 @@ import { SearchIndex } from './search.mjs';
 import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict } from './judge.mjs';
 import { renderRecall, sleepPhase, conflictJudgments } from './layer.mjs';
-import { configReport, STATE_DIR } from './config.mjs';
+import {
+  configReport,
+  STATE_DIR,
+  embedDims,
+  maxChars as configuredMaxChars,
+  storageLimitBytes as configuredStorageLimitBytes,
+} from './config.mjs';
 import { installMemjudgeRpc } from './rpc.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
@@ -52,9 +58,12 @@ export const TOOL_NAMES = Object.freeze([
   'memjudge_stats',
 ]);
 
-/** 向量维度。64 与 128 在 92 题召回、12 题综合上完全同分（91/92、0.792），
- *  但 64 维打包落盘只 +16KB（188416 B），128 维要 +31KB 顶穿 199680 的验收线。 */
-const VEC_DIMS = 64;
+/** 向量维度：跟随用户配置（config.mjs 的 dims，默认 64）。
+ *  64 与 128 在 92 题召回、12 题综合上完全同分（91/92、0.792），但 64 维打包落盘
+ *  只 +16KB（188416 B），128 维要 +31KB 顶穿 199680 的验收线——所以默认压在 64。
+ *  必须是函数：面板改了 dims 之后同一个进程里要立刻按新维度读向量块，
+ *  否则 allVectors 会拿旧维度的块当有效数据。 */
+const vecDims = () => embedDims();
 
 export const DEFAULTS = Object.freeze({
   /** 空串 = <DSH_HOME|~/.dsh>/memjudge/memjudge.db。绝不写用户主 profile 之外的位置。 */
@@ -151,9 +160,31 @@ function decodeSource(source) {
   return { chapter: 0, para: 0 };
 }
 
+/**
+ * 章/段号的权威读法：先看 source 列里的 JSON，其次看 id 前缀
+ * （makeId 生成 `mem-c<章>-p<段>-<hash>`）。
+ *
+ * 为什么需要 id 兜底：source 列是**一列两用**——章级聚合检索（topChapters）要章号，
+ * 面板分组要来源串。带显式 source 的记忆把这一列让给了来源串，章号只剩 id 里那份。
+ * 不兜底则章级聚合会把每条显式来源记忆各算一章，冲突检测从「按文档」退化成「按句」。
+ */
+function chapterOf(memory) {
+  const src = decodeSource(memory?.source);
+  if (src.chapter || src.para) return src;
+  const m = /^mem-c(\d+)-p(\d+)-/.exec(String(memory?.id ?? ''));
+  return m ? { chapter: Number(m[1]) || 0, para: Number(m[2]) || 0 } : src;
+}
+
+/** 注入索引里的来源标签：章号优先，显式来源次之，两者都没有才算手动写入。 */
+function sourceLabel(source) {
+  const text = typeof source === 'string' ? source.trim() : '';
+  if (!text || text.startsWith('{')) return '手动写入';
+  return oneLine(text, 24);
+}
+
 /** store.dump() 的一条 → SearchIndex.add 期望的文档形状。 */
 function toDoc(memory) {
-  const src = decodeSource(memory.source);
+  const src = chapterOf(memory);
   return {
     id: memory.id,
     text: memory.text,
@@ -212,7 +243,13 @@ export function apply(ctx, config) {
   const cfg = resolveConfig(config);
   const now = cfg.now ?? (() => Date.now());
   const dbPath = cfg.dbPath || defaultDbPath();
-  const store = openStore(dbPath, { now });
+  // 两个上限都来自用户配置层（env > config.json > 默认 2MB / 0）：
+  // storageLimitBytes 只决定 stats() 的「上限/是否超预算」，maxChars 才是写入闸门。
+  const store = openStore(dbPath, {
+    now,
+    maxChars: configuredMaxChars(),
+    storageLimitBytes: configuredStorageLimitBytes(),
+  });
 
   /** @type {Array<() => void>} 所有注册的 disposer，逆序调用一次 */
   const disposers = [];
@@ -243,7 +280,7 @@ export function apply(ctx, config) {
       if (cfg.vector && store) {
         // 先吃落盘的向量块（同步、零网络）。没有就后台补，绝不阻塞启动：
         // 启动重建现在 43ms，接一次 32s 的 embed 会让插件装载卡死。
-        const cached = store.allVectors(VEC_DIMS);
+        const cached = store.allVectors(vecDims());
         if (cached.size) built.setVectors(cached);
         else warmVectors(built);
       }
@@ -258,7 +295,7 @@ export function apply(ctx, config) {
     vectorWarming = (async () => {
       try {
         const rows = store.dump();
-        const vecs = await embedVec(rows.map((r) => r.text), { dims: VEC_DIMS, cacheDir: cfg.vectorCacheDir });
+        const vecs = await embedVec(rows.map((r) => r.text), { dims: vecDims(), cacheDir: cfg.vectorCacheDir });
         if (!vecs) return;
         const m = new Map();
         rows.forEach((r, i) => { if (vecs[i]) m.set(r.id, vecs[i]); });
@@ -299,11 +336,11 @@ export function apply(ctx, config) {
     const head = `## memjudge 记忆索引（${rows.length}/${total} 条，按最近使用）`;
     const tail = '\n用 memjudge_recall 取全文，memjudge_conflicts 查前后矛盾。';
     const topics = rows.map((row) => {
-      const src = decodeSource(row.source);
+      const src = chapterOf(row);
       return {
         key: row.id,
         title: oneLine(row.text, 90),
-        summary: src.chapter ? `ch${src.chapter}` : '手动写入',
+        summary: src.chapter ? `ch${src.chapter}` : sourceLabel(row.source),
       };
     });
     const body = renderRecall([{ heading: head, topics }], cfg.injectBudget - tail.length);
@@ -321,7 +358,7 @@ export function apply(ctx, config) {
   const chapterRows = () => {
     const byChapter = new Map();
     for (const memory of store.dump()) {
-      const chapter = decodeSource(memory.source).chapter;
+      const chapter = chapterOf(memory).chapter;
       const key = chapter > 0 ? `ch${chapter}` : memory.id;
       let entry = byChapter.get(key);
       if (!entry) {
@@ -355,6 +392,10 @@ export function apply(ctx, config) {
           items: { type: 'string' },
           description: '被本条取代的旧记忆 id 列表。只建链，不改旧正文。',
         },
+        source: {
+          type: 'string',
+          description: '这条记忆来自哪里（会话/文件/项目）。面板按它分组。',
+        },
       },
       required: ['text'],
     },
@@ -381,13 +422,17 @@ export function apply(ctx, config) {
     async execute(args) {
       const text = String(args?.text ?? '');
       if (!text.trim()) throw new Error('memjudge_remember: text 不能为空');
+      // 来源：显式 source 优先（面板按它分组），没给才退回章/段号的 JSON 编码。
+      // 两者写同一列，显式 source 时不并列存：decodeSource 对非 JSON 串已有兜底
+      // （退回 {chapter:0,para:0}），章号仍可从 id 的 mem-c<章>-p<段>- 前缀恢复。
+      const explicitSource = typeof args?.source === 'string' ? args.source.trim() : '';
       const result = store.put({
         text,
         importance: clampNum(args?.importance, 0, 1, 0),
         chapter: args?.chapter,
         para: args?.para,
         supersedes: args?.supersedes ?? null,
-        source: encodeSource(args?.chapter, args?.para),
+        source: explicitSource || encodeSource(args?.chapter, args?.para),
       });
       invalidate();
       return {
@@ -472,7 +517,7 @@ export function apply(ctx, config) {
         : (cfg.llmSelect || (cfg.vector && ix.hasVectors))
           ? await ix.searchAsync(query, {
             maxChars: budget, topChapters, now: now(),
-            dims: VEC_DIMS, cacheDir: cfg.vectorCacheDir, llmSelect: cfg.llmSelect,
+            dims: vecDims(), cacheDir: cfg.vectorCacheDir, llmSelect: cfg.llmSelect,
           })
           : ix.search(query, { maxChars: budget, topChapters, now: now() });
       if (!found.hits.length) {

@@ -15,6 +15,11 @@ import { makeId } from './schema.mjs';
 import { extractL1 } from './extract.mjs';
 
 export const STORE_SCHEMA_VERSION = 5;
+/**
+ * 库体上限的**旧默认值**（SPEC 能力 7 的 200KB 验收阈值）。
+ * 保留导出是给测试与外部脚本用的常量；运行期上限走 open() 的 opts.storageLimitBytes，
+ * 由 src/index.mjs 从用户配置（默认 2MB）传入。这里只作为「没传时的兜底」。
+ */
 export const STORAGE_LIMIT_BYTES = 200 * 1024;
 
 // ── 预算（抄 PerryLink/dsh-memento lib/budget.mjs:17-51，逐行移植） ──────────
@@ -445,7 +450,9 @@ ${FACTS_DDL}
  * 打开（或新建）一个库。
  *
  * @param {string} [dbPath] ':memory:' 或文件路径
- * @param {{now?: () => number}} [opts] now 供假时钟注入，默认 Date.now
+ * @param {{now?: () => number, maxChars?: number, storageLimitBytes?: number}} [opts]
+ *   now 供假时钟注入（默认 Date.now）；maxChars 是写入硬闸门（0 = 不限）；
+ *   storageLimitBytes 只影响 stats() 的 limitBytes/withinLimit，不影响写入
  */
 export function open(dbPath = ':memory:', opts = {}) {
   const isMemory = dbPath === ':memory:';
@@ -565,6 +572,12 @@ export function open(dbPath = ':memory:', opts = {}) {
   // 库级字符预算（memento 语义）：maxChars > 0 时超限抛 BUDGET_EXCEEDED，不截断。
   // 默认 0 = 不限——评测语料 29648 字必须能全量落库；调用方要「写满即拒」就显式传。
   const maxChars = Number.isFinite(opts.maxChars) && opts.maxChars > 0 ? Math.trunc(opts.maxChars) : 0;
+
+  // 库体展示上限：只喂 stats() 的 limitBytes/withinLimit，不参与写入判定。
+  // 没传时退回 STORAGE_LIMIT_BYTES（200KB），保证老调用方与老测试的行为不变。
+  const storageLimitBytes = Number.isFinite(opts.storageLimitBytes) && opts.storageLimitBytes > 0
+    ? Math.trunc(opts.storageLimitBytes)
+    : STORAGE_LIMIT_BYTES;
 
   const stmt = {
     byHash: db.prepare('SELECT id, text FROM memories WHERE text_hash = ?'),
@@ -762,13 +775,17 @@ export function open(dbPath = ':memory:', opts = {}) {
     };
   }
 
-  /** 列出条目（默认不含 text，省内存；需要正文时传 includeText） */
+  /**
+   * 列出条目（默认不含 text，省内存；需要正文时传 includeText）。
+   * order 只认 'desc'，其余一律 asc：内部导出与面板脚本都依赖「按写入顺序」的默认值。
+   */
   function list(opts2 = {}) {
     assertOpen();
     const limit = Number.isFinite(opts2.limit) ? opts2.limit : -1;
     const offset = Number.isFinite(opts2.offset) ? opts2.offset : 0;
+    const dir = opts2.order === 'desc' ? 'DESC' : 'ASC';
     const cols = opts2.includeText ? '*' : 'id, text_hash, created_at, last_accessed, access_count, importance, supersedes, source';
-    return db.prepare(`SELECT ${cols} FROM memories ORDER BY created_at, id LIMIT ? OFFSET ?`).all(limit, offset)
+    return db.prepare(`SELECT ${cols} FROM memories ORDER BY created_at ${dir}, id ${dir} LIMIT ? OFFSET ?`).all(limit, offset)
       .map((r) => ({ ...r, supersedes: r.supersedes ? JSON.parse(r.supersedes) : null }));
   }
 
@@ -832,8 +849,8 @@ export function open(dbPath = ':memory:', opts = {}) {
       textChars: s.chars,
       textBytes: s.bytes,
       bytes: bytes(),
-      limitBytes: STORAGE_LIMIT_BYTES,
-      withinLimit: bytes() <= STORAGE_LIMIT_BYTES,
+      limitBytes: storageLimitBytes,
+      withinLimit: bytes() <= storageLimitBytes,
       segments: w.segments,
       wornSegments: w.worn,
       wear: w.wear,

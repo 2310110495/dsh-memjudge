@@ -8,10 +8,13 @@
 //   3. 任何一种失败（无 key / 超时 / 429 / 5xx / 结构不对）都 return null，
 //      绝不让异常冒到召回路径上——降级必须是静默的。
 //
-// 缓存：按 sha256(text) 前 16 位索引，落 <cacheDir>/vec-cache.json，值存 int8 base64。
-// 同一段文本永不重复调用；文本一变 hash 就变，缓存自然失效。
+// 缓存：按 sha256(text) 前 16 位索引，落 <cacheDir>/vec-cache-<model>-<dims>-<hash>.json，
+// 值存 int8 base64。同一段文本永不重复调用；文本一变 hash 就变，缓存自然失效。
+// **文件名带模型指纹**：键里只有文本哈希时，换 embedModel 或改 dims 会原样复用旧向量
+// ——维度不同直接错，维度碰巧相同则静默算错相似度。指纹进文件名后，换模型只是「新起
+// 一个文件」，旧文件留着可回滚，两者互不污染。
 
-import { llmKey } from './config.mjs';
+import { llmKey, embedModel, embedDims, llmBaseUrl } from './config.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -20,8 +23,9 @@ export const DIMS_CHOICES = [64, 128, 256, 512, 1024];
 export const DEFAULT_DIMS = 128;
 export const DEFAULT_BATCH = 16; // 实测：batch=16 约 1.3s/次；32 反而 6.4s（服务端排队）
 const TIMEOUT_MS = 20_000;
-const ENDPOINT = 'https://api.siliconflow.cn/v1/embeddings';
-const MODEL = 'Qwen/Qwen3-Embedding-8B';
+/** 端点与模型跟随用户配置（原本硬编码，改配置等于不生效）。 */
+const endpointUrl = () => `${llmBaseUrl().replace(/\/+$/, '')}/embeddings`;
+const modelName = () => embedModel();
 
 const hashText = (t) => createHash('sha256').update(String(t)).digest('hex').slice(0, 16);
 
@@ -96,24 +100,60 @@ class VecCache {
 
 /** 进程内单例：同一进程多次 embed 共享缓存。 */
 let _cache = null;
+/** 最近一次显式设置的缓存目录；null = 不落盘（纯内存缓存）。 */
+let _cacheDir = null;
 let _stats = { calls: 0, batches: 0, tokens: 0, hits: 0, failures: 0, ms: 0 };
 
+/**
+ * 模型名 → 文件名片段。为什么不是纯哈希：`ls` 一眼能看出这堆缓存属于哪个模型，
+ * 排查「换了模型还在用旧向量」时不用先算 sha256。为什么还留哈希：slug 化会撞
+ * （`a/b` 与 `a\b` 都变 `a-b`），且超长模型名要截断，哈希兜住这两种情况。
+ */
+function modelSlug() {
+  const s = embedModel()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return s || 'model';
+}
+
+/** 缓存文件名：模型 slug + 实际生效维度 + 指纹前 8 位。 */
+function cacheFileName(dims) {
+  const fingerprint = createHash('sha256').update(`${embedModel()}|${dims}`).digest('hex').slice(0, 8);
+  return `vec-cache-${modelSlug()}-${dims}-${fingerprint}.json`;
+}
+
+function cachePathFor(dims) {
+  return _cacheDir ? path.join(_cacheDir, cacheFileName(dims)) : null;
+}
+
 export function vecStats() {
-  return { ..._stats, cacheSize: _cache?.size ?? 0 };
+  return { ..._stats, cacheSize: _cache?.size ?? 0, cacheFile: _cache?.file ?? null };
 }
 
 export function resetVecStats() {
   _stats = { calls: 0, batches: 0, tokens: 0, hits: 0, failures: 0, ms: 0 };
 }
 
-/** 测试用：注入自定义缓存目录 / 清空单例。 */
-export function _setCacheDir(dir) {
-  _cache = new VecCache(dir ? path.join(dir, 'vec-cache.json') : null);
+/** 测试用：注入自定义缓存目录 / 清空单例。传 null 或空串清成纯内存。
+ *  第二个参数是本次要用的维度，省略时按配置维度命名（embed() 会显式传实际维度）。 */
+export function _setCacheDir(dir, dims) {
+  _cacheDir = dir ? path.resolve(String(dir)) : null;
+  // 旧实例若有未落盘的向量，先存一次再换文件，别把已经付过 API 费的向量丢掉
+  if (_cache?.dirty) _cache.save();
+  _cache = new VecCache(cachePathFor(Number.isFinite(dims) && dims > 0 ? Math.trunc(dims) : embedDims()));
   return _cache;
 }
 
-function cache() {
-  if (!_cache) _cache = new VecCache(null);
+/**
+ * 取缓存实例。目录相同但文件不同（换了模型/维度）就换一个新实例：
+ * 否则进程内会一直拿旧模型的向量算相似度——这正是本轮要修的那个静默算错。
+ */
+function cache(dims = DEFAULT_DIMS) {
+  const file = cachePathFor(dims);
+  if (_cache && _cache.file === file) return _cache;
+  if (_cache?.dirty) _cache.save();
+  _cache = new VecCache(file);
   return _cache;
 }
 
@@ -128,10 +168,10 @@ async function callEmbed(texts, dims, key) {
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   const t0 = Date.now();
   try {
-    const res = await fetch(ENDPOINT, {
+    const res = await fetch(endpointUrl(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: MODEL, input: texts, dimensions: dims, encoding_format: 'float' }),
+      body: JSON.stringify({ model: modelName(), input: texts, dimensions: dims, encoding_format: 'float' }),
       signal: ac.signal,
     });
     if (!res.ok) return { ok: false, status: res.status };
@@ -163,8 +203,9 @@ export async function embed(texts, opts = {}) {
   const list = (texts || []).map((t) => String(t ?? ''));
   if (!list.length) return [];
   const dims = DIMS_CHOICES.includes(opts.dims) ? opts.dims : DEFAULT_DIMS;
-  if (opts.cacheDir) _setCacheDir(opts.cacheDir);
-  const store = cache();
+  if (opts.cacheDir) _setCacheDir(opts.cacheDir, dims);
+  // 传实际生效的 dims：文件名里的维度与写进文件的内容必须同源
+  const store = cache(dims);
 
   const out = new Array(list.length).fill(null);
   const missIdx = [];
