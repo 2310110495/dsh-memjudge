@@ -1,0 +1,38 @@
+{
+  "spec": "spec-1.2",
+  "generatedAt": "2026-10-28T21:18:00+08:00",
+  "note": "布尔值口径：true=pass，false=fail，null=未测/部分（不计 pass）。判定证据指针在 docs/FINAL.md 的逐项归因与 docs/AUDIT.md；实测命令见 FINAL §7。",
+  "capabilities": {
+    "1_storeFidelity": true,
+    "2_fidelityExact": true,
+    "3_recall": true,
+    "4_synthesis_singleTurn": false,
+    "4_synthesis_multiTurn": false,
+    "5_noFabrication": true,
+    "6_deny": true,
+    "7_storage": true,
+    "8_inject": null,
+    "9_selfMod": null,
+    "10_conflict": true,
+    "11_decay": true,
+    "12_noStale": true
+  },
+  "revisions": [
+    {
+      "revision": "spec-1.2",
+      "date": "2026-10-28",
+      "changes": [
+        "§2.4 能力 4 新增并列多轮口径 4b：summary.synthScoreMultiTurn >= 0.917，约束 ≤3 轮、每轮返回 ≤2000 字符、轮间可见上一轮材料、判分仍用 scoreRecall；单轮口径 4a 保留不动，两条并列可选、互不替代，报告必须标注所用口径。",
+        "§0.3 新增例外条款 0.3.1：允许在 mem-eval/ 下新增评测脚本，边界为「新增 ≠ 修改」——不得改动 run-one.mjs / score.mjs 的默认行为、默认参数与默认输出字段，不得改题库语料，不得覆盖历史结果文件名；新脚本必须显式标注口径与 SPEC 版本。",
+        "§2.8 能力 8 新增澄清：单次注入 ≤2000 字符对多轮口径的每一轮都成立，不是多轮累计总量。"
+      ],
+      "rationale": "单轮口径下能力 4 不可达：五轮独立尝试（t22 rerank / t23 章级预算 / t25 RRF 装填 / t26 查询扩展 / t27 LLM 在环选段）全部零收益，静态测量显示判分 kw 所在句仅 55–113 字、预算从不是瓶颈，真正缺的是候选集合里没有答案段（问句与 S01/S07/S10 答案段零词面重合）。多轮口径是给「先看目录、再取正文」这类两段式工具语义留出评测空间，同时不改动单轮判据，保证现有 24 份历史结果的可比性。证据见 docs/ABILITY4-EVIDENCE.md。",
+      "measured": {
+        "synthScore_singleTurn": 0.583,
+        "synthScoreMultiTurn": 0.708,
+        "threshold": 0.917,
+        "verdict": "两条口径均 fail；0.708 仍差 0.209，不是接近达标。要达标需 C 方案的工具语义改造（memjudge_recall 两段式）。"
+      }
+    }
+  ]
+}

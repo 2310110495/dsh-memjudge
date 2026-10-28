@@ -31,14 +31,15 @@ L0 原始层   memories（SQLite，逐字不可变，v5 schema）
 
 ## 12 项能力（实测，非宣称）
 
-判据真源 `docs/SPEC.md`（v1.1）。数字来自 `node scripts/verify-install.mjs --mock` 与 `mem-eval/` 的 125 题实测。
+判据真源 `docs/SPEC.md`（**spec-1.2**）。数字来自 `node scripts/verify-install.mjs --mock`、`node --test test/*.test.mjs`（53 tests / 52 pass / 1 skip）与 `mem-eval/` 的 125 题实测。
 
 | # | 能力 | 阈值 | 实测 | 判定 |
 |---|---|---|---|---|
 | 1 | 存得准（逐字往返） | 20/20 章 + 29648 字 | `store.test` 逐字往返断言通过 | pass |
 | 2 | 原样回原文 | 8/8 exact | 8/8，`fidelityRatio = 1` | **pass** |
 | 3 | 找得回（条级召回） | ≥0.989 且 ≤1 miss | 3a **0.989（91/92，仅 R20 miss）** · 3b 0.870 | **pass** |
-| 4 | 12 题综合 | ≥0.917 | **0.583**（5/12 满分） | **fail** |
+| 4a | 12 题综合（单轮，默认） | ≥0.917 | **0.583**（5/12 满分；五轮尝试上限，见 `docs/ABILITY4-EVIDENCE.md`） | **fail** |
+| 4b | 12 题综合（多轮，并列口径） | ≥0.917 | **0.708**（≤3 轮、每轮 ≤2000 字符；仍差 0.209） | **fail** |
 | 5 | 不编 | contaminate = 0 | contaminate 0，6 探针全库 0 次 | **pass** |
 | 6 | 问没有的说没有 | SPEC 口径 ≥5/6 | **5/6**（工具自身 denied 5/6，污染 0/6） | **pass** |
 | 7 | 存储 ≤200KB | ≤200KB | 段级 **160.0 KB**（余量 40960 B） | **pass** |
@@ -48,7 +49,7 @@ L0 原始层   memories（SQLite，逐字不可变，v5 schema）
 | 11 | 按天折算 | 5 点非增、末值 ≥0.15 | 双档半衰期 warm 120 / cold 12，地板 0.15 | **pass** |
 | 12 | 不翻 30 天旧账 | ≤0.25 且不进 top-3 | `rankWeight` 0.1149，候选内排末位 | **pass**（3 条判据覆盖 2 条） |
 
-**10 项 pass、1 项 part、1 项未测、1 项 fail（综合题）。** 每项归因见 `docs/FINAL.md`，独立审查见 `docs/AUDIT.md`。
+**10 项 pass、1 项 part、1 项未测、能力 4 两个口径都 fail（单轮 0.583、多轮 0.708）。** 多轮口径 0.708 仍低于 0.917，不是「接近达标」——要达标需要 C 方案的工具语义改造（先看目录、再取正文），证据与推导见 `docs/ABILITY4-EVIDENCE.md`。每项归因见 `docs/FINAL.md`，独立审查见 `docs/AUDIT.md`。
 
 ### 能力 8 为什么不是 clean pass
 
@@ -253,7 +254,7 @@ node scripts/check-grounding.mjs   # Grounding：编译层违规 + 存储层 fac
 
 | 文件 | 说明 |
 |---|---|
-| `docs/SPEC.md` | 12 项能力验收标准（v1.1） |
+| `docs/SPEC.md` | 12 项能力验收标准（spec-1.2） |
 | `docs/AUDIT.md` | 独立审查报告（含三轮修订记录） |
 | `docs/FINAL.md` | 最终报告（12 项状态 + 已知局限） |
 | `docs/RESCORE-HALLU.md` | 幻觉拒答重算说明 |
