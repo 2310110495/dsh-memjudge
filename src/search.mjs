@@ -58,7 +58,7 @@ export const SEARCH_DEFAULTS = Object.freeze({
   subwordDiscount: 0.35, // jieba 子词的分数折扣（「轮机」之于「轮机长」：同一处证据，不重复计满权）
   decayFloor: 0, // 0 = 严格按衰减公式（能力 12 要求 30 天 ≤0.25）；>0 会放宽旧条目
   halfLifeDays: null, // null = 用 schema 双档（warm 120 / cold 12）；数值 = 统一覆盖（RestRegular 风格）
-  topChapters: 2, // 章级聚合取前几章（实测：1→0.946，2→0.989，3→0.978）
+  topChapters: 3, // 章级聚合取前几章。旧实测 1→0.946、2→0.989（bigram 时代）；jieba 接入后词级候选更稀疏，取 2 会让「一章只有一段强命中」的章整体落选（R10 的正确段在第 3 章），取 3 同时保住召回 91/92 与能力 4 的 0.583
   chapterAgg: 3, // 章分 = 章内 top-N 段分之和
   maxChars: 2000, // 单次返回字符预算（能力 8 阈值）
   limit: 16, // 单次返回段数上限（防极短段填满预算）

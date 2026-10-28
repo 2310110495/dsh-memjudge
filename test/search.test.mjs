@@ -29,6 +29,11 @@ for (const c of chapters) {
 
 const NOW = Date.parse('2026-10-27T17:00:00+08:00');
 
+// 冻结时钟：本文件所有断言都按 NOW 算衰减。只要有一条路径漏传 now（或将来有人
+// 加了一条用 Date.now() 的断言），ageDays 就会随墙钟漂移，排序在临界点上翻转，
+// 同一命令能跑出 0.946 / 0.978 / 0.989 三个数。冻结在这一行，漏传即锚定。
+Date.now = () => NOW;
+
 /** 把段装成 schema 兼容的记忆对象（importance/accessCount 中性，衰减因子为常数）。 */
 function makeMems({ writtenSpreadDays = 0, lastAccessAgeDays = 0, lastAccessFromCreated = false } = {}) {
   return segs.map((s) => {
