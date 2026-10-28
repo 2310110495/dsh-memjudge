@@ -24,7 +24,17 @@ import { open as openStore } from './store.mjs';
 import { SearchIndex } from './search.mjs';
 import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict } from './judge.mjs';
-import { renderRecall, sleepPhase, conflictJudgments } from './layer.mjs';
+import {
+  renderRecall,
+  sleepPhase,
+  conflictJudgments,
+  // wiki 编译层（T8-1）：投影只在内存，落盘只有 meta 两个键。
+  compileWiki,
+  diffWiki,
+  groundingViolations,
+  rawDigest,
+  WIKI_VERSION,
+} from './layer.mjs';
 import {
   configReport,
   STATE_DIR,
@@ -348,6 +358,120 @@ export function apply(ctx, config) {
     return injectCache;
   };
 
+  // ── wiki 编译层（T8-1）───────────────────────────────────────────────
+  // docs/wiki-layer-spec.md §2 的硬决策：编译产物只活在内存，库里只留两个 meta
+  // 键（wiki_version / raw_digest，合计 <200 字节）。不建表、不写 md、不建 FTS——
+  // memories 是 raw 的唯一副本，投影一旦落盘就成了第二份真相，冲突再也说不清哪边
+  // 是材料。投影随时可以按 raw 重算，所以「没有落盘投影」从来不是缺陷。
+  const WIKI_META_VERSION = 'wiki_version';
+  const WIKI_META_DIGEST = 'raw_digest';
+
+  /** 内存投影。null = 本进程还没编过（≠「库里没有 wiki」）。 */
+  let wiki = null;
+  let stmtMetaGet = null;
+  let stmtMetaPut = null;
+
+  /** 运行时计数：让 stats 与测试能区分「真编了一次」与「digest 命中直接跳过」。 */
+  const wikiRuntime = {
+    compiles: 0,
+    skipped: 0,
+    unverified: 0,
+    status: 'idle',
+    digest: null,
+  };
+
+  const metaRead = (key) => {
+    try {
+      stmtMetaGet ??= store.raw().prepare('SELECT v FROM meta WHERE k = ?');
+      const row = stmtMetaGet.get(key);
+      return row ? String(row.v) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // meta 只是「这张投影对应哪份 raw」的书签：写失败最多下次多编一次，不挡写入。
+  const metaWrite = (key, value) => {
+    try {
+      stmtMetaPut ??= store.raw().prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)');
+      stmtMetaPut.run(key, String(value));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 重编 wiki 投影。三条短路规则：
+   *   1. 内存投影的 rawDigest 与当前 raw 相同 → 直接复用（compiles 不动）。
+   *   2. meta.raw_digest 已存在且等于当前 raw → 这份 raw 之前编过，投影只是丢了
+   *      （进程重启）。仍要编一次把内存投影建起来，但用 diffWiki 记下相对上次落盘
+   *      投影的增删改判，而不是当成一个全新库。
+   *   3. Grounding 有违规时不拒绝编译、不抛错：投影照建，状态降为 unverified
+   *      （文档 §2.3），raw 与写入结果完全不受影响。
+   */
+  const refreshWiki = (persist = false) => {
+    const rows = store.dump();
+    const digest = rawDigest(rows);
+
+    if (wiki && wiki.rawDigest === digest) {
+      wikiRuntime.skipped += 1;
+      return wiki;
+    }
+
+    const storedDigest = metaRead(WIKI_META_DIGEST);
+    const storedVersion = metaRead(WIKI_META_VERSION);
+    const sameAsStored = storedDigest === digest && storedVersion === String(WIKI_VERSION);
+
+    const compiled = compileWiki(rows);
+    wikiRuntime.compiles += 1;
+
+    // 只跟内存里的旧投影比。投影不落盘，重启后拿不到上一版的块，宁可不给 diff
+    // 也不伪造「全部新增」；storedDigest 相同意味着这份 raw 之前编过且内容没动，
+    // 此时 diff 恒为空，直接置 null。
+    const previous = wiki;
+    compiled.diff = previous && !sameAsStored ? diffWiki(previous, compiled) : null;
+    compiled.reusedStoredDigest = sameAsStored;
+
+    const violations = groundingViolations(compiled);
+    compiled.grounding = { violations, status: violations.length ? 'unverified' : 'verified' };
+    wiki = compiled;
+
+    wikiRuntime.unverified = violations.length;
+    wikiRuntime.status = compiled.grounding.status;
+    wikiRuntime.digest = digest;
+    // 书签只在写库/删库路径落盘：读工具（stats/recall）懒编投影时不写库，保持
+    // 「读不产生写入」这条契约。
+    if (persist) {
+      metaWrite(WIKI_META_VERSION, WIKI_VERSION);
+      metaWrite(WIKI_META_DIGEST, digest);
+    }
+    return wiki;
+  };
+
+  /**
+   * 写库/删库后的接线钩子。编译异常一律吞掉：记忆写入是主业务，wiki 只是投影，
+   * 失败就退回「没有投影」，下次写库再试，raw 一个字节都不受影响。
+   */
+  const touchWiki = () => {
+    try {
+      refreshWiki(true);
+    } catch {
+      wiki = null;
+      wikiRuntime.status = 'idle';
+    }
+  };
+
+  /** 只读投影入口：没编过就按需编一次（不落盘）。T8-2/T8-4 从这里取投影。 */
+  const getWiki = () => {
+    if (wiki) return wiki;
+    try {
+      return refreshWiki(false);
+    } catch {
+      return null;
+    }
+  };
+
   const textBlock = (text) => [{ type: 'text', text }];
 
   /**
@@ -435,6 +559,8 @@ export function apply(ctx, config) {
         source: explicitSource || encodeSource(args?.chapter, args?.para),
       });
       invalidate();
+      // 写入后立刻重编 wiki 投影（幂等命中时 rawDigest 不变，直接跳过）。
+      touchWiki();
       return {
         id: result.id,
         inserted: result.inserted,
@@ -649,6 +775,8 @@ export function apply(ctx, config) {
         throw err;
       }
       invalidate();
+      // 删除同样改变 raw：投影必须跟着重建，否则 wiki 里会留着已经忘掉的块。
+      touchWiki();
       return { forgotten: removed, count: removed.length, dryRun: false };
     },
   }));
@@ -759,6 +887,7 @@ export function apply(ctx, config) {
           keyConfigured: { type: 'boolean' },
           keySource: { type: 'string' },
           panelPath: { type: 'string', description: '可视化面板 HTML 的生成路径。' },
+          wiki: { type: 'string', description: 'wiki 编译层投影状态：版本、块数、编译次数、Grounding 结论。' },
         },
         required: [
           'memories', 'facts', 'textChars', 'bytes', 'limitBytes', 'withinLimit',
@@ -773,6 +902,7 @@ export function apply(ctx, config) {
         + `倒排 ${value.terms} 词 / ${value.postings} 条 posting / ${value.chapters} 章\n`
         + `后台整理 ${value.tidy ?? '未运行'}\n`
         + `注入 ${value.injectEnabled ? `开启（${value.injectChars}/${value.injectBudget} 字符）` : '关闭（0 字符）'}\n`
+        + `wiki ${value.wiki}\n`
         + `模块 ${value.modules}\n`
         + `密钥 ${value.keyConfigured ? `已配置（${value.keySource}）` : '未配置——向量/重排/LLM 提取全部停用，走纯 BM25'}\n`
         + `面板 ${value.panelPath}（node scripts/panel.mjs --open 刷新）`,
@@ -814,6 +944,15 @@ export function apply(ctx, config) {
         keyConfigured: configReport().hasKey,
         keySource: configReport().keySource,
         panelPath: path.join(STATE_DIR, 'panel.html'),
+        // wiki 投影是懒编的：体检会顺手把它建起来（只花内存，不写库、不动注入面）。
+        wiki: (() => {
+          const projected = getWiki();
+          if (!projected) return '未编译（编译异常已吞掉，raw 不受影响）';
+          const rt = wikiRuntime;
+          return `v${projected.version} 投影 ${projected.blocks.length} 块/${projected.grounding.status}`
+            + (rt.unverified ? `（Grounding 违规 ${rt.unverified} 处）` : '')
+            + ` / 编译 ${rt.compiles} 次，digest 命中跳过 ${rt.skipped} 次`;
+        })(),
       };
       return out;
     },
