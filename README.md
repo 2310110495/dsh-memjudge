@@ -54,7 +54,7 @@ DSH 记忆插件：SQLite 逐字存储 + CJK 二元组 BM25 段级检索 + 三�
 ```
 src/
   schema.mjs   记忆条目 schema + DECAY 参数（半衰期 120/12 天，留存阈值 0.15）
-  store.mjs    SQLite 存储：put/get/list/updateAccess/dump/bytes + extractFacts 三元组
+  store.mjs    SQLite 存储：put/get/list/updateAccess/dump/bytes + extractFacts 三元组 + 段位图打包
   search.mjs   CJK 二元组 BM25 + 倒排索引 + 章级聚合（章分=top3段分和，取 top2 章）
   judge.mjs    判断层：gate（拒答门）/ resolveConflict / decayWeight / fitBudget / render
   index.mjs    apply(ctx)：注册 5 个 memjudge_* 工具 + 注入 section（默认关闭）
@@ -65,6 +65,40 @@ src/
 - **拒答门分软硬**：实体不存在/限定语不存在/拉丁标识不存在硬拒；`no-facts` 与「二字组覆盖不足」放行（否则「今天心情不好」这种纯文本记忆永远查不到）。
 - **冲突消解看修正措辞**：「原报 X 系估值/现予更正」——X 是旧值，句子里的另一个值才是新值。不能按时间排序取最后一条。
 - **衰减挂 lastAccessed**：被用即刷新，没用才放手。地板 0.15 保证不死透。
+
+## 存储预算：196KB 是怎么花掉的
+
+段级写入（adapter 按空行切段，一份 20 章语料落成 294 条 memory）原来占 200704 B / 200KB 中的 196.0 KB，余量只剩 4096 B——再加十来条就撞线。用 `dbstat` 逐表量到字节（不是估算）：
+
+| 对象 | 字节 | 页 | 占比 | 内容 |
+|---|---|---|---|---|
+| `memories` 表 | 118784 | 29 | 61.7% | 294 行，行载荷 104534 B（355.6 B/条：正文 87930 B + id/hash/元数据 + 记录头） |
+| `facts` 表 | 28672 | 7 | 14.9% | 390 行，字符串载荷仅 6642 B（17.0 B/行），其余是行头+rowid+槽位 |
+| `sqlite_autoindex_memories_1` | 16384 | 4 | 8.5% | 文本主键 `id` 的索引 |
+| `ux_memories_hash` | 12288 | 3 | 6.4% | `text_hash` 唯一索引（33 字符/条 = 5726 B） |
+| `segments` 表 | 4096 | 1 | 2.1% | 294 行段位图，打包后共 1048 B |
+| `meta` + `sqlite_schema` + `sqlite_autoindex_meta_1` | 12288 | 3 | 6.4% | 每张有内容的表各占 1 个 b-tree 内部根页 |
+
+结构性的浪费有两处：**每张表自带一个 4096 B 的内部根页**（4 张表就是 16KB），以及**尾页不满**（facts 末页 33 行浪费 2298 B、索引叶子分别浪费 145/262 键空间）。合计约 9.7KB 无法在不合并表的前提下回收，所以剩余空间只能从「页数」上抢。
+
+### 试过但无效的方案
+
+同一份语料、同一个 `splitSegments`/`extractFacts`，逐变体重建库再 `VACUUM` 后量文件字节：
+
+| 方案 | 段级字节 | 结论 |
+|---|---|---|
+| 原始（covered 存 `'0'/'1'` TEXT） | 200704 | 基线 |
+| A：块粒度调大（≥24 汉字/块） | 200704 | **无效**。段数 2704→879，但 `segments` 是一 memory 一行，位图只短了 1825 B，跨不过页边界 |
+| A′：≥48 汉字/块 | 200704 | 同上，段数 475，字节一字未变 |
+| D：facts 按 memory 打包成 JSON 一列 | 208896 | **更差**。390 行的开销换成了更大的 JSON 载荷 |
+| D′：facts 二进制 zigzag-varint 一列 | 192512 | 载荷降到 18652 B 仍占 7 页，只与 B 持平却要重写全部读取路径 |
+| B：covered 改 BLOB 位串（8 段/字节） | 192512 | **采纳**。`segments` 3 页→1 页，省 8192 B |
+| B′：再叠加 text_hash 改 INTEGER | 188416 | 多省 1 页，但要重建 `memories` 表保 rowid（`facts.memory_id`/`segments.ord` 引用 rowid，重建会错位），风险不抵 4KB |
+| C：`page_size` 降到 2048 | 180224 | 需迁移时 VACUUM 重写整库，未采纳 |
+
+采用 B：`segments(ord INTEGER PRIMARY KEY, bits BLOB) WITHOUT ROWID`，`bits` 前 2 字节大端存段数、随后 `ceil(n/8)` 字节位图（LSB-first）。段级 294 条从 200704 B 降到 **192512 B（188.0 KB），余量 4096 → 12288 B**；`STORE_SCHEMA_VERSION` 2→3，旧库重开自动改写段表并按原文重切补位图（v2 的位图是派生数据，重建无损），二次打开幂等。
+
+余量不是白给的，测试里有三条断言钉住它：`段级写入余量 ≥ 8192 字节`（防止有人把位图退回字符串形式而无人察觉）、`v2 库重开升级到 v3 且二次打开幂等`、`逼近 200KB 时再写抛 BUDGET_EXCEEDED 且不留残行`——最后一条把库推到 190KB 以上，重开时卡死字符预算，验证被拒的写入不会留下 memories/facts/segments 残行、库体字节不变。
 
 ## 安装
 
@@ -98,7 +132,7 @@ node scripts/verify-install.mjs --mock   # 不依赖 dsh CLI 的模拟验证
 ## 测试
 
 ```bash
-node test/store.test.mjs    # 61 断言：SQLite 读写、三元组抽取、段层位图、v1→v2 迁移、200KB 预算
+node test/store.test.mjs    # 64 断言：SQLite 读写、三元组抽取、段位图打包、v1/v2→v3 迁移、200KB 预算与贴边拒绝
 node test/search.test.mjs   # 14 断言：recall 0.989、衰减下限曲线、倒排 17.5%
 node test/judge.test.mjs    # 11 断言：拒答 5/6、冲突 4/4、衰减 0.150 地板、预算 1945
 node test/layer.test.mjs    # 12 断言：索引渲染、字段加权检索、四阶段后台整理 fail-safe

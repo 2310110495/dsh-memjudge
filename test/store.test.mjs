@@ -441,6 +441,44 @@ check('v1 库重开自动迁移：segments 表补写存量 memory 的段', () =>
   fs.rmSync(v1Path, { force: true });
 });
 
+check('v2 库（covered 为 \'0\'/\'1\' 字符串位图）重开升级到 v3，二次打开幂等', () => {
+  const V2_TEXT = '白鲸号收到报告。焊缝凹陷九厘米，实测属实。';
+  const v2Path = path.join(TMP, 'v2.db');
+  fs.rmSync(v2Path, { force: true });
+  const s1 = open(v2Path);
+  s1.put({ text: V2_TEXT });
+  // 手工退化成 v2 形状：segments(ord, seg_count, covered TEXT)
+  const db1 = s1.raw();
+  db1.exec('DROP TABLE segments');
+  db1.exec(`CREATE TABLE segments (
+    ord       INTEGER PRIMARY KEY,
+    seg_count INTEGER NOT NULL,
+    covered   TEXT NOT NULL DEFAULT ''
+  ) WITHOUT ROWID;`);
+  const n0 = splitSegments(V2_TEXT).length;
+  db1.prepare('INSERT INTO segments (ord, seg_count, covered) VALUES (?, ?, ?)')
+    .run(1, n0, '1'.repeat(n0));
+  db1.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_version', '2');
+  s1.close();
+
+  const s2 = open(v2Path);
+  const cols = s2.raw().prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
+  assert.deepEqual(cols.sort(), ['bits', 'ord'], `迁移后列应为 bits/ord，实际 ${cols.join(',')}`);
+  assert.equal(s2.stats().segments, n0, '段数不应因形状迁移而变');
+  // 自检重建段表时从原文重切，覆盖位归零（v2 的位图是派生数据，重建无损）
+  assert.equal(s2.stats().wornSegments, n0, '重建后段位图应回到未覆盖');
+  const afterFirst = s2.segmentDump();
+  const version = s2.raw().prepare('SELECT v FROM meta WHERE k = ?').get('schema_version').v;
+  assert.equal(Number(version), 3, `schema_version 应升到 3，实际 ${version}`);
+  s2.close();
+
+  const s3 = open(v2Path);
+  assert.deepEqual(s3.segmentDump(), afterFirst, '二次打开段位图必须原样（幂等）');
+  assert.equal(s3.stats().segments, n0);
+  s3.close();
+  fs.rmSync(v2Path, { force: true });
+});
+
 // ---------------------------------------------------------------- 体积
 
 section('存储体积（能力 7）');
@@ -476,6 +514,59 @@ check('段级写入的段数与章级一致（同一语料、同一 SPLIT_RE）'
   ref.close();
   assert.equal(segStats.segments, chapterSegments,
     `段级 ${segStats.segments} 段 vs 章级 ${chapterSegments} 段`);
+});
+
+// 段位图打包（v3）的收益写进断言：否则一次「改回字符串位图」的重复会在不被察觉的
+// 情况下把余量吃回 4KB。4KB 余量意味着再加十来条段级 memory 就撞线。
+const segMargin = STORAGE_LIMIT_BYTES - segBytes;
+check(`段级写入余量 ${segMargin} 字节 ≥ 8KB（v3 段位图打包换来，防回退）`, () => {
+  assert.ok(segMargin >= 8 * 1024, `余量只有 ${segMargin} 字节，段位图形状疑似退回字符串位图`);
+});
+
+check('段级写入逼近 200KB 边界时再写抛 BUDGET_EXCEEDED，且不留残行', () => {
+  const edgePath = path.join(TMP, 'edge.db');
+  fs.rmSync(edgePath, { force: true });
+  const s = open(edgePath, { now: () => FIXED_NOW });
+  // 段级口径写满整份语料（≈188KB），再用短段落把库体推到 195KB 附近
+  for (const c of chapters) {
+    const parts = String(c.text).split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+    for (let i = 0; i < parts.length; i += 1) s.put({ text: parts[i], chapter: c.n, para: i + 1 });
+  }
+  let extra = 0;
+  while (s.compact() < 190 * 1024 && extra < 400) {
+    s.put({ text: `补充记录 ${extra}：焊缝凹陷九厘米，实测属实。` });
+    extra += 1;
+  }
+  const edgeBytes = s.compact();
+  const before = s.stats();
+  assert.ok(edgeBytes <= STORAGE_LIMIT_BYTES,
+    `贴边库 ${edgeBytes} 已越过 ${STORAGE_LIMIT_BYTES}，本次边界断言失去意义`);
+  assert.ok(edgeBytes >= 190 * 1024, `贴边库只有 ${edgeBytes} 字节，没推到边界`);
+  const usedChars = before.textChars;
+  s.close();
+
+  // 重开并卡死字符预算：下一条必然被拒，且拒的是既有错误码而非静默截断
+  const g = open(edgePath, { now: () => FIXED_NOW, maxChars: usedChars });
+  const text = '白鲸号的焊缝记录又被人改了一次。';
+  let thrown = null;
+  try {
+    g.put({ text });
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown, '应抛错');
+  assert.equal(thrown.code, 'BUDGET_EXCEEDED', `错误码应为 BUDGET_EXCEEDED，实际 ${thrown.code}`);
+  assert.deepEqual(thrown.details, { used: usedChars, limit: usedChars, needed: text.length });
+  const after = g.stats();
+  assert.equal(after.memories, before.memories, '被拒的写入不应留下 memories 行');
+  assert.equal(after.facts, before.facts, '被拒的写入不应留下 facts 行');
+  assert.equal(after.segments, before.segments, '被拒的写入不应留下段');
+  assert.equal(after.textChars, usedChars, '被拒的写入不应改动正文用量');
+  assert.equal(g.get(`mem-${'x'}`), null);
+  const bytesAfterReject = g.compact();
+  assert.equal(bytesAfterReject, edgeBytes, `被拒写入后库体应不变：${edgeBytes} → ${bytesAfterReject}`);
+  g.close();
+  fs.rmSync(edgePath, { force: true });
 });
 
 const finalStats = store.stats();

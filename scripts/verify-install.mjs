@@ -68,6 +68,8 @@ const { apply, TOOL_NAMES, SECTION_NAME, INJECT_HARD_LIMIT } =
   await import(pathToFileURL(path.join(PLUGIN_ROOT, 'src', 'index.mjs')).href);
 const { chapters } = await import(pathToFileURL(path.join(WORKSPACE, 'mem-eval', 'corpus', 'novel.mjs')).href);
 const quiz = await import(pathToFileURL(path.join(WORKSPACE, 'mem-eval', 'corpus', 'quiz.mjs')).href);
+// SPEC 2.10 判据 2 指名要 score.mjs 的 JUDGED_CONFLICT 正则，这里直接调用原函数，不复制。
+const { scoreConflict } = await import(pathToFileURL(path.join(WORKSPACE, 'mem-eval', 'harness', 'score.mjs')).href);
 
 // ---------------------------------------------------------------- 宿主装载
 
@@ -265,6 +267,9 @@ for (const item of quiz.hallucination) {
   const text = renderOf('memjudge_recall', { query: item.q }, value);
   const specDeny = text.length >= 40 && denyNearEntity(text, item.absent);
   const leak = new RegExp(`${item.absent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[:：]?\\s*[0-9]{2,}`).test(text);
+  // 被问实体整串是否出现在返回里。缺席时 denyNearEntity 恒 false（indexOf 先落空），
+  // 这不是「窗口太窄」，是根本没有可比的位置——单独报，不混进拒答率。
+  const absentMissing = !norm(text).includes(norm(item.absent));
   hallu.push({
     id: item.id,
     absent: item.absent,
@@ -272,6 +277,7 @@ for (const item of quiz.hallucination) {
     toolDenied: value.denied === true,
     specDeny,
     leak,
+    absentMissing,
     head: text.slice(0, 60).replace(/\s+/g, ' '),
   });
 }
@@ -281,36 +287,44 @@ sections.hallucination = {
   toolDenied: hallu.filter((h) => h.toolDenied).length,
   specDeny: hallu.filter((h) => h.specDeny).length,
   contaminate: hallu.filter((h) => h.leak).length,
+  absentMissing: hallu.filter((h) => h.absentMissing).length,
   threshold: 5,
 };
 
 say('');
 say('6 道幻觉题（SPEC §2.6：口否认词须落在被问实体 80 字内且返回 ≥40 字）');
-say('  id  字数  工具拒答  SPEC判deny  邻近泄漏  返回开头');
+say('  id  字数  工具拒答  SPEC判deny  邻近泄漏  实体缺席  返回开头');
 for (const h of hallu) {
-  say(`  ${h.id.padEnd(3)} ${String(h.chars).padStart(5)}  ${(h.toolDenied ? 'yes' : 'no ').padEnd(8)} ${(h.specDeny ? 'yes' : 'no ').padEnd(10)} ${(h.leak ? 'LEAK' : '-').padEnd(8)} ${h.head}`);
+  say(`  ${h.id.padEnd(3)} ${String(h.chars).padStart(5)}  ${(h.toolDenied ? 'yes' : 'no ').padEnd(8)} ${(h.specDeny ? 'yes' : 'no ').padEnd(10)} ${(h.leak ? 'LEAK' : '-').padEnd(8)} ${(h.absentMissing ? 'ABSENT' : '-').padEnd(8)} ${h.head}`);
 }
 
-// 4. 四道冲突题：conflicts 工具（能力 10 的真判据）+ recall 材料层（对照）
+// 4. 四道冲突题：SPEC 2.10 判据 = judgedConflict && newSide，两者都从 scoreConflict 取
 const conflictsValue = await tool('memjudge_conflicts').execute({ limit: 50 });
 const conflictRows = [];
 for (const item of quiz.conflict) {
   const numeric = item.kw.filter((k) => NUMERIC.test(k));
   const groups = conflictsValue.conflicts ?? [];
-  // 只认「把这两个值配成一对」的组：values 过长说明是把同单位的值全堆在一起，不算识别出矛盾。
+  // conflicts 工具的聚合粒度只作诊断（见 docs/AUDIT.md F4），不进判据。
   const pair = groups
     .filter((g) => numeric.every((k) => (g.values ?? []).includes(k)))
     .sort((a, b) => (a.values?.length ?? 0) - (b.values?.length ?? 0))[0];
   const recallValue = await tool('memjudge_recall').execute({ query: item.q });
   const recallText = renderOf('memjudge_recall', { query: item.q }, recallValue);
+  // SPEC 2.10 判据 3：只把原文自带的「现予更正」带回来不算判断，故 revisionMarkInText 单列，
+  // judgedConflict 才是插件自己的判断句。
+  const sc = scoreConflict(recallText, item);
   conflictRows.push({
     id: item.id,
     numeric,
-    pairFound: Boolean(pair),
-    values: pair?.values ?? [],
     isolated: Boolean(pair) && pair.values.length <= 3,
-    current: pair?.current ?? null,
-    newSide: pair?.current === '十一厘米',
+    groupValues: pair?.values.length ?? 0,
+    groupCurrent: pair?.current ?? null,
+    judgedConflict: sc.judgedConflict,
+    newSide: sc.newSide,
+    oldSide: sc.oldSide,
+    revisionMarkInText: sc.revisionMarkInText,
+    discoveredBasis: sc.discoveredBasis,
+    verdict: sc.verdict,
     recallHasBoth: numeric.filter((k) => recallText.includes(k)).length,
     recallChars: recallText.length,
   });
@@ -319,25 +333,24 @@ for (const item of quiz.conflict) {
 sections.conflict = {
   rows: conflictRows,
   total: conflictsValue.total ?? 0,
-  isolated: conflictRows.filter((c) => c.isolated).length,
+  judged: conflictRows.filter((c) => c.judgedConflict).length,
   newSide: conflictRows.filter((c) => c.newSide).length,
+  passed: conflictRows.filter((c) => c.judgedConflict && c.newSide).length,
+  isolated: conflictRows.filter((c) => c.isolated).length,
   threshold: 3,
 };
 
 say('');
-say('4 道冲突题（能力 10 真判据 = conflicts 工具把两值配成一对 且 current 是后文修正值）');
-say('  id  配成对  values数  current    newSide  recall带回kw');
+say('4 道冲突题（SPEC 2.10：judgedConflict 且 newSide，两者均取自 scoreConflict）');
+say('  id  judged newSide oldSide revMark 判定            conflicts组  recall带回kw');
 for (const c of conflictRows) {
-  say(`  ${c.id.padEnd(3)} ${(c.pairFound ? 'yes' : 'no ').padEnd(7)} ${String(c.values.length).padStart(6)}  ${String(c.current ?? '-').padEnd(9)} ${(c.newSide ? 'yes' : 'no ').padEnd(7)} ${c.recallHasBoth}/${c.numeric.length}（${c.recallChars} 字）`);
+  say(`  ${c.id.padEnd(3)} ${(c.judgedConflict ? 'yes' : 'no ').padEnd(6)} ${(c.newSide ? 'yes' : 'no ').padEnd(7)} ${(c.oldSide ? 'yes' : 'no ').padEnd(7)} ${(c.revisionMarkInText ? 'yes' : 'no ').padEnd(7)} ${String(c.verdict).padEnd(15)} ${String(c.groupValues).padStart(4)}/${c.isolated ? 'iso' : 'mix'}  ${c.recallHasBoth}/${c.numeric.length}（${c.recallChars} 字）`);
 }
-say(`  conflicts 工具共报 ${sections.conflict.total} 组：`);
-for (const g of (conflictsValue.conflicts ?? [])) {
-  say(`    - ${g.key}: ${g.values.length} 个值 → ${g.values.join(',')} ；current=${g.current}`);
-}
+say(`  （conflicts 工具另报 ${sections.conflict.total} 组；聚合粒度问题见 docs/AUDIT.md F4，本表判据不读它）`);
 
 // 5. 判定
 const halluOk = sections.hallucination.specDeny >= sections.hallucination.threshold && sections.hallucination.contaminate === 0;
-const conflictOk = sections.conflict.newSide >= sections.conflict.threshold;
+const conflictOk = sections.conflict.passed >= sections.conflict.threshold;
 const installOk = sections.install.tools === TOOL_NAMES.length && sections.install.sections === 1;
 
 sections.verdict = {
@@ -350,17 +363,31 @@ sections.verdict = {
 say('');
 say('结论');
 say(`  装上            : ${installOk ? 'PASS' : 'FAIL'}（${sections.install.tools}/${TOOL_NAMES.length} 工具 + ${sections.install.sections} section，名字零冲突）`);
-say(`  幻觉拒答 ≥5/6   : ${halluOk ? 'PASS' : 'FAIL'}（SPEC 口径 ${sections.hallucination.specDeny}/6；工具自身 denied ${sections.hallucination.toolDenied}/6；污染 ${sections.hallucination.contaminate}/6）`);
-say(`  冲突消解 ≥3/4   : ${conflictOk ? 'PASS' : 'FAIL'}（current 取到后文修正值 ${sections.conflict.newSide}/4；配成对的组 ${sections.conflict.isolated}/4）`);
+say(`  幻觉拒答 ≥5/6   : ${halluOk ? 'PASS' : 'FAIL'}（SPEC 口径 ${sections.hallucination.specDeny}/6；工具自身 denied ${sections.hallucination.toolDenied}/6；污染 ${sections.hallucination.contaminate}/6；实体缺席 ${sections.hallucination.absentMissing}/6）`);
+say(`  冲突消解 ≥3/4   : ${conflictOk ? 'PASS' : 'FAIL'}（judgedConflict 且 newSide ${sections.conflict.passed}/4；仅 newSide ${sections.conflict.newSide}/4；仅原文更正语 ${conflictRows.filter((c) => c.revisionMarkInText && !c.judgedConflict).length}/4）`);
 say('');
 if (!conflictOk) {
-  say('  冲突项为何不达标：conflicts 按「同单位 + 共享名词」聚合，20 章库上把 12 个厘米值');
-  say('  混成一组，current 取的是「时间最晚那句」的值，而最晚那句可能在复述旧值。');
-  say('  这不是参数问题，是判断层实现缺陷（见 docs/AUDIT.md F4 与 docs/FINAL.md 能力 10）。');
+  const judged = sections.conflict.judged;
+  const revOnly = conflictRows.filter((c) => c.revisionMarkInText && !c.judgedConflict).length;
+  say(`  冲突项为何不达标：插件返回的 ${conflictRows[0]?.recallChars ?? 0} 字级摘录里，`);
+  if (judged === 0) {
+    say(`  judgedConflict 命中 0/4 —— 它带回的是原文段落，从未自己下「两处不一致」的判断。`);
+  }
+  if (revOnly > 0) {
+    say(`  另有 ${revOnly}/4 只带回原文自带的「现予更正」（revisionMarkInText），按 SPEC 2.10 判据 3 不计入。`);
+  }
+  say('  这是判断层缺动作，不是判据问题：要过本项，插件必须在多值命中时自述矛盾并附修正值。');
+  say('  另：conflicts 工具按「同单位 + 共享名词」聚合，把 12 个厘米值混成一组，粒度见 docs/AUDIT.md F4。');
 }
 if (!halluOk) {
-  say('  幻觉项为何不达标：H3/H4 把整段原文倒出来（>600 字），没有否认句；');
-  say('  H1/H2/H5/H6 是真拒答，但按 SPEC §2.6 的邻近窗口与 ≥40 字门槛不计数。');
+  const miss = sections.hallucination.absentMissing;
+  say(`  幻觉项为何不达标：${sections.hallucination.specDeny}/6 命中 SPEC 口径（需 ≥5/6），污染 ${sections.hallucination.contaminate}/6。`);
+  if (miss > 0) {
+    say(`  其中 ${miss} 题的被问实体在返回里整串不出现（表内「实体缺席」= ABSENT）。`);
+    say('  这不是窗口宽度问题：denyNearEntity 先用 indexOf 定位实体，定位不到就没有窗口，');
+    say('  把 80 放大到 8000 仍是 false。这类行既不算拒答也不算倾倒，评测器侧单列 absent 档；');
+    say('  要让它变成真拒答，得让工具在实体缺席时自己输出否认句，那是 src/judge.mjs 的事。');
+  }
 }
 
 // 6. 收尾

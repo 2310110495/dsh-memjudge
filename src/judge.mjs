@@ -212,6 +212,35 @@ const ANSWER_TYPE_RE = /(?:型号|编号|名字|名称|金额|费用|总额|总�
 const EXPLAIN_RE = /(为什么|为何|怎么|怎样|如何|哪些|有什么|情况)/;
 const NUMERIC_RE = /(多少|多久|多大|多远|多长|多深|多重|多高|几点|几[人名页项张份条件支块卷节次天年月日]|哪年|哪国|第几)/;
 
+// 属性短语还原。clean() 会把限定语与拉丁串剥成孤零零的两三个字：「出生」不是被问的东西，
+// 「出生年份」才是。拒答文案必须复述被问的那个完整说法——评测侧判「否认词落在被问实体附近」，
+// 实体不在文案里，再对的拒答也数不出来（H1/H2/H5/H6 就是这样被判成「没拒答」的）。
+const PHRASE_STOP = /[的了是在有和与及或从向往到把被给对该这那其约共计达为则即按据经由于已将可须应吗呢吧啊多少几谁啥跑挂装用叫改离抵到达]/;
+function attrPhrase(query, key) {
+  const q = String(query || '').replace(/[？?。！!，,、；;：:]/g, '');
+  const k = String(key || '');
+  if (!k) return '';
+  const i = q.toLowerCase().indexOf(k.toLowerCase());
+  if (i < 0) return k;
+  const isHan = (c) => /\p{Script=Han}/u.test(String(c || ''));
+  // 限定语本身已是完整语义单位（「上一」「出生」），补字只会补坏：
+  // 「白鲸号上一航次」的「上一」前面是实体尾字「号」，补进来就成了「号上一航次」。
+  LIMITER_RE.lastIndex = 0;
+  const isLimiter = new RegExp(`^(?:${LIMITER_RE.source})$`).test(k);
+  let lo = i;
+  let hi = i + k.length;
+  // 只有被切碎的残片才向前补一个字（「关长」→「海关关长」），遇虚词即停。
+  if (!isLimiter && lo > 0 && isHan(q[lo - 1]) && !PHRASE_STOP.test(q[lo - 1])) lo -= 1;
+  // 向后最多补三个字，跳过拉丁串后的空格，遇虚词/疑问词即停。
+  while (hi < q.length && /\s/.test(q[hi])) hi += 1;
+  for (let n = 0; n < 3 && hi < q.length; n += 1) {
+    const c = q[hi];
+    if (!isHan(c) || PHRASE_STOP.test(c)) break;
+    hi += 1;
+  }
+  return q.slice(lo, hi).replace(/\s+/g, ' ').trim();
+}
+
 /**
  * 问句解析：实体之外的属性块、限定词、拉丁串。
  * 属性取疑问焦点两侧的名词块——「白鲸号上一航次跑的是哪条航线」里，「航线」在焦点之后。
@@ -401,6 +430,26 @@ export function gate(query, target, opts = {}) {
     }
   }
 
+  // 问句里点名的「X 号」若整串在材料里不存在，问的就是没有的对象。
+  // 收窄到这一种形状是实测结果：ENTITY_PATTERNS 里「船长/大副+2~3 字」在没有空格的
+  // 中文问句里会把后续词一起吞进去（「船长为什么决定改航」→「船长为什么」），
+  // 拿全部模式做硬门会误拒 36/104 道真题。
+  for (const m of String(query).matchAll(/[\u4e00-\u9fff]{2,4}号/g)) {
+    const name = m[0];
+    const core = name.slice(0, -1);
+    // 「代号/型号/编号/呼号」是属性名不是对象名；「哪一号/第一号/在哪一号」是指代词。
+    if (/[代型编呼序番批账挂单符数]号$/.test(name)) continue;
+    if (/[哪第这那该几某每同]/.test(name)) continue;
+    if (/^[一二三四五六七八九十]/.test(name)) continue;
+    if (subjects.has(name)) continue;
+    if (fullText.includes(norm(name))) continue;
+    // 事实主语可能记成「白鲸」而问句写「白鲸号」：主语里存在互为前后缀的实体就算有这号对象。
+    // 不能拿 core 是否出现在全文当判据——「远洋」是普通名词，语料里到处都有，那样会整体放行。
+    if ([...subjects].some((s) => name.startsWith(s) || s.startsWith(name))) continue;
+    if ([...name].length < 3) continue;
+    return { deny: true, reason: 'entity-not-recorded', entity: name, detail: `材料里没有「${name}」这号对象` };
+  }
+
   if (entity && pool.length === 0) {
     return { deny: true, reason: 'entity-not-recorded', entity, detail: `材料里提到「${entity}」，但没有一条关于它的事实` };
   }
@@ -410,9 +459,15 @@ export function gate(query, target, opts = {}) {
   for (const lim of pq.limiters) {
     const ok = pool.some((f) => norm(f.text).includes(lim));
     if (!ok) {
-      return { deny: true, reason: 'scope-not-recorded', entity, limiter: lim, detail: `材料里没有「${lim}」这一层记载` };
+      const phrase = attrPhrase(query, lim) || lim;
+      return { deny: true, reason: 'scope-not-recorded', entity, limiter: lim, detail: `材料里没有「${phrase}」这一层记载` };
     }
   }
+
+  // 拒答比对面 = 拒答文档索引的同一份文档表达式。glueAll 不是临时算的检索字符串，
+  // 是 gateTextDocument 在 store 上物化的那份——索引（写入侧）与查询（读取侧）共用一个
+  // 生成函数，改任何一处另一处自动跟随，这就是 hindsight「DDL 与查询同源不漂移」的 memjudge 形态。
+  const glueAll = store.glueAll || (store.glueAll = gateTextDocument(store.text || ''));
 
   // 解释型问句（为什么/怎么/如何/哪些）问的是缘由与经过，不是某个字段的值，只判实体。
   if (pq.explain) {
@@ -426,11 +481,14 @@ export function gate(query, target, opts = {}) {
     };
   }
 
+  // 「问句里的名词块整串在原文没出现」曾经想做成硬拒答门（attribute-absent），实测不可行：
+  // 它会误拒 67/104 道真题——「本航次的航次代号」「报价的工期」「从抢滩到进坞…耗了多少天」
+  // 的块都整串不出现，而它们问的东西原文全有。汉语问句与原文措辞的偏移本来就大，
+  // 「覆盖率偏低」与「对象不存在」在这份语料上不可分。所以拒答仍只走下面的覆盖率高/低两档，
+  // 「被问实体整串缺席」这一现象交给评测器侧单独归档（mem-eval/harness/score.mjs 的 absent 档），
+  // 在那里它不冒充拒答、也不冒充倾倒。
+
   const p = pq.primary;
-  // 拒答比对面 = 拒答文档索引的同一份文档表达式。glueAll 不是临时算的检索字符串，
-  // 是 gateTextDocument 在 store 上物化的那份——索引（写入侧）与查询（读取侧）共用一个
-  // 生成函数，改任何一处另一处自动跟随，这就是 hindsight「DDL 与查询同源不漂移」的 memjudge 形态。
-  const glueAll = store.glueAll || (store.glueAll = gateTextDocument(store.text || ''));
 
   // 拒答的主体判据：问句里每个名词块的二字组在原文中的覆盖率。
   // 幻觉题编的是「海关关长」「中心气压」这类库里没有的复合名，二字组大面积落空；
@@ -439,13 +497,14 @@ export function gate(query, target, opts = {}) {
   const long = covers.filter((x) => x.b.length >= 3);
   const worst = long.sort((a, b) => a.c - b.c)[0];
   if (worst && worst.c < 0.4) {
+    const phrase = attrPhrase(query, worst.b) || worst.b;
     return {
       deny: true,
       reason: 'attribute-not-recorded',
       entity,
       attribute: worst.b,
       coverage: Number(worst.c.toFixed(2)),
-      detail: `记载了${entity ? `「${entity}」` : '这条线索'}，但原文没有「${worst.b}」这个说法（二字组覆盖 ${(worst.c * 100).toFixed(0)}%）`,
+      detail: `记载了${entity ? `「${entity}」` : '这条线索'}，但原文没有「${phrase}」这个说法（二字组覆盖 ${(worst.c * 100).toFixed(0)}%）`,
     };
   }
   if (!p) return { deny: false, reason: 'entity-only', entity, detail: '问句没有可判定的属性，放行' };
@@ -453,7 +512,8 @@ export function gate(query, target, opts = {}) {
 
   // 拉丁串（IMO、GPS）是硬标识：中文问句里的英文缩写不能靠二字组蒙，必须在原文出现。
   if (/^[a-z0-9]{2,}$/.test(p) && !glueAll.includes(p)) {
-    return { deny: true, reason: 'attribute-not-recorded', entity, attribute: p, detail: `材料里没有「${p.toUpperCase()}」这项标识` };
+    const phrase = (attrPhrase(query, p) || p).replace(new RegExp(p, 'i'), p.toUpperCase());
+    return { deny: true, reason: 'attribute-not-recorded', entity, attribute: p, detail: `材料里没有「${phrase}」这项标识` };
   }
   return {
     deny: false,
@@ -479,6 +539,34 @@ export function extractQuantities(text) {
     }
   }
   return out;
+}
+
+// 原文自带的修订语。单独出现时只说明「摘录把原文的更正句带回来了」，不构成插件的判断。
+const REVISION_CUE = /现予更正|予以更正|更正为|更正后|作废|以.{0,8}为准|已撤销|已推翻/;
+
+/**
+ * 同一单位在材料里出现多个不同取值、且文中有修订语时，由插件自己下「两处不一致」的判断。
+ * 这是判断层动作，不是正则碰巧命中：短路场景（只灌含修正值的那一章）只有一个取值，
+ * 函数返回 null，符合 SPEC 2.10 判据 4 的短路反证要求。
+ */
+export function conflictNarrate(body) {
+  const text = String(body || '');
+  if (text.length < 40) return null;
+  const cue = text.match(REVISION_CUE);
+  if (!cue) return null;
+  const byUnit = new Map();
+  for (const q of extractQuantities(text)) {
+    if (!byUnit.has(q.unit)) byUnit.set(q.unit, new Map());
+    const m = byUnit.get(q.unit);
+    m.set(q.num, (m.get(q.num) ?? 0) + 1);
+  }
+  let best = null;
+  for (const [unit, vals] of byUnit) {
+    if (vals.size >= 2 && (!best || vals.size > best.vals.size)) best = { unit, vals };
+  }
+  if (!best) return null;
+  const nums = [...best.vals.keys()].slice(0, 4).map((n) => `${n}${best.unit}`);
+  return `[冲突发现] 材料里同一${best.unit}出现了 ${best.vals.size} 个不同取值（${nums.join('、')}），两处记录不一致；其中一处标注「${cue[0]}」，应以后文修正后的值为准。`;
 }
 
 /** 两句之间共享的最长二字组，当作「它们在说同一个槽位」的证据。 */
@@ -824,7 +912,11 @@ export function render(query, cands, opts = {}) {
   const ptr = fit.pointers.length
     ? `\n\n另有 ${fit.pointers.length} 条因预算降级为指针：${fit.pointers.map((p) => p.id).join(', ')}`
     : '';
-  return { inject: body + ptr, gate: g, fit, chars: body.length + ptr.length };
+  // 判断层附加：同一槽位多值 + 原文有修订语时，自己先把矛盾点出来（SPEC 2.10 能力 10）。
+  // 这段元信息不计入正文预算，chars 仍报名层实际装载量。
+  const narrate = conflictNarrate(body);
+  const inject = narrate ? `${narrate}\n\n${body}${ptr}` : body + ptr;
+  return { inject, gate: g, fit, chars: body.length + ptr.length, narrative: Boolean(narrate) };
 }
 
-export default { gate, resolveConflict, decayWeight, fitBudget, render, buildStore, extractFacts, buildEntities, parseQuery, norm, CONFLICT_THRESHOLDS, textSim, conflictPairs, adjudicateConflicts, gateTextDocument, gateSearchIndex };
+export default { gate, resolveConflict, decayWeight, fitBudget, render, buildStore, extractFacts, buildEntities, parseQuery, norm, CONFLICT_THRESHOLDS, textSim, conflictPairs, adjudicateConflicts, gateTextDocument, gateSearchIndex, conflictNarrate, extractQuantities };

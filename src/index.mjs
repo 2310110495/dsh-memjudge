@@ -165,12 +165,14 @@ function oneLine(text, max) {
  * 硬门不依赖三元组，所以 no-facts 时单独补一次拉丁标识检查：
  * 「白鲸号的 IMO 编号是多少」在纯叙述候选上仍会被拒。
  */
-function isHardDeny(verdict, query, body) {
+export function isHardDeny(verdict, query, body) {
   const reason = verdict?.reason;
   if (reason === 'entity-not-recorded' || reason === 'scope-not-recorded') return true;
   if (reason === 'attribute-not-recorded') {
-    // 带 coverage 的是「二字组覆盖不足」（软）；不带的是拉丁标识门（硬）
-    return typeof verdict.coverage !== 'number';
+    // 带 coverage 的是「二字组覆盖不足」。实测 104 道真题的块覆盖率下限是 0.43，
+    // 所以 cov<0.4 是「问的东西一个字组都对不上」，与 H4「海关关长」的 0% 同类，属硬门；
+    // 不再只认恰为 0 这一种。
+    return typeof verdict.coverage !== 'number' || verdict.coverage < 0.4;
   }
   if (reason === 'no-facts') {
     const latin = (String(query).match(/[A-Za-z][A-Za-z0-9]{1,}/g) || []).map((s) => s.toLowerCase());

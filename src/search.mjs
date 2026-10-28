@@ -26,6 +26,14 @@
 //   3. 衰减 → RestRegular recencyFactor(ageDays, halfLifeDays)：
 //      Math.pow(0.5, ageDays/halfLifeDays)，半衰期可配置（SEARCH_DEFAULTS.halfLifeDays）。
 //      null = 沿用 schema 双档（warm 120 天 / cold 12 天）；数值 = 统一覆盖。
+//
+// 与源的三处有意偏离（不是抄漏，逐条可核，验收见 test/retrieval-port.test.mjs）：
+//   a. meow 的 CJK run 长度 <2 时不产出 token；本实现保留单字进倒排（打分乘
+//      singleCharDiscount=0.35），因为「单汉字不算强命中」闸门需要单字先进索引才能被计数拦下。
+//   b. meow 只在 promptLang=en 时做停用词+Porter；本实现无条件做。中文 bigram 不受影响
+//      （normalizeEn 只动纯字母词），写入侧与检索侧走同一函数，命中一致性不破。
+//   c. 默认衰减走 schema 双档（warm/cold），只有显式传 halfLifeDays 数值才是 RestRegular
+//      的统一半衰期。两条路径的乘性因子同源（0.5+0.5·imp / 1+0.1·ln(1+acc) / 0.3 罚）。
 
 import { rankWeight, decayFactor, DECAY } from './schema.mjs';
 
@@ -273,6 +281,11 @@ export function finalScore(bm25, mem, nowMs = Date.now(), opts = {}) {
     ageDays: rw.ageDays,
     tier: rw.tier,
     halfLifeDays: rw.halfLifeDays,
+    // 三个非时间因子原样透传（RestRegular recordScore 的其余三项），
+    // 让 explain / 审计能逐项复算 weight，不必反解 decay。
+    importanceFactor: rw.importanceFactor,
+    accessFactor: rw.accessFactor,
+    supersededPenalty: rw.supersededPenalty,
     superseded: Boolean(mem?.supersededBy),
   };
 }

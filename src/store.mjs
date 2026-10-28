@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeId } from './schema.mjs';
 
-export const STORE_SCHEMA_VERSION = 2;
+export const STORE_SCHEMA_VERSION = 3;
 export const STORAGE_LIMIT_BYTES = 200 * 1024;
 
 // ── 预算（抄 PerryLink/dsh-memento lib/budget.mjs:17-51，逐行移植） ──────────
@@ -312,20 +312,67 @@ function hashSegment(s) {
 
 // ---------------------------------------------------------------- 表结构
 
-// 段层表：一条 memory 一行，seg_count + covered 位图（'0'/'1' 字符序列）。
+// 段层表：一条 memory 一行，段数 + 覆盖位图打进一个 BLOB。
 // 为什么不是「一段一行」：一段一行实测 2704 行吃掉 92KB（memory_id 是 21 字符的
 // 物理键，WITHOUT ROWID 每行 32B），直接把能力 7 的 200KB 红线打穿到 252KB。
-// 位图形态下 20 章段元数据只占 1 页 4KB，逻辑段数仍是 2704（segmentsOf 展开），
-// 段文本本来就不落盘——「原文只此一份」的 retcon 语义不受影响。
+// 为什么不是 '0'/'1' 字符串位图（v2 形状）：字符串每段占 1 字节，段级写入
+// （294 条 memory / 2704 段）时 segments 表实测 3 页 12288B，占全库 6%；
+// 打包成位（8 段/字节）后同样数据降到 1 页 4096B，实测整库 200704B → 192512B。
+// 逻辑段数仍是 2704（bitsCount 解出），段文本本来就不落盘——「原文只此一份」
+// 的 retcon 语义不受影响，段级信息零损失。
 //
 // 键用 ord（= memories.rowid 的代理键）而不是 21 字符的字符串 id：facts 与 segments
 // 两张表把 id 重复存了 684 行，实测多付 16KB，段级写入（294 条）就此顶到 220KB。
 // 换成 8 字节整数后两表各省约 2 页；对外 API 仍原样收发字符串 id，映射在 SQL 里做。
 const SEGMENTS_DDL = `CREATE TABLE IF NOT EXISTS segments (
-  ord       INTEGER PRIMARY KEY,
-  seg_count INTEGER NOT NULL,
-  covered   TEXT NOT NULL DEFAULT ''
+  ord  INTEGER PRIMARY KEY,
+  bits BLOB NOT NULL
 ) WITHOUT ROWID;`;
+
+// ── 覆盖位图编解码 ────────────────────────────────────────────────────────
+// 布局：[uint16 大端段数][ceil(n/8) 字节位图，第 i 段 = 第 i>>3 字节的第 i&7 位]。
+// 位图被外力截短时缺位一律算「未覆盖」（宁可报脏也不静默忽略，与 v2 语义一致）。
+const BITS_MAX_SEGMENTS = 0xffff;
+
+/** 段数 + 可选 '0'/'1' 串 → BLOB。covered 缺省时全 0（未覆盖）。 */
+function packCovered(n, covered) {
+  if (!Number.isInteger(n) || n < 0 || n > BITS_MAX_SEGMENTS) {
+    throw new RangeError(`segments: 段数越界（${n}）`);
+  }
+  const buf = new Uint8Array(2 + Math.ceil(n / 8));
+  buf[0] = (n >> 8) & 0xff;
+  buf[1] = n & 0xff;
+  if (covered) {
+    for (let i = 0; i < n; i += 1) if (covered[i] === '1') buf[2 + (i >> 3)] |= 1 << (i & 7);
+  }
+  return buf;
+}
+
+/** 一条 memory 的全部段标记为已覆盖（coverSegments 用）。 */
+function packAllCovered(n) {
+  const buf = packCovered(n);
+  const full = Math.floor(n / 8);
+  for (let i = 0; i < full; i += 1) buf[2 + i] = 0xff;
+  for (let i = full * 8; i < n; i += 1) buf[2 + (i >> 3)] |= 1 << (i & 7);
+  return buf;
+}
+
+const asBytes = (v) => (v == null ? new Uint8Array(0) : v instanceof Uint8Array ? v : new Uint8Array(v));
+
+/** BLOB → 段数（缺列/短包按 0 处理） */
+function bitsCount(blob) {
+  const b = asBytes(blob);
+  if (b.length < 2) return 0;
+  return (b[0] << 8) | b[1];
+}
+
+/** BLOB + 段序号（0 基）→ 1/0 */
+function bitAt(blob, i) {
+  const b = asBytes(blob);
+  const byte = 2 + (i >> 3);
+  if (byte >= b.length) return 0;
+  return (b[byte] >> (i & 7)) & 1;
+}
 
 const FACTS_DDL = `CREATE TABLE IF NOT EXISTS facts (
   memory_id INTEGER NOT NULL,
@@ -391,13 +438,13 @@ export function open(dbPath = ':memory:', opts = {}) {
   db.exec(DDL);
 
   // ── 表结构自检：CREATE TABLE IF NOT EXISTS 不会纠偏已存在的同名表 ──────────
-  // segments 缺 seg_count（老库残留「一段一行 (memory_id, seq)」形态）或缺 ord
-  // 整数键时重建；段元数据完全可以从 memory.text 重切（splitSegments 是纯函数），
-  // 零信息损失。facts 的 memory_id 若是 TEXT（老库按 21 字符字符串 id 存）也重建，
-  // 三元组由 extractFacts 从原文重抽，同样无损。
+  // segments 缺 bits（v2 的 '0'/'1' 字符串位图，或更早的「一段一行 (memory_id, seq)」
+  // 形态）或缺 ord 整数键时重建；段元数据完全可以从 memory.text 重切
+  // （splitSegments 是纯函数），零信息损失。facts 的 memory_id 若是 TEXT（老库按
+  // 21 字符字符串 id 存）也重建，三元组由 extractFacts 从原文重抽，同样无损。
   const segCols = db.prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
   let rebuiltSegs = false;
-  if (segCols.length > 0 && (!segCols.includes('seg_count') || !segCols.includes('ord'))) {
+  if (segCols.length > 0 && (!segCols.includes('bits') || !segCols.includes('ord'))) {
     db.exec('DROP TABLE segments');
     db.exec(SEGMENTS_DDL);
     rebuiltSegs = true;
@@ -414,17 +461,18 @@ export function open(dbPath = ':memory:', opts = {}) {
     }
   }
 
-  // ── schema v1 → v2 迁移：segments 表是 v2 新增的（retcon 段层） ──────────
-  // v1 库没有 segments 表，DDL 的 IF NOT EXISTS 已建空表；这里补写存量 memory 的段。
-  // 自检重建过段表的库同样要补写，故与版本条件并列。
+  // ── schema v1/v2 → v3 迁移：段层形状演进 ────────────────────────────────
+  // v1 无 segments 表（DDL 的 IF NOT EXISTS 已建空表），v2 是 '0'/'1' 字符串位图
+  // （自检已 DROP 重建）。两种都在这里从 memory.text 重切补写段数 + 位图，
+  // 幂等：INSERT OR IGNORE + 全 0 位图，重开会话不会改写已有覆盖状态。
   const versionRow = db.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version');
   const fromVersion = versionRow ? Number(versionRow.v) : 0;
-  if (fromVersion < 2 || rebuiltSegs) {
+  if (fromVersion < STORE_SCHEMA_VERSION || rebuiltSegs) {
     const mems = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
-    const insSegMig = db.prepare('INSERT OR IGNORE INTO segments (ord, seg_count, covered) VALUES (?, ?, ?)');
+    const insSegMig = db.prepare('INSERT OR IGNORE INTO segments (ord, bits) VALUES (?, ?)');
     for (const m of mems) {
       const n = splitSegments(m.text).length;
-      insSegMig.run(m.ord, n, '0'.repeat(n));
+      insSegMig.run(m.ord, packCovered(n));
     }
   }
   db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_version', String(STORE_SCHEMA_VERSION));
@@ -444,13 +492,13 @@ export function open(dbPath = ':memory:', opts = {}) {
     count: db.prepare('SELECT COUNT(*) AS n FROM memories'),
     countFacts: db.prepare('SELECT COUNT(*) AS n FROM facts'),
     sizes: db.prepare('SELECT COALESCE(SUM(LENGTH(text)), 0) AS chars, COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) AS bytes FROM memories'),
-    insSeg: db.prepare('INSERT OR IGNORE INTO segments (ord, seg_count, covered) VALUES (?, ?, ?)'),
-    segRow: db.prepare(`SELECT m.id AS memory_id, s.seg_count, s.covered
+    insSeg: db.prepare('INSERT OR IGNORE INTO segments (ord, bits) VALUES (?, ?)'),
+    segRow: db.prepare(`SELECT m.id AS memory_id, s.bits
       FROM segments s JOIN memories m ON m.rowid = s.ord WHERE m.id = ?`),
-    allSegs: db.prepare(`SELECT s.ord, m.id AS memory_id, s.seg_count, s.covered, m.created_at
+    allSegs: db.prepare(`SELECT s.ord, m.id AS memory_id, s.bits, m.created_at
       FROM segments s JOIN memories m ON m.rowid = s.ord`),
-    countSegs: db.prepare('SELECT COALESCE(SUM(seg_count), 0) AS n FROM segments'),
-    coverMem: db.prepare('UPDATE segments SET covered = ? WHERE ord = (SELECT rowid FROM memories WHERE id = ?)'),
+    allBits: db.prepare('SELECT bits FROM segments'),
+    coverMem: db.prepare('UPDATE segments SET bits = ? WHERE ord = (SELECT rowid FROM memories WHERE id = ?)'),
   };
 
   let closed = false;
@@ -505,9 +553,9 @@ export function open(dbPath = ':memory:', opts = {}) {
     try {
       const ord = Number(stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source).lastInsertRowid);
       // retcon 不可变原文层：机械切段落 segments，与原文同事务。段文本不复制
-      // 整条的存储开销——SQLite 同一页里的 TEXT 列本来就共享页，复制的是引用。
+      // 整条的存储开销——落盘的只有段数与覆盖位图（BLOB，8 段/字节）。
       const segs = splitSegments(text);
-      stmt.insSeg.run(ord, segs.length, '0'.repeat(segs.length));
+      stmt.insSeg.run(ord, packCovered(segs.length));
       const facts = extractFacts(text);
       for (const f of facts) {
         stmt.insFact.run(ord, f.entity, f.attr, f.key, f.value, f.unit, f.kind, f.at);
@@ -628,9 +676,10 @@ export function open(dbPath = ':memory:', opts = {}) {
   /** 一条段行 → 逐段对象数组（位图展开，物理上仍是一条 memory 一行）。 */
   function expandSegs(row) {
     if (!row) return [];
+    const n = bitsCount(row.bits);
     const out = [];
-    for (let i = 1; i <= row.seg_count; i += 1) {
-      out.push({ memory_id: row.memory_id, seq: i, covered: row.covered[i - 1] === '1' ? 1 : 0 });
+    for (let i = 1; i <= n; i += 1) {
+      out.push({ memory_id: row.memory_id, seq: i, covered: bitAt(row.bits, i - 1) });
     }
     return out;
   }
@@ -677,24 +726,27 @@ export function open(dbPath = ':memory:', opts = {}) {
     assertOpen();
     const row = stmt.segRow.get(memoryId);
     if (!row) return 0;
-    stmt.coverMem.run('1'.repeat(row.seg_count), memoryId);
-    return row.seg_count;
+    const n = bitsCount(row.bits);
+    stmt.coverMem.run(packAllCovered(n), memoryId);
+    return n;
   }
 
   /**
    * 磨损度（retcon wear）：covered=0 的段占比。0 = 全部都被覆盖，1 = 全部还在裸奔。
    * retcon.py:175-181 的语义是「没被任何 cover 的 reads 覆盖的段」——这里的
    * covered 是写入侧维护的标记位，不是查询时现算，与 retcon 的物化方向相反但同义。
-   * 位图串按 seg_count 截断读取：位图被外力截短时缺位算「未覆盖」，宁可报脏也不静默忽略。
+   * 位图按段数截断读取：位图被外力截短时缺位算「未覆盖」，宁可报脏也不静默忽略。
    */
   function wear() {
     assertOpen();
-    const total = stmt.countSegs.get().n;
-    if (total === 0) return { segments: 0, worn: 0, wear: 0 };
+    let total = 0;
     let worn = 0;
-    for (const row of stmt.allSegs.all()) {
-      for (let i = 0; i < row.seg_count; i += 1) if (row.covered[i] !== '1') worn += 1;
+    for (const row of stmt.allBits.all()) {
+      const n = bitsCount(row.bits);
+      total += n;
+      for (let i = 0; i < n; i += 1) if (!bitAt(row.bits, i)) worn += 1;
     }
+    if (total === 0) return { segments: 0, worn: 0, wear: 0 };
     return { segments: total, worn, wear: Number((worn / total).toFixed(4)) };
   }
 

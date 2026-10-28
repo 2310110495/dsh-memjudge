@@ -1,0 +1,34 @@
+fix(judge): 拒答通用性 + 段级预算 + 检索移植单测
+
+审计对 t9 判 fail，理由是「通用拒答路径」等价于只对题库六条生效。核实成立：
+八个语料中零出现的属性词构造的问法，硬拒 0/8。根因在 judge.mjs 只从「当过事实
+主语」的实体里选 entity，「远洋号」这类材料里从来没有的对象进不了判断，entity
+恒为 null，后面所有缺席检查全部跳过。
+
+judge.mjs
+- 增加「X 号」实体门：问句点名的 X 号若整串不在材料、也不与任何事实主语互为前后
+  缀（材料写「白鲸号」而主语记「白鲸」，算有这号对象），判 entity-not-recorded。
+  只收这一种形状是实测结果——用 ENTITY_PATTERNS 全集会把「船长为什么决定改航」
+  切成实体「船长为什么」，误拒 36/104 道真题。
+- attrPhrase：拒答文案复述完整问法，不再只回一个属性词。
+
+index.mjs
+- isHardDeny 把 attribute-not-recorded 的门限从 coverage === 0 放宽到 < 0.4。
+  实测 87 条带 coverage 的真题最低是 0.43，0.4 这一档零误伤；0.5 那一档真题有
+  5 条，所以不能再往上抬。
+- isHardDeny 导出，供回归脚本复用同一份判定（探针自己抄一份会让主代码改了而探针
+  不跟着变）。
+- 段级预算裁剪与 render 标签记账（上限 204800，实测 192512）。
+
+scripts/check-generality.mjs（新增）
+23 条构造问法（实体名/属性名在语料 grep 计数为 0）+ 104 道真题一起跑：前者防
+过拟合，后者防为拒答而拒答。已知缺口 3 条（通信频率/舵机型号/潮差）留档在
+KNOWN_GAP 里，不隐藏——拦它们要抬阈值，会误伤 5 道真题。
+
+其余
+- search.mjs / store.test.mjs：检索移植与断言（t1）
+- test/retrieval-port.test.mjs（新增）、docs/RESCORE-HALLU.md（新增）
+- docs/AUDIT.md §5、docs/FINAL.md 能力 6：记第二轮修订与修订后的判据
+
+验证：check-generality 20/23 硬拒、0/104 误伤；verify-install --mock 的 SPEC 口径
+0/6 → 5/6；node --test test/*.test.mjs 31/31。
