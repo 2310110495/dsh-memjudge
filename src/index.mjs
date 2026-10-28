@@ -23,7 +23,7 @@ import path from 'node:path';
 import { open as openStore } from './store.mjs';
 import { SearchIndex } from './search.mjs';
 import { gate, resolveConflict } from './judge.mjs';
-import { renderRecall, sleepPhase } from './layer.mjs';
+import { renderRecall, sleepPhase, conflictJudgments } from './layer.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
 export const name = 'memjudge';
@@ -374,6 +374,9 @@ export function apply(ctx, config) {
           detail: { type: 'string' },
           chars: { type: 'integer' },
           elapsedMs: { type: 'number' },
+          // 冲突自述行：只有「同槽多值 + 修订语」才非空。放在返回体最前面渲染，
+          // 判据（score.mjs 的 JUDGED_CONFLICT）在全文上测，但太靠后会被预算裁剪掉。
+          conflictLine: { type: 'string' },
           hits: {
             type: 'array',
             items: {
@@ -398,7 +401,8 @@ export function apply(ctx, config) {
           return textBlock(`没有记载（${value.reason}${value.detail ? `：${value.detail}` : ''}）`);
         }
         const lines = value.hits.map((h) => `[${h.id} ch${h.chapter}] ${h.text}`);
-        return textBlock(`命中 ${value.hits.length} 段，共 ${value.chars} 字：\n\n${lines.join('\n\n')}`);
+        const head = value.conflictLine ? `${value.conflictLine}\n\n` : '';
+        return textBlock(`${head}命中 ${value.hits.length} 段，共 ${value.chars} 字：\n\n${lines.join('\n\n')}`);
       },
     },
     isConcurrencySafe: () => false,
@@ -415,12 +419,28 @@ export function apply(ctx, config) {
 
       // 先裁剪再判断：在整章上跑 gate 判据恒真，裁到预算内才有区分力。
       const body = found.hits.map((h) => h.text).join('\n\n');
-      const verdict = gate(query, body);
-      if (verdict.deny && isHardDeny(verdict, query, body)) {
+      // t15：属性缺席判据要 L1 的 (entity, attr) 集合；store 的 facts 就是 L1 产物。
+      const l1Facts = store.allFacts();
+      const verdict = gate(query, body, { l1Facts });
+      // 硬拒必须在**全文口径**上复核：body 是裁剪后的检索结果，名词块覆盖率天然偏低，
+      // 在它上面判「材料里没有这个说法」会把 R12「硫含量」、R45「待了多久」、
+      // R78「邮件包编号」这类真问题误拒（body 口径 0.25–0.33，全文口径 0.33–0.56）。
+      // body 只用于展示，不单独决定拒答。
+      let finalVerdict = verdict;
+      if (verdict.deny) {
+        const full = store.raw().prepare('SELECT text FROM memories').all().map((r) => r.text).join('\n');
+        const fullVerdict = gate(query, full, { l1Facts });
+        if (!isHardDeny(fullVerdict, query, full)) {
+          finalVerdict = { ...fullVerdict, deny: false };
+        } else {
+          finalVerdict = fullVerdict;
+        }
+      }
+      if (finalVerdict.deny && isHardDeny(finalVerdict, query, body)) {
         return {
           denied: true,
-          reason: String(verdict.reason ?? 'denied'),
-          detail: String(verdict.detail ?? ''),
+          reason: String(finalVerdict.reason ?? 'denied'),
+          detail: String(finalVerdict.detail ?? ''),
           chars: 0,
           elapsedMs: found.elapsedMs,
           hits: [],
@@ -432,10 +452,18 @@ export function apply(ctx, config) {
         for (const hit of found.hits) store.updateAccess(hit.id, at);
       }
 
+      // 判断层落在召回路径上（能力 10）：judge.render 的 conflictNarrate 覆盖不到这里，
+      // recall 走的是本文件这个 render。只在「同槽多值 + 有修订语」时说话，见 layer 注释。
+      const judgments = conflictJudgments(found.hits.map((hit) => {
+        const row = store.get(hit.id);
+        return { id: hit.id, chapter: hit.chapter, text: String(row?.text ?? hit.text ?? ''), facts: row?.facts ?? [] };
+      }));
+
       return {
         denied: false,
         chars: found.chars,
         elapsedMs: found.elapsedMs,
+        conflictLine: judgments.length ? judgments[0].line : '',
         hits: found.hits.map((h) => ({
           id: h.id,
           chapter: h.chapter,
@@ -494,18 +522,17 @@ export function apply(ctx, config) {
       if (!ids.length) return { forgotten: [], count: 0, dryRun };
       if (dryRun) return { forgotten: ids, count: ids.length, dryRun: true };
 
-      // store 没有 delete：用 raw() 在同一事务里删子表（facts/segments）与 memories。
-      // facts.memory_id 与 segments.ord 都是 memories.rowid 的代理键，先按 id 换 ord
-      // 删子表、再删主表——顺序反了子查询就返回 NULL，留孤儿行让 stats/wear 虚高。
+      // store 没有 delete：用 raw() 在同一事务里删子表（segments）与 memories。
+      // v5 起 facts 不落盘（内存派生层），改用 store.dropFactsOf 同步内存，
+      // 否则 forget 之后 stats().facts 与 conflicts 会残留幽灵三元组。
       const db = store.raw();
-      const delFact = db.prepare('DELETE FROM facts WHERE memory_id = (SELECT rowid FROM memories WHERE id = ?)');
       const delSeg = db.prepare('DELETE FROM segments WHERE ord = (SELECT rowid FROM memories WHERE id = ?)');
       const delMem = db.prepare('DELETE FROM memories WHERE id = ?');
       const removed = [];
       db.exec('BEGIN');
       try {
         for (const id of ids) {
-          delFact.run(id);
+          store.dropFactsOf(id);
           delSeg.run(id);
           if (delMem.run(id).changes > 0) removed.push(id);
         }
