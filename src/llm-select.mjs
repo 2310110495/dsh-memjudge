@@ -9,10 +9,10 @@
 // 降级必须可观测（t25/t26 的教训）：返回值永远带 degraded ∈ no-key|timeout|http|parse|none。
 // 静默降级会让整轮实验测的都是降级版本而没人知道。
 
-import { llmKey } from './config.mjs';
+import { chatKey } from './config.mjs';
 import { chat, resolveModel } from './llm-client.mjs';
 
-// 端点不在这里定义：由 llm-client 从 config 的 baseUrl 拼，面板改了就跟着改。
+// 端点不在这里定义：由 llm-client 从 chat 组的 baseUrl 拼，面板改了就跟着改。
 // MODEL 常量只作 LS_DEFAULTS 的历史兜底值；实际请求模型取 chatModel()（见 resolveModel）。
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 
@@ -96,7 +96,7 @@ export function selectCacheSize() {
 }
 
 export function selectEnabled() {
-  return Boolean(llmKey());
+  return Boolean(chatKey());
 }
 
 function digest(query, snippets) {

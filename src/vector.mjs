@@ -14,7 +14,7 @@
 // ——维度不同直接错，维度碰巧相同则静默算错相似度。指纹进文件名后，换模型只是「新起
 // 一个文件」，旧文件留着可回滚，两者互不污染。
 
-import { llmKey, embedModel, embedDims, llmBaseUrl } from './config.mjs';
+import { embedKey, embedModel, embedDims, embedBaseUrl } from './config.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -23,8 +23,9 @@ export const DIMS_CHOICES = [64, 128, 256, 512, 1024];
 export const DEFAULT_DIMS = 128;
 export const DEFAULT_BATCH = 16; // 实测：batch=16 约 1.3s/次；32 反而 6.4s（服务端排队）
 const TIMEOUT_MS = 20_000;
-/** 端点与模型跟随用户配置（原本硬编码，改配置等于不生效）。 */
-const endpointUrl = () => `${llmBaseUrl().replace(/\/+$/, '')}/embeddings`;
+/** 端点与模型跟随用户配置（原本硬编码，改配置等于不生效）。
+ *  只读 embed 组：向量模型可以与对话模型不同供应商。 */
+const endpointUrl = () => `${embedBaseUrl().replace(/\/+$/, '')}/embeddings`;
 const modelName = () => embedModel();
 
 const hashText = (t) => createHash('sha256').update(String(t)).digest('hex').slice(0, 16);
@@ -157,9 +158,9 @@ function cache(dims = DEFAULT_DIMS) {
   return _cache;
 }
 
-/** key 只在内存里读，绝不落盘、不进日志。 */
+/** key 只在内存里读，绝不落盘、不进日志。用 embed 组的 key。 */
 function apiKey() {
-  const k = llmKey();
+  const k = embedKey();
   return k && k.length > 8 ? k : null;
 }
 

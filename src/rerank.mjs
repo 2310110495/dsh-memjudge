@@ -1,4 +1,7 @@
-// memjudge 精排层：Qwen3-Reranker-8B（SiliconFlow /v1/rerank）接在检索候选之后。
+// memjudge 精排层：Qwen3-Reranker-8B（OpenAI 兼容 /rerank）接在检索候选之后。
+//
+// 端点、密钥、模型都取 rerank 组（rerankBaseUrl / rerankKey / rerankModel）：
+// 重排模型与对话模型可以来自不同供应商，换供应商只要改 rerank 组，不必动 chat 组。
 //
 // 为什么需要它：BM25 的排序信号是「词重合」，跨章综合题要的是「这段是不是在回答这个问题」。
 // 两段都含「凹陷」时字面分拉不开，而 reranker 直接给 query-document 的相关性判断。
@@ -15,8 +18,23 @@
 // 成本：一次请求打包全部候选（默认 20 条），不逐条调用；同一 (query, 候选集合)
 // 在进程内做短 TTL 缓存，评测里同题多次查询不会重复付费。
 
+import { rerankBaseUrl, rerankKey, rerankModel } from './config.mjs';
+
 export const RERANK_MODEL = 'Qwen/Qwen3-Reranker-8B';
-export const RERANK_ENDPOINT = 'https://api.siliconflow.cn/v1/rerank';
+
+/** 端点：rerank 组的 baseUrl 拼 /rerank，末尾斜杠已由配置层剥掉。 */
+export function rerankEndpoint() {
+  return `${rerankBaseUrl()}/rerank`;
+}
+
+/**
+ * 模型解析：调用方显式传的优先（评测可指定具体模型），否则用配置里的 rerankModel()。
+ * RERANK_MODEL 只作历史兜底常量，配置层默认值与之同源。
+ */
+export function resolveRerankModel(explicit) {
+  const m = typeof explicit === 'string' ? explicit.trim() : '';
+  return m || rerankModel();
+}
 
 export const RERANK_DEFAULTS = Object.freeze({
   topN: 8,
@@ -26,9 +44,9 @@ export const RERANK_DEFAULTS = Object.freeze({
   model: RERANK_MODEL,
 });
 
-/** key 只从环境读，绝不落盘、不进日志、不进 commit。 */
+/** key 只从配置读（rerank 组），绝不落盘、不进日志、不进 commit。 */
 export function rerankEnabled() {
-  return Boolean(llmKey());
+  return Boolean(rerankKey());
 }
 
 /**
@@ -44,8 +62,6 @@ export function rerankOptIn() {
   const v = String(process.env.MEMJUDGE_RERANK ?? '').trim().toLowerCase();
   return rerankEnabled() && (v === '1' || v === 'true' || v === 'yes' || v === 'on');
 }
-
-import { llmKey } from './config.mjs';
 
 const cache = new Map(); // `${digest}` → { at, results }
 export const rerankStats = {
@@ -117,14 +133,14 @@ export async function rerank(query, docs, opts = {}) {
   const started = performance.now();
   rerankStats.calls += 1;
   try {
-    const res = await fetchImpl(RERANK_ENDPOINT, {
+    const res = await fetchImpl(rerankEndpoint(), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${llmKey()}`,
+        Authorization: `Bearer ${rerankKey()}`,
       },
       // 一次打包所有候选：逐条调用会把延迟与费用乘 20 倍
-      body: JSON.stringify({ model: o.model, query: q, documents: list }),
+      body: JSON.stringify({ model: resolveRerankModel(opts.model), query: q, documents: list }),
       signal: ctrl.signal,
     });
     if (!res || !res.ok) {
@@ -197,4 +213,4 @@ export function applyRerank(items, ranked) {
   return { items: [...head, ...tail], moved: head.length, applied: true };
 }
 
-export default { rerank, applyRerank, rerankEnabled, rerankOptIn, clearRerankCache, rerankCacheSize, rerankStats, RERANK_DEFAULTS, RERANK_MODEL, RERANK_ENDPOINT };
+export default { rerank, applyRerank, rerankEnabled, rerankOptIn, clearRerankCache, rerankCacheSize, rerankStats, RERANK_DEFAULTS, RERANK_MODEL, rerankEndpoint, resolveRerankModel };

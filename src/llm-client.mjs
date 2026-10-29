@@ -6,21 +6,22 @@
 // 增强能力（向量、重排、查询扩展、LLM 选段、LLM 提取）全部静默失效。
 //
 // 三条约定：
-//   1. 端点只由 llmBaseUrl() 拼，密钥只由 llmKey() 读，模型由 chatModel() 定；
-//      不另立第二套配置读取路径（与 rpc.mjs 的 testKey 同源）。
+//   1. 端点只由 chatBaseUrl() 拼，密钥只由 chatKey() 读，模型由 chatModel() 定；
+//      不另立第二套配置读取路径（与 rpc.mjs 的 testKey 同源）。**只用 chat 组**：
+//      向量走 embed 组、重排走 rerank 组，三家供应商可以混搭。
 //   2. 超时 / abort / HTTP 非 2xx 一律原样上抛，由调用方决定怎么降级——这里不吞错、
 //      不把失败改写成成功；只负责把「失败」变成一个调用方认得出的错误。
 //   3. 端点与模型在**每次调用时**求值，不在模块加载时固化：面板改完 config.json
 //      调 reloadConfig() 后立即生效，不需要重启进程。
 
-import { chatModel, llmBaseUrl, llmKey } from './config.mjs';
+import { chatBaseUrl, chatKey, chatModel } from './config.mjs';
 
 /** 默认超时：与三个模块此前的 TIMEOUT_MS 一致（长 prompt 批量提取实测需要这么久）。 */
 export const CHAT_TIMEOUT_MS = 150_000;
 
-/** 端点：单一来源，末尾斜杠已由 llmBaseUrl() 剥掉。 */
+/** 端点：单一来源，末尾斜杠已由 chatBaseUrl() 剥掉。 */
 export function chatEndpoint() {
-  return `${llmBaseUrl()}/chat/completions`;
+  return `${chatBaseUrl()}/chat/completions`;
 }
 
 /**
@@ -51,7 +52,7 @@ export class ChatHttpError extends Error {
  *   timeoutMs  自定义超时；默认 CHAT_TIMEOUT_MS。rpc 的密钥测试这类场景需要更短的（8s）。
  *   signal     调用方自己的取消信号，与内部超时信号并联，任一触发即 abort。
  *   fetchImpl  注入点：单测用它做零网络验证，不传则用 globalThis.fetch。
- *   apiKey     默认 llmKey()；密钥测试要验「用户刚输入的 key」时才显式传。
+ *   apiKey     默认 chatKey()；密钥测试要验「用户刚输入的 key」时才显式传。
  * @returns {Promise<any>} 响应 JSON
  * @throws {ChatHttpError} 非 2xx；其它错误（超时 abort / 网络 / JSON 解析）原样透传
  */
@@ -65,7 +66,7 @@ export async function chat(payload, opts = {}) {
   const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
     ? Math.trunc(opts.timeoutMs)
     : CHAT_TIMEOUT_MS;
-  const apiKey = typeof opts.apiKey === 'string' ? opts.apiKey : llmKey();
+  const apiKey = typeof opts.apiKey === 'string' ? opts.apiKey : chatKey();
   const outer = opts.signal ?? null;
 
   const ctrl = new AbortController();

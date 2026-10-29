@@ -13,10 +13,10 @@
 //      导致 t21 报的所有「融合」数字其实都是纯 BM25 的。这里不允许再出现「不知道跑没跑」的状态。
 //   3. 查询扩展是**查询时**算的，不落盘、不进索引，库体预算不受影响。
 
-import { llmKey } from './config.mjs';
+import { chatKey } from './config.mjs';
 import { chat, resolveModel } from './llm-client.mjs';
 
-// 端点不在这里定义：由 llm-client 从 config 的 baseUrl 拼，面板改了就跟着改。
+// 端点不在这里定义：由 llm-client 从 chat 组的 baseUrl 拼，面板改了就跟着改。
 // MODEL 常量只作 QE_DEFAULTS 的历史兜底值；实际请求模型取 chatModel()（见 resolveModel）。
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 
@@ -87,7 +87,7 @@ export function expandCacheSize() {
 }
 
 export function expandEnabled() {
-  return Boolean(llmKey());
+  return Boolean(chatKey());
 }
 
 /**
