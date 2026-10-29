@@ -41,7 +41,16 @@ import {
   embedDims,
   maxChars as configuredMaxChars,
   storageLimitBytes as configuredStorageLimitBytes,
+  // 自动记忆的五项配置走 config.mjs 的三级解析（env > config.json > 默认）。
+  resolveAutoCapture,
 } from './config.mjs';
+import {
+  // 采集判定内核（纯函数，fail-open）：本文件只做「读 decision → 写库」的旁路。
+  createQuota,
+  extractCandidates,
+  formatSource,
+  resolveAutoConfig,
+} from './auto-capture.mjs';
 import { installMemjudgeRpc } from './rpc.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
@@ -275,10 +284,13 @@ export function apply(ctx, config) {
   let index = null;
   let indexDirty = true;
   let injectCache = null;
+  /** 自动采集 G5（近重复）的候选语料缓存。null = 需要按库重取；写库走 invalidate() 清空。 */
+  let autoCaptureCorpus = null;
 
   const invalidate = () => {
     indexDirty = true;
     injectCache = null;
+    autoCaptureCorpus = null;
   };
 
   const getIndex = () => {
@@ -471,6 +483,131 @@ export function apply(ctx, config) {
       return null;
     }
   };
+
+  // ── 自动记忆（T2 接线）：agent/pre-step 采集 ──────────────────────────
+  // 设计真源 docs/auto-capture-spec.md §1.3（挂载点与 prepend 语义）/ §4.3（章号分配）/
+  // §7.2（fail-open 纪律）。判定内核在 src/auto-capture.mjs，这里只做旁路：
+  // 读最终 decision → 取候选 → store.put。永不往 decision.messages 里 push 任何东西。
+  //
+  // 守卫的必要性：test/plugin.test.mjs 的 MockContext 只有 tools / systemPrompt / effect，
+  // 没有 on。不判就整条 apply 抛错，既有 5 条工具用例全崩。
+  const autoCfg = resolveAutoConfig(resolveAutoCapture(config && typeof config === 'object' ? config : {}));
+  // config.autoCapture === false 是硬开关：即使 env 把它翻回 true 也不采集。
+  const autoEnabled = autoCfg.enabled !== false && !(config && config.autoCapture === false);
+  // 配额状态机在 apply 里建一次、handler 复用。每次重建等于单会话/单轮上限从未生效。
+  const autoQuota = createQuota(autoCfg);
+  /** 自动章号起点：1-899 留给显式导入的语料，900+ 归自动条目（spec §4.3）。 */
+  const AUTO_CHAPTER_START = 900;
+  /** meta 里存「下一个可用自动章号」的键（与 wiki_version/raw_digest 同级，不建新表）。 */
+  const AUTO_META_CHAPTER = 'auto_capture_chapter_next';
+  /** 会话 → { chapter, para }：一会话一章，段号在章内递增。上限 256 个会话，超出淘汰最旧。 */
+  const autoSeqs = new Map();
+
+  /**
+   * 领一个章号。号在事务里领，读-改-写之间不 await，避免并发同号。
+   * meta 写失败时退回起点号：宁可多会话共章，也不让采集整条断掉。
+   */
+  const claimAutoChapter = () => {
+    const db = store.raw();
+    let began = false;
+    try {
+      db.exec('BEGIN');
+      began = true;
+      const row = db.prepare('SELECT v FROM meta WHERE k = ?').get(AUTO_META_CHAPTER);
+      const prev = Number.parseInt(row ? String(row.v) : '', 10);
+      const chapter = Number.isFinite(prev) && prev >= AUTO_CHAPTER_START ? prev : AUTO_CHAPTER_START;
+      db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run(AUTO_META_CHAPTER, String(chapter + 1));
+      db.exec('COMMIT');
+      return chapter;
+    } catch (err) {
+      if (began) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // 事务可能已因写失败自行回滚
+        }
+      }
+      console.warn('[memjudge] auto-capture 章号领取失败，退回起点号：', err && err.message);
+      return AUTO_CHAPTER_START;
+    }
+  };
+
+  /** 取（必要时分配）会话的章号与下一个段号。 */
+  const autoSeqFor = (sessionId) => {
+    const key = sessionId.trim();
+    const hit = autoSeqs.get(key);
+    if (hit) return hit;
+    const entry = { chapter: claimAutoChapter(), para: 0 };
+    if (autoSeqs.size >= 256) {
+      const oldest = autoSeqs.keys().next();
+      if (!oldest.done) autoSeqs.delete(oldest.value);
+    }
+    autoSeqs.set(key, entry);
+    return entry;
+  };
+
+  /** G5 候选语料：懒取一次，写库路径已通过 invalidate() 清空。 */
+  const autoCorpus = () => {
+    if (autoCaptureCorpus === null) autoCaptureCorpus = store.dump().map((m) => m.text);
+    return autoCaptureCorpus;
+  };
+
+  if (typeof ctx.on === 'function') {
+    // { prepend: true }：位于瀑布最外层，await next() 之后拿到的是内层处理完的最终
+    // decision（含 driver 追加的 runtime-context），spec §1.3 第 1 点。
+    // 不包 track/ctx.effect：ctx.on 的 disposer 已挂在当前 fiber 上，再包一层会重复释放。
+    ctx.on('agent/pre-step', async (input, next) => {
+      // 采集关闭：一次判定都不做，但仍必须原样放行。
+      if (!autoEnabled) return await next();
+
+      // await next() 独立成首句、不进 try：next() 自身抛的错是别的插件的错，不替它吞。
+      const decision = await next();
+      try {
+        if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
+
+        const sessionId = input?.agent?.session?.id;
+        if (typeof sessionId !== 'string' || sessionId.trim() === '') return decision;
+        const turn = Number.isFinite(Number(input?.turn)) ? Math.trunc(Number(input.turn)) : 0;
+
+        const candidates = extractCandidates(decision.messages, {
+          ...autoCfg,
+          existing: autoCorpus(),
+          quota: autoQuota,
+          sessionId,
+          turn,
+        });
+        if (candidates.length === 0) return decision;
+
+        let wrote = 0;
+        for (const candidate of candidates) {
+          const seq = autoSeqFor(sessionId);
+          seq.para += 1;
+          try {
+            const result = store.put({
+              text: candidate.text,
+              importance: candidate.importance,
+              chapter: seq.chapter,
+              para: seq.para,
+              source: formatSource(sessionId, turn),
+            });
+            if (result && result.inserted) wrote += 1;
+          } catch (err) {
+            // 单条写失败（预算超限 / 库异常）不拖累其余候选，也不碰这一轮对话。
+            console.warn('[memjudge] auto-capture 写入跳过：', err && err.message);
+          }
+        }
+
+        if (wrote > 0) {
+          invalidate();
+          touchWiki();
+        }
+      } catch (e) {
+        console.warn('[memjudge] auto-capture 跳过：', e && e.message);
+      }
+      // 任何情况下都返回 decision 本体：不修改、不替换、不返回 undefined。
+      return decision;
+    }, { prepend: true });
+  }
 
   const textBlock = (text) => [{ type: 'text', text }];
 

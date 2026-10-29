@@ -43,6 +43,79 @@ export const DEFAULT_STORAGE_LIMIT_BYTES = 2 * 1024 * 1024;
 /** 写入闸门默认值：0 = 不设硬限（要「写满即拒」得用户显式填）。 */
 export const DEFAULT_MAX_CHARS = 0;
 
+// ── 自动记忆（auto-capture）的配置键 ────────────────────────────────────────
+// 真源 docs/auto-capture-spec.md §6.1（采集默认开、注入可见性跟随 autoInject）
+// 与 §6.3（配置键）。走与本文件其它项同一条三级优先级：env > config.json > 默认。
+// 五项全部只有「行为」含义，不锁定任何能力，所以不进 FLAG_ENV/SETTING_ENV 的
+// 面板锁表——那两个表是给「面板输入框要不要置灰」用的。
+
+export const AUTO_CAPTURE_DEFAULTS = Object.freeze({
+  /** 采集总开关。默认开：默认关等于没做（spec §6.1）。 */
+  autoCapture: true,
+  /** G2 最小长度。 */
+  autoCaptureMinChars: 12,
+  /** G3 最大长度。超长整条丢弃，绝不截断。 */
+  autoCaptureMaxChars: 600,
+  /** G6 单会话累计上限。 */
+  autoCaptureLimitPerSession: 40,
+  /** G6 单轮上限。 */
+  autoCapturePerTurn: 2,
+  /** G5 近重复阈值。 */
+  autoCaptureDupThreshold: 0.85,
+});
+
+/** 配置键 → 环境变量。一个键一个变量，别名问题不在这里造。 */
+export const AUTO_CAPTURE_ENV = Object.freeze({
+  autoCapture: 'MEMJUDGE_AUTO_CAPTURE',
+  autoCaptureMinChars: 'MEMJUDGE_AUTO_CAPTURE_MIN_CHARS',
+  autoCaptureMaxChars: 'MEMJUDGE_AUTO_CAPTURE_MAX_CHARS',
+  autoCaptureLimitPerSession: 'MEMJUDGE_AUTO_CAPTURE_MAX_PER_SESSION',
+  autoCapturePerTurn: 'MEMJUDGE_AUTO_CAPTURE_MAX_PER_TURN',
+  autoCaptureDupThreshold: 'MEMJUDGE_AUTO_CAPTURE_DUP_THRESHOLD',
+});
+
+function clampRange(v, lo, hi, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+/**
+ * 五项自动记忆配置的三级解析。非法值一律回落默认，不抛错（与 resolveConfig 同一条
+ * 「插件装不上比参数被钳更糟」的规矩）。
+ *
+ * @param {object} [cfg] config.json 的内容
+ * @param {object} [env] 环境变量表，缺省 process.env（测试注入点）
+ */
+export function resolveAutoCapture(cfg, env = process.env) {
+  const src = cfg && typeof cfg === 'object' ? cfg : {};
+  const read = env && typeof env === 'object' ? env : {};
+
+  const enabledOf = () => {
+    const e = read[AUTO_CAPTURE_ENV.autoCapture];
+    if (e === '1' || e === 'true') return true;
+    if (e === '0' || e === 'false') return false;
+    if (src.autoCapture === false) return false;
+    return AUTO_CAPTURE_DEFAULTS.autoCapture;
+  };
+
+  const numOf = (key, lo, hi, trunc) => {
+    const e = read[AUTO_CAPTURE_ENV[key]];
+    const raw = e !== undefined && e !== '' ? e : src[key];
+    const value = clampRange(raw, lo, hi, AUTO_CAPTURE_DEFAULTS[key]);
+    return trunc ? Math.trunc(value) : value;
+  };
+
+  return {
+    autoCapture: enabledOf(),
+    autoCaptureMinChars: numOf('autoCaptureMinChars', 4, 200, true),
+    autoCaptureMaxChars: numOf('autoCaptureMaxChars', 12, 20000, true),
+    autoCaptureLimitPerSession: numOf('autoCaptureLimitPerSession', 1, 200, true),
+    autoCapturePerTurn: numOf('autoCapturePerTurn', 1, 20, true),
+    autoCaptureDupThreshold: numOf('autoCaptureDupThreshold', 0.5, 1, false),
+  };
+}
+
 /** 正整数清洗：非法/非正 → 默认值。用于上限这类「0 无意义」的字段。 */
 function posInt(v, fallback) {
   const n = Number(v);
@@ -233,6 +306,9 @@ function load() {
     // 存储上限两个字段与模型名同一条三来源优先级：env > config.json > 默认
     storageLimitBytes: posInt(process.env.MEMJUDGE_STORAGE_LIMIT_BYTES || cfg.storageLimitBytes, DEFAULT_STORAGE_LIMIT_BYTES),
     maxChars: nonNegInt(process.env.MEMJUDGE_MAX_CHARS || cfg.maxChars, DEFAULT_MAX_CHARS),
+    // 自动记忆五项：同一条三级优先级（env > config.json > 默认），在 load 里算一次，
+    // 面板与 pre-step 读的是同一份值，不各算一遍。
+    autoCapture: resolveAutoCapture(cfg, process.env),
   };
   return cache;
 }
