@@ -132,13 +132,23 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 掩码降级：hasKey 为真但服务端没回里 keyMasked 时，不能显示空字符串
+     * 掩码降级：该组已配置但服务端没回 keyMasked 时，不能显示空字符串
      * （用户会以为没生效），也不能显示「未配置」。给出明确的中性说明。
      */
-    function maskText(cfg) {
-      if (!cfg || !cfg.hasKey) return '—';
-      const m = cfg.keyMasked;
+    function maskOf(view) {
+      if (!view || !view.keyConfigured) return '—';
+      const m = view.keyMasked;
       return (typeof m === 'string' && m.trim()) ? m.trim() : '（服务端未返回掩码）';
+    }
+
+    /** 一组密钥的来源短标：面板上必须一眼看出「自己的 / 继承的 / 环境变量钉死的」。 */
+    function keySourceLabel(view) {
+      if (view.keyEnvLocked) return '环境变量锁定';
+      if (view.keyInherited) return '继承对话模型';
+      if (view.keySource === 'env') return '环境变量';
+      if (view.keySource === 'secrets.json') return '本机 secrets.json';
+      if (view.keySource === 'override') return '运行时覆盖';
+      return view.keyConfigured ? '来源未知' : '未配置';
     }
 
     function errMsg(res) {
@@ -194,6 +204,9 @@ window.__ModuleLoader__.load({
       '.mj-keyinput{flex:1 1 auto;min-width:0;position:relative;display:flex}',
       '.mj-keyact{display:flex;align-items:center;gap:8px}',
       '.mj-meta{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}',
+      // 凭证分组之间的分隔线由 CSS 承担：内联值优先级高于 @container，窄档就收不紧了。
+      '.mj-credgroup+.mj-credgroup,.mj-globalblock{margin-top:12px;padding-top:12px;'
+        + 'border-top:1px solid var(--dsw-alias-border-l1)}',
       '.mj-conf{display:flex;gap:10px;align-items:flex-start;padding:8px 0}',
       '.mj-confattr{flex:0 0 96px;width:96px;min-width:0}',
       // 按钮的 display 必须走 CSS：内联值优先级高于 @container，删掉这一条会让
@@ -239,6 +252,7 @@ window.__ModuleLoader__.load({
         + '.mj-conf{flex-wrap:wrap}'
         + '.mj-confattr{flex:1 0 100%;width:auto}'
         + '.mj-texthint{padding-left:0}'
+        + '.mj-credgroup+.mj-credgroup,.mj-globalblock{margin-top:10px;padding-top:10px}'
         + '.mj-membody[data-collapsed="1"]{display:none}'
         + '.mj-fold{display:inline-flex}'
         + '}',
@@ -435,11 +449,17 @@ window.__ModuleLoader__.load({
      * 受控单行输入：左 96px 标签（与 .mj-modname / .mj-confattr 同一栅格）+ 右侧 input。
      * locked 是「被环境变量钉死」，disabled 是「本次提交在飞」——两者都不可编辑，
      * 但原因不同，所以 title 分开写；locked 还要在 hint 上补一句，否则用户只知道点不动。
-     * 密钥不归它管：密钥有自己的密码框 + 显隐按钮（keyFormBlock）。
+     * lockedReason 由调用方给（能点名环境变量名时就点名），缺省用通用文案。
+     * ariaLabel 与 label 分开：三组都有「接口地址」，可访问名必须带上组名才唯一。
+     * 密钥不归它管：密钥有自己的密码框 + 显隐按钮（keyBlock）。
      */
-    function TextField({ label, value, onChange, placeholder, hint, mono, disabled, locked, type, inputMode, maxLength }) {
+    function TextField({
+      label, value, onChange, placeholder, hint, mono, disabled, locked, lockedReason,
+      ariaLabel, type, inputMode, maxLength,
+    }) {
       const off = !!disabled || !!locked;
-      const reason = locked ? '该项由环境变量决定，改面板不生效' : disabled ? '正在保存，稍候' : undefined;
+      const lockText = lockedReason || '该项由环境变量决定，改面板不生效';
+      const reason = locked ? lockText : disabled ? '正在保存，稍候' : undefined;
       return h('div', { style: { padding: '5px 0' } },
         h('div', { className: 'mj-textrow', style: { display: 'flex', alignItems: 'center', gap: 10 } },
           h('div', {
@@ -452,7 +472,7 @@ window.__ModuleLoader__.load({
             type: type || 'text',
             value: value == null ? '' : String(value),
             placeholder: placeholder,
-            'aria-label': label,
+            'aria-label': ariaLabel || label,
             inputMode: inputMode,
             maxLength: maxLength,
             disabled: off,
@@ -470,7 +490,7 @@ window.__ModuleLoader__.load({
         hint || locked
           ? h(Hint, { className: 'mj-texthint' },
             hint || '',
-            locked ? (hint ? ' 被环境变量锁定。' : '被环境变量锁定。') : '')
+            locked ? (hint ? ' ' + lockText : lockText) : '')
           : null);
     }
 
@@ -485,42 +505,153 @@ window.__ModuleLoader__.load({
 
     // ------------------------------------------------ 接口与模型（值型设置）
     //
+    // 三组独立凭据：对话 / 向量 / 重排可以来自三家不同供应商，端点、密钥、模型名互不串用。
+    // 面板按组渲染子块；存储口径与写入闸门是全局项，不属于任何组，留在本卡末尾。
+    //
     // 回读（configReport）是唯一真值来源，这里只放「恢复默认」用的出厂值。
     // 出厂值必须与 src/config.mjs 的 load() 默认分支逐字一致，否则按回去的是另一套配置。
+
+    /** 组名即后端 group 参数；title/desc 只用于面板文案，不参与请求。 */
+    const CRED_GROUPS = [
+      { id: 'chat', title: '对话模型', desc: '查询扩展、LLM 选段与提取、面板的测试连接都走这一组。' },
+      { id: 'embed', title: '向量模型', desc: '向量召回用这一组；未单独配置时端点与密钥继承对话模型。' },
+      { id: 'rerank', title: '重排模型', desc: '精排重打分用这一组；同样支持继承对话模型的端点与密钥。' },
+    ];
+
+    /** 组 → 九项白名单里的键名（与 src/config.mjs 的 SETTING_ENV 同一套，别在此处另造命名）。 */
+    const GROUP_KEYS = {
+      chat: { baseUrl: 'chatBaseUrl', model: 'chatModel' },
+      embed: { baseUrl: 'embedBaseUrl', model: 'embedModel' },
+      rerank: { baseUrl: 'rerankBaseUrl', model: 'rerankModel' },
+    };
+
+    /** 反向表：九项键 → 组，供 settingText 从 groups 的生效值取文本。 */
+    const GROUP_OF_SETTING = (() => {
+      const out = {};
+      for (const [group, keys] of Object.entries(GROUP_KEYS)) {
+        out[keys.baseUrl] = group;
+        out[keys.model] = group;
+      }
+      return out;
+    })();
+
     const SETTING_DEFAULTS = {
-      baseUrl: 'https://api.siliconflow.cn/v1',
+      chatBaseUrl: 'https://api.siliconflow.cn/v1',
       chatModel: 'deepseek-ai/DeepSeek-V4-Flash',
+      embedBaseUrl: 'https://api.siliconflow.cn/v1',
       embedModel: 'Qwen/Qwen3-Embedding-8B',
+      rerankBaseUrl: 'https://api.siliconflow.cn/v1',
       rerankModel: 'Qwen/Qwen3-Reranker-8B',
       dims: '64',
       storageLimitBytes: '2048',
       maxChars: '0',
     };
 
-    /** 七行输入的顺序、文案与键盘类型；storageLimitBytes 走 kb:true 的字节↔KB 换算。 */
+    /**
+     * 九项输入的渲染表：group 决定它落在哪个子块，null = 全局项。
+     * dims 归向量组（只对向量模型有意义）；顺序即组内顺序。
+     */
     const SETTING_ROWS = [
       {
-        key: 'baseUrl', label: '接口地址', mono: true,
+        group: 'chat', key: 'chatBaseUrl', label: '接口地址', mono: true,
         placeholder: 'https://api.siliconflow.cn/v1',
         hint: 'OpenAI 兼容的 /v1 根地址。改完立刻生效，无需重启。',
       },
-      { key: 'chatModel', label: '对话模型', mono: true, hint: '测试连接与 LLM 选段/提取用这个模型。' },
-      { key: 'embedModel', label: '向量模型', mono: true, hint: '换模型会重建向量缓存，旧向量不会串用。' },
-      { key: 'rerankModel', label: '重排模型', mono: true },
-      { key: 'dims', label: '向量维度', inputMode: 'numeric', hint: '须与向量模型输出维度一致。' },
       {
-        key: 'storageLimitBytes', label: '存储上限', inputMode: 'numeric', kb: true,
+        group: 'chat', key: 'chatModel', label: '模型名', mono: true,
+        hint: '查询扩展、LLM 选段/提取与测试连接都用它。',
+      },
+      {
+        group: 'embed', key: 'embedBaseUrl', label: '接口地址', mono: true,
+        placeholder: 'https://api.siliconflow.cn/v1',
+        hint: '向量模型的 /v1 根地址，可与对话模型不同家。',
+      },
+      {
+        group: 'embed', key: 'embedModel', label: '模型名', mono: true,
+        hint: '换模型会重建向量缓存，旧向量不会串用。',
+      },
+      {
+        group: 'embed', key: 'dims', label: '向量维度', inputMode: 'numeric',
+        hint: '须与向量模型输出维度一致。',
+      },
+      {
+        group: 'rerank', key: 'rerankBaseUrl', label: '接口地址', mono: true,
+        placeholder: 'https://api.siliconflow.cn/v1',
+        hint: '重排模型的 /v1 根地址，可与前两组不同家。',
+      },
+      {
+        group: 'rerank', key: 'rerankModel', label: '模型名', mono: true,
+        hint: '重排接口按它发 query 与 documents。',
+      },
+      {
+        group: null, key: 'storageLimitBytes', label: '存储上限', inputMode: 'numeric', kb: true,
         hint: '仅统计口径，超过会标红但不会阻止写入。',
       },
       {
-        key: 'maxChars', label: '写入硬限', inputMode: 'numeric',
+        group: null, key: 'maxChars', label: '写入硬限', inputMode: 'numeric',
         hint: '0 = 不设限。设为正数后超限的写入会被拒绝，不截断。',
       },
     ];
 
-    /** 回读值 → 输入框文本。数值项直接 String()（64.0 会变 '64'）；存储上限按 KB 取整。 */
+    /**
+     * 一组的回读视图。新后端给 config.groups[group]（掩码 + 来源 + 继承 + env 锁）；
+     * 老后端没有 groups 时降级：chat 用顶层同义字段，embed / rerank 视为未配置。
+     * 有这层降级，面板不会因为后端版本不一致而白屏。
+     */
+    function groupView(cfg, group) {
+      const empty = {
+        baseUrl: '', baseUrlSource: '', baseUrlInherited: false, baseUrlEnv: null,
+        model: '', modelSource: '', modelEnv: null,
+        keyConfigured: false, keyMasked: '', keySource: 'none', keyInherited: false, keyEnvLocked: false,
+      };
+      if (!cfg) return empty;
+      const raw = cfg.groups && typeof cfg.groups === 'object' ? cfg.groups[group] : null;
+      if (raw && typeof raw === 'object') return Object.assign({}, empty, raw);
+      if (group === 'chat') {
+        return Object.assign({}, empty, {
+          baseUrl: typeof cfg.baseUrl === 'string' ? cfg.baseUrl : '',
+          model: typeof cfg.chatModel === 'string' ? cfg.chatModel : '',
+          keyConfigured: !!cfg.hasKey,
+          keyMasked: typeof cfg.keyMasked === 'string' ? cfg.keyMasked : '',
+          keySource: typeof cfg.keySource === 'string' ? cfg.keySource : 'none',
+        });
+      }
+      return Object.assign({}, empty, {
+        model: typeof cfg[group + 'Model'] === 'string' ? cfg[group + 'Model'] : '',
+      });
+    }
+
+    /** 一组密钥来源的一句话说明：自己的 / 继承的 / 环境变量里的，三种不能混着说。 */
+    function keySourceHint(cfg, group, view) {
+      const spec = cfg && cfg.credSpec ? cfg.credSpec[group] : null;
+      const keyEnvName = spec && Array.isArray(spec.keyEnv) && spec.keyEnv.length ? spec.keyEnv[0] : '';
+      if (view.keyEnvLocked) {
+        return '密钥由环境变量 ' + (keyEnvName || 'MEMJUDGE_*_KEY') + ' 决定，面板写入不生效。';
+      }
+      if (view.keyInherited) return '继承自对话模型密钥：填本组自己的 key 即切换为独立配置。';
+      if (view.keySource === 'env') {
+        return '来自环境变量' + (keyEnvName ? ' ' + keyEnvName : '') + '，换机器需重新配置。';
+      }
+      if (view.keyConfigured) return '存于本机 secrets.json，只属于这一组。';
+      return '未配置：这一组的增强能力保持关闭。';
+    }
+
+    /** 端点/模型名的环境变量名（后端给了就点名，让用户知道该去改哪个变量）。 */
+    function settingEnvName(view, key, group) {
+      if (GROUP_KEYS[group].baseUrl === key) return view.baseUrlEnv || '';
+      if (GROUP_KEYS[group].model === key) return view.modelEnv || '';
+      return '';
+    }
+
+    /** 回读值 → 输入框文本。端点/模型名取 groups 的生效值；存储上限按 KB 取整。 */
     function settingText(key, cfg) {
       if (!cfg) return '';
+      const group = GROUP_OF_SETTING[key];
+      if (group) {
+        const view = groupView(cfg, group);
+        const raw = GROUP_KEYS[group].baseUrl === key ? view.baseUrl : view.model;
+        return raw == null ? '' : String(raw);
+      }
       const raw = cfg[key];
       if (key === 'storageLimitBytes') {
         const n = Number(raw);
@@ -549,16 +680,19 @@ window.__ModuleLoader__.load({
 
     // ---------------------------------------------------------- 模块定义
 
+    // 每项增强看自己那一组密钥：向量要 embed、精排要 rerank、其余三项走 chat。
+    // group 字段与 src/config.mjs 的 moduleFlags() 判定同源，面板据此把「先填密钥」
+    // 指向真正缺 key 的那一组，而不是一律指向对话模型。
     const MODULES = [
       { key: 'jieba', name: 'jieba 分词', desc: '搜索引擎模式切词，替代 CJK 二元组', readonly: true },
-      { key: 'vector', name: '向量融合', desc: 'Qwen3-Embedding-8B 64 维 int8，BM25+RRF', gated: true },
-      { key: 'rerank', name: '精排 rerank', desc: 'Qwen3-Reranker-8B（综合题实测零增量）', gated: true },
-      { key: 'expand', name: '查询扩展', desc: 'LLM 拆子查询', gated: true },
-      { key: 'llmSelect', name: 'LLM 选段', desc: '候选段交模型挑选', gated: true },
-      { key: 'llmExtract', name: 'LLM 提取', desc: '离线重建 facts', gated: true },
+      { key: 'vector', name: '向量融合', desc: 'Qwen3-Embedding-8B 64 维 int8，BM25+RRF', gated: true, group: 'embed' },
+      { key: 'rerank', name: '精排 rerank', desc: 'Qwen3-Reranker-8B（综合题实测零增量）', gated: true, group: 'rerank' },
+      { key: 'expand', name: '查询扩展', desc: 'LLM 拆子查询', gated: true, group: 'chat' },
+      { key: 'llmSelect', name: 'LLM 选段', desc: '候选段交模型挑选', gated: true, group: 'chat' },
+      { key: 'llmExtract', name: 'LLM 提取', desc: '离线重建 facts', gated: true, group: 'chat' },
     ];
 
-    const NO_KEY_TITLE = '这五项都要调外部模型，没有 key 会在每次检索时等超时，所以被强制关闭。';
+    const NO_KEY_TITLE = '这一项要调外部模型，但它所属的那一组还没有密钥：开着只会在每次检索时等超时，所以先关着。';
 
     /**
      * 模块行（§5）。四类门控必须视觉可分：
@@ -572,7 +706,8 @@ window.__ModuleLoader__.load({
         right.push(h(Hint, { key: 'ro', style: { whiteSpace: 'normal', textAlign: 'right' } },
           '只读 · 由环境变量 MEMJUDGE_NO_JIEBA 控制'));
       } else if (needKey) {
-        right.push(h(Link, { key: 'nk', onClick: onNeedKey }, '先填密钥'));
+        right.push(h(Link, { key: 'nk', onClick: onNeedKey },
+          m.groupName ? '先填' + m.groupName + '密钥' : '先填密钥'));
       } else if (locked) {
         right.push(h(Hint, { key: 'lk' }, '由环境变量锁定'));
       } else {
@@ -663,36 +798,58 @@ window.__ModuleLoader__.load({
       const rows = (memsSt.data && Array.isArray(memsSt.data.rows)) ? memsSt.data.rows : null;
       const conflicts = (confSt.data && Array.isArray(confSt.data.conflicts)) ? confSt.data.conflicts : null;
 
-      // ---- 密钥区状态（§4）——不乐观更新，一切以 status 回读为准
-      const keyRef = useRef(null);
-      const [keyInput, setKeyInput] = useState('');
-      const [keyShown, setKeyShown] = useState(false);
-      const [keyBusy, setKeyBusy] = useState('');
-      const [keyMsg, setKeyMsg] = useState(null);
-      const [confirmClear, setConfirmClear] = useState(false);
-      const fadeTimer = useRef(null);
-      const armTimer = useRef(null);
+      // ---- 密钥区状态（§4）——三组各一套，不乐观更新，一切以 status 回读为准
+      //
+      // 每组独立持有 { input, shown, busy, msg, confirmClear, replacing }：
+      // 一组的保存/测试失败绝不能改到另外两组的输入框与反馈——三组常常来自三家供应商，
+      // 用一个共享 busy 会让「测 embed 时 chat 的按钮也变灰」这种误导成为常态。
+      const KEY_SLOT_INIT = {
+        input: '', shown: false, busy: '', msg: null, confirmClear: false, replacing: false,
+      };
+      const [keyStates, setKeyStates] = useState(() => ({
+        chat: Object.assign({}, KEY_SLOT_INIT),
+        embed: Object.assign({}, KEY_SLOT_INIT),
+        rerank: Object.assign({}, KEY_SLOT_INIT),
+      }));
+      // 组 → 该组密钥输入框 DOM；「先填密钥」链接要能跳到缺 key 的那一组
+      const keyRefs = useRef({});
+      const fadeTimers = useRef({});
+      const armTimers = useRef({});
 
       useEffect(() => () => {
-        if (fadeTimer.current) clearTimeout(fadeTimer.current);
-        if (armTimer.current) clearTimeout(armTimer.current);
+        for (const t of Object.values(fadeTimers.current)) clearTimeout(t);
+        for (const t of Object.values(armTimers.current)) clearTimeout(t);
+        fadeTimers.current = {};
+        armTimers.current = {};
       }, []);
 
-      const setFeedback = useCallback((msg, fade) => {
-        setKeyMsg(msg);
-        if (fadeTimer.current) clearTimeout(fadeTimer.current);
+      /** 读一组的分片；组名不合法时给一份空白，绝不让 undefined 打进渲染。 */
+      const slotOf = useCallback((group) => keyStates[group] || KEY_SLOT_INIT, [keyStates]);
+
+      const patchSlot = useCallback((group, patch) => {
+        setKeyStates((prev) => {
+          const cur = prev[group] || KEY_SLOT_INIT;
+          return Object.assign({}, prev, { [group]: Object.assign({}, cur, patch) });
+        });
+      }, []);
+
+      const setKeyFeedback = useCallback((group, msg, fade) => {
+        patchSlot(group, { msg });
+        if (fadeTimers.current[group]) clearTimeout(fadeTimers.current[group]);
         if (fade) {
-          fadeTimer.current = setTimeout(() => {
-            setKeyMsg((cur) => (cur === msg ? null : cur));
+          fadeTimers.current[group] = setTimeout(() => {
+            fadeTimers.current[group] = null;
+            patchSlot(group, { msg: null });
           }, 4000);
         }
-      }, []);
+      }, [patchSlot]);
 
-      const resetConfirm = useCallback(() => {
-        if (armTimer.current) clearTimeout(armTimer.current);
-        armTimer.current = null;
-        setConfirmClear(false);
-      }, []);
+      /** 二段确认的 5 秒复位；按组各存一个定时器。 */
+      const resetConfirm = useCallback((group) => {
+        if (armTimers.current[group]) clearTimeout(armTimers.current[group]);
+        armTimers.current[group] = null;
+        patchSlot(group, { confirmClear: false });
+      }, [patchSlot]);
 
       const pullStatus = useCallback(() => {
         return Promise.resolve(rpc('status', {})).then((res) => {
@@ -705,86 +862,105 @@ window.__ModuleLoader__.load({
         });
       }, [rpc, setStatusSt]);
 
-      const saveKey = useCallback(() => {
-        const v = keyInput.trim();
-        if (!v || keyBusy) return;
-        setKeyBusy('save');
-        setFeedback(null);
-        Promise.resolve(rpc('saveKey', { key: v })).then((res) => {
+      /** 保存一组的密钥：payload 带 group，成功后只重读 status（回读为准），并清掉该组输入。 */
+      const saveKeyFor = useCallback((group) => {
+        const slot = slotOf(group);
+        const v = slot.input.trim();
+        if (!v || slot.busy) return;
+        patchSlot(group, { busy: 'save' });
+        setKeyFeedback(group, null);
+        Promise.resolve(rpc('saveKey', { key: v, group })).then((res) => {
           if (!(res && res.ok)) {
-            setFeedback({ kind: 'err', text: '保存失败：' + errMsg(res) });
+            setKeyFeedback(group, { kind: 'err', text: '保存失败：' + errMsg(res) });
             return null;
           }
           return pullStatus().then(() => {
-            setKeyInput('');
-            setFeedback({ kind: 'ok', text: '已保存，密钥即刻生效。' }, true);
+            patchSlot(group, { input: '', replacing: false });
+            setKeyFeedback(group, { kind: 'ok', text: '已保存，这一组即刻生效。' }, true);
             return null;
           });
         }, (e) => {
-          setFeedback({ kind: 'err', text: '保存失败：' + (e && e.message ? e.message : String(e)) });
-        }).then(() => { setKeyBusy(''); });
-      }, [keyInput, keyBusy, rpc, pullStatus, setFeedback]);
+          setKeyFeedback(group, { kind: 'err', text: '保存失败：' + (e && e.message ? e.message : String(e)) });
+        }).then(() => { patchSlot(group, { busy: '' }); });
+      }, [slotOf, patchSlot, rpc, pullStatus, setKeyFeedback]);
 
-      const testKey = useCallback(() => {
-        if (keyBusy) return;
-        setKeyBusy('test');
-        setFeedback(null);
-        const payload = keyInput.trim() ? { key: keyInput.trim() } : {};
+      /**
+       * 测试一组连通性。后端非 2xx 时外层信封仍是 ok:true，判定必须看内层
+       * value.ok —— 那是「测试结果」，fail() 才是「调用方式错了」。
+       * 输入框里有未保存的值就带上测它，否则后端用该组已存/继承/环境变量里的 key。
+       */
+      const testKeyFor = useCallback((group) => {
+        const slot = slotOf(group);
+        if (slot.busy) return;
+        patchSlot(group, { busy: 'test' });
+        setKeyFeedback(group, null);
+        const payload = { group };
+        const typed = slot.input.trim();
+        if (typed) payload.key = typed;
         Promise.resolve(rpc('testKey', payload)).then((res) => {
           if (!(res && res.ok)) {
-            setFeedback({ kind: 'err', text: '连接失败：' + errMsg(res) });
+            setKeyFeedback(group, { kind: 'err', text: '连接失败：' + errMsg(res) });
             return;
           }
           const v = res.value || {};
           if (v.ok) {
-            setFeedback({
+            setKeyFeedback(group, {
               kind: 'ok',
               text: '连接正常 · ' + (Number.isFinite(v.latencyMs) ? v.latencyMs : '—')
-                + ' ms · 模型 ' + (v.model || (cfg && cfg.chatModel) || '未知'),
+                + ' ms · 模型 ' + (v.model || '未知'),
             });
           } else {
-            setFeedback({
+            // 后端原文照登：status 与 message 都是它自己的话，面板只加一句读法提示
+            setKeyFeedback(group, {
               kind: 'err',
               text: '连接失败：' + (v.status != null ? v.status + ' ' : '') + (v.message || '无返回信息')
-                + '\n401 表示 key 无效或已过期；连不上表示端点不可达。',
+                + '\n401 表示该组 key 无效或已过期；连不上表示该组端点不可达。',
             });
           }
         }, (e) => {
-          setFeedback({ kind: 'err', text: '连接失败：' + (e && e.message ? e.message : String(e)) });
-        }).then(() => { setKeyBusy(''); });
-      }, [keyBusy, keyInput, rpc, cfg, setFeedback]);
+          setKeyFeedback(group, { kind: 'err', text: '连接失败：' + (e && e.message ? e.message : String(e)) });
+        }).then(() => { patchSlot(group, { busy: '' }); });
+      }, [slotOf, patchSlot, rpc, setKeyFeedback]);
 
-      const clearKey = useCallback(() => {
-        if (keyBusy) return;
-        if (!confirmClear) {
-          setConfirmClear(true);
-          if (armTimer.current) clearTimeout(armTimer.current);
-          armTimer.current = setTimeout(() => { setConfirmClear(false); }, 5000);
+      /** 清除一组密钥，二段确认（5 秒内再点一次）。 */
+      const clearKeyFor = useCallback((group) => {
+        const slot = slotOf(group);
+        if (slot.busy) return;
+        if (!slot.confirmClear) {
+          patchSlot(group, { confirmClear: true });
+          if (armTimers.current[group]) clearTimeout(armTimers.current[group]);
+          armTimers.current[group] = setTimeout(() => {
+            armTimers.current[group] = null;
+            patchSlot(group, { confirmClear: false });
+          }, 5000);
           return;
         }
-        resetConfirm();
-        setKeyBusy('clear');
-        setFeedback(null);
-        Promise.resolve(rpc('clearKey', {})).then((res) => {
+        resetConfirm(group);
+        patchSlot(group, { busy: 'clear' });
+        setKeyFeedback(group, null);
+        Promise.resolve(rpc('clearKey', { group })).then((res) => {
           if (!(res && res.ok)) {
-            setFeedback({ kind: 'err', text: '清除失败：' + errMsg(res) });
+            setKeyFeedback(group, { kind: 'err', text: '清除失败：' + errMsg(res) });
             return null;
           }
           return pullStatus().then(() => {
-            setFeedback({ kind: 'ok', text: '密钥已清除，增强模块已停用。' }, true);
+            patchSlot(group, { input: '', replacing: false });
+            setKeyFeedback(group, { kind: 'ok', text: '这一组的密钥已清除。' }, true);
             return null;
           });
         }, (e) => {
-          setFeedback({ kind: 'err', text: '清除失败：' + (e && e.message ? e.message : String(e)) });
-        }).then(() => { setKeyBusy(''); });
-      }, [keyBusy, confirmClear, rpc, pullStatus, resetConfirm, setFeedback]);
+          setKeyFeedback(group, { kind: 'err', text: '清除失败：' + (e && e.message ? e.message : String(e)) });
+        }).then(() => { patchSlot(group, { busy: '' }); });
+      }, [slotOf, patchSlot, resetConfirm, rpc, pullStatus, setKeyFeedback]);
 
-      const focusKeyInput = useCallback(() => {
-        const el = keyRef.current;
+      /** 把焦点送到某一组的密钥输入框（「先填密钥」链接与替换态共用）。 */
+      const focusGroupKey = useCallback((group) => {
+        patchSlot(group, { replacing: true });
+        const el = keyRefs.current[group];
         if (!el) return;
         try { if (el.scrollIntoView) el.scrollIntoView({ block: 'center' }); } catch (e) { /* 老宿主忽略 */ }
         try { el.focus(); } catch (e2) { /* 忽略 */ }
-      }, []);
+      }, [patchSlot]);
 
       // ---- 模块开关（§5）——saveConfig → 重拉 status → 按回读渲染
       const [flagBusy, setFlagBusy] = useState({});
@@ -1020,9 +1196,20 @@ window.__ModuleLoader__.load({
       const hasKey = !!(cfg && cfg.hasKey);
       const envLocked = cfg && cfg.envLocked && typeof cfg.envLocked === 'object' ? cfg.envLocked : null;
       const cfgLoading = statusSt.phase === 'loading' && !cfg;
-      // 密钥到位但五项增强一盏都没亮：用户看不出因果，必须当场告诉他打开。
+
+      /** 三组的回读视图：一次算好，组子块与模块行共用同一份，避免各算各的。 */
+      const groupViews = {};
+      for (const g of CRED_GROUPS) groupViews[g.id] = groupView(cfg, g.id);
+      const missingKeyGroups = CRED_GROUPS.filter((g) => !groupViews[g.id].keyConfigured);
+      const anyKey = missingKeyGroups.length < CRED_GROUPS.length;
+      const groupTitle = (id) => {
+        for (const g of CRED_GROUPS) if (g.id === id) return g.title;
+        return id;
+      };
+
+      // 任意一组有 key、但五项增强一盏都没亮：用户看不出因果，必须当场告诉他打开。
       // bulkDone 是成功后 4 秒的宽限，让「已打开 N 项」有地方落地。
-      const showBulkCard = statusSt.phase === 'ready' && hasKey && !!cfg && !!cfg.flags
+      const showBulkCard = statusSt.phase === 'ready' && anyKey && !!cfg && !!cfg.flags
         && (GATED_FLAG_KEYS.every((f) => !cfg.flags[f]) || bulkDone !== null);
 
       const keyCardBody = statusSt.phase === 'error'
@@ -1031,97 +1218,182 @@ window.__ModuleLoader__.load({
         : cfgLoading
           ? h(Hint, null, '读取配置中…')
           : cfg
-            ? h('div', null, keyStatusBlock(), keyFormBlock(), keyFeedbackBlock())
+            ? h('div', null,
+              CRED_GROUPS.map((g) => credGroupBlock(g)),
+              h('div', { className: 'mj-globalblock' }, globalSettingsBlock()))
             : h(Hint, null, '读取配置中…');
 
-      function keyStatusBlock() {
-        const src = cfg.keySource;
-        const envSrc = src === 'env';
-        return h('div', { style: { marginBottom: 10 } },
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-            h('span', {
-              style: {
-                display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px',
-                borderRadius: 999, fontSize: 12, lineHeight: '1.5',
-                background: C.layer2, border: '1px solid ' + C.line2,
-                color: hasKey ? C.ok : C.warn,
-              },
-            }, hasKey ? '已配置' : '未配置'),
-            envSrc ? h('span', {
-              title: '环境变量里的 key 不跟着这台机器走',
-              style: { fontSize: 12, color: C.warn, lineHeight: '1.5' },
-            }, '· 环境变量来源') : null),
-          hasKey
-            ? h('div', {
-              style: { fontFamily: C.mono, fontSize: 13, lineHeight: '1.55', color: C.fg, marginTop: 6, wordBreak: 'break-all' },
-            }, maskText(cfg))
-            : h('div', { style: { fontSize: 13, lineHeight: '1.55', color: C.fg, marginTop: 6 } },
-              '填上你自己的 API key，下面五项增强才能打开。'),
-          hasKey
-            ? h(Hint, { style: { marginTop: 2 } },
-              envSrc ? '来自环境变量 MEMJUDGE_LLM_KEY（换机器要重新填）'
-                : src === 'secrets.json' ? '你自己填的，存于本机 secrets.json'
-                  : '来源未知，增强能力可能无法调用外部模型')
-            : h(Hint, { style: { marginTop: 2 } },
-              '向量、重排、查询扩展、LLM 选段、LLM 提取五项增强全部停用，检索退回关键词匹配。'));
+      /** 一组凭证子块：标题 + 端点行 + 密钥行 + 其余行（模型名 / 向量维度）。 */
+      function credGroupBlock(g) {
+        const view = groupViews[g.id];
+        const rows = SETTING_ROWS.filter((r) => r.group === g.id);
+        const urlRow = rows.length ? rows[0] : null;
+        const restRows = rows.slice(1);
+        return h('div', {
+          key: g.id,
+          className: 'mj-credgroup',
+          'data-group': g.id,
+        },
+          h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 2 } },
+            h('div', { style: { fontSize: 13, lineHeight: '1.4', fontWeight: 600, color: C.fg } }, g.title),
+            h(Hint, { style: { minWidth: 0 } }, g.desc)),
+          urlRow ? settingRow(urlRow) : null,
+          keyBlock(g, view),
+          restRows.map((row) => settingRow(row)));
       }
 
-      function keyFormBlock() {
-        const busy = !!keyBusy;
-        const canSave = keyInput.trim().length > 0 && !busy;
-        return h('div', { className: 'mj-keyrow' },
-          h('div', { className: 'mj-keyinput' },
+      /** 一行值型设置。继承来的端点不算锁：写进去就变成这一组自己的显式设置。 */
+      function settingRow(row) {
+        const base = settingText(row.key, cfg);
+        const val = settingsDraft && Object.prototype.hasOwnProperty.call(settingsDraft, row.key)
+          ? settingsDraft[row.key] : base;
+        const locked = !!(settingsLocked && settingsLocked[row.key] === true);
+        const gid = row.group || GROUP_OF_SETTING[row.key] || null;
+        const view = gid ? groupViews[gid] : null;
+        const envName = view ? settingEnvName(view, row.key, gid) : '';
+        const inherited = !!(view && view.baseUrlInherited && GROUP_KEYS[gid].baseUrl === row.key);
+        const hint = inherited
+          ? '当前继承自对话模型的端点；在这里填值即改为这一组自己的端点。' + (row.hint ? ' ' + row.hint : '')
+          : row.hint;
+        return h(TextField, {
+          key: row.key,
+          label: row.label,
+          ariaLabel: gid ? groupTitle(gid) + ' ' + row.label : row.label,
+          value: val,
+          onChange: (text) => editSetting(row.key, text),
+          placeholder: row.placeholder,
+          hint: hint,
+          mono: row.mono,
+          inputMode: row.inputMode,
+          locked: locked,
+          lockedReason: envName ? '该项由环境变量 ' + envName + ' 决定，改面板不生效' : undefined,
+          disabled: settingsBusy,
+        });
+      }
+
+      /**
+       * 一组的密钥行。四种形态必须视觉可分：
+       * 已配置（掩码 + 替换/清除） / 未配置（直接输入 + 保存） / 继承（提示可覆盖） / env 锁定（禁用）。
+       * 键名、环境变量名都从 cfg.credSpec 取，面板不另抄一份。
+       */
+      function keyBlock(g, view) {
+        const group = g.id;
+        const slot = slotOf(group);
+        const busy = !!slot.busy;
+        const locked = !!view.keyEnvLocked;
+        const spec = cfg && cfg.credSpec ? cfg.credSpec[group] : null;
+        const keyEnvName = spec && Array.isArray(spec.keyEnv) && spec.keyEnv.length ? spec.keyEnv[0] : '';
+        const showInput = locked || !view.keyConfigured || !!slot.replacing;
+        const canSave = !locked && slot.input.trim().length > 0 && !busy;
+        const confirm = !!slot.confirmClear;
+
+        let field;
+        if (showInput) {
+          field = h('div', { className: 'mj-keyinput', style: { flex: '1 1 auto', minWidth: 0 } },
             h('input', {
-              ref: keyRef,
+              ref: (el) => { keyRefs.current[group] = el; },
               className: 'mj-input',
-              type: keyShown ? 'text' : 'password',
-              value: keyInput,
-              disabled: busy,
-              placeholder: '粘贴 API key（sk-...）',
-              'aria-label': 'API key',
+              type: slot.shown ? 'text' : 'password',
+              value: slot.input,
+              disabled: busy || locked,
+              placeholder: locked
+                ? '由环境变量 ' + (keyEnvName || 'MEMJUDGE_*_KEY') + ' 提供，面板不可写'
+                : (view.keyInherited ? '填这一组自己的 key（不填就继续继承）' : '粘贴 API key（sk-...）'),
+              'aria-label': g.title + ' 密钥',
+              title: locked ? '密钥由环境变量 ' + (keyEnvName || 'MEMJUDGE_*_KEY') + ' 决定，面板写入不生效' : undefined,
               autoComplete: 'off',
               spellCheck: false,
-              onChange: (e) => setKeyInput(e.target.value),
-              onKeyDown: (e) => { if (e.key === 'Enter' && canSave) saveKey(); },
+              onChange: (e) => patchSlot(group, { input: e.target.value }),
+              onKeyDown: (e) => { if (e.key === 'Enter' && canSave) saveKeyFor(group); },
               style: {
-                width: '100%', minHeight: 32, padding: '0 34px 0 10px', boxSizing: 'border-box',
-                background: C.layer1, border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
+                width: '100%', minHeight: 28, padding: '0 34px 0 8px', boxSizing: 'border-box',
+                background: C.layer2, border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
                 color: C.fg, fontSize: 13, lineHeight: '1.5', fontFamily: C.mono, outline: 'none',
+                opacity: (busy || locked) ? 0.55 : 1,
+                cursor: locked ? 'not-allowed' : 'text',
               },
             }),
-            h('button', {
+            locked ? null : h('button', {
               type: 'button',
               className: 'mj-icon',
-              'aria-label': keyShown ? '隐藏密钥' : '显示密钥',
-              'aria-pressed': keyShown ? 'true' : 'false',
-              onClick: () => setKeyShown((v) => !v),
+              'aria-label': slot.shown ? '隐藏密钥' : '显示密钥',
+              'aria-pressed': slot.shown ? 'true' : 'false',
+              onClick: () => patchSlot(group, { shown: !slot.shown }),
               style: {
-                position: 'absolute', right: 2, top: 2, bottom: 2, width: 28, height: 'auto',
+                position: 'absolute', right: 2, top: 2, bottom: 2, width: 26, height: 'auto',
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                 border: 'none', borderRadius: C.radiusSm, background: 'transparent',
                 color: C.fg2, cursor: 'pointer', fontSize: 12, fontFamily: 'inherit',
               },
-            }, keyShown ? '隐' : '显')),
-          h('div', { className: 'mj-keyact' },
-            h(Btn, { primary: true, disabled: !canSave, onClick: saveKey },
-              keyBusy === 'save' ? '保存中…' : '保存密钥'),
-            h(Btn, { disabled: busy, onClick: testKey },
-              keyBusy === 'test' ? '测试中…' : '测试连接'),
-            hasKey ? h(Btn, {
-              danger: confirmClear,
-              disabled: busy,
-              onClick: clearKey,
-              title: confirmClear ? '5 秒内再点一次即清除' : '清除本机 secrets.json 里的密钥',
-            }, keyBusy === 'clear' ? '清除中…' : confirmClear ? '确认清除' : '清除') : null));
-      }
+            }, slot.shown ? '隐' : '显'));
+        } else {
+          field = h('div', {
+            className: 'mj-keyinput',
+            style: { flex: '1 1 auto', minWidth: 0, alignItems: 'center' },
+          },
+            h('span', {
+              className: 'mj-text',
+              'aria-label': g.title + ' 密钥掩码',
+              style: { fontFamily: C.mono, fontSize: 13, lineHeight: '1.55', color: C.fg, wordBreak: 'break-all' },
+            }, maskOf(view)));
+        }
 
-      function keyFeedbackBlock() {
-        if (!keyMsg) return h('div', { 'aria-live': 'polite', style: { minHeight: 18, marginTop: 6 } });
-        const tone = keyMsg.kind === 'ok' ? C.ok : keyMsg.kind === 'err' ? C.bad : C.fg2;
-        return h('div', {
-          'aria-live': 'polite',
-          style: { fontSize: 12, lineHeight: '1.5', color: tone, marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
-        }, keyMsg.text);
+        const acts = [];
+        if (locked) {
+          acts.push(h(Btn, { key: 't', disabled: busy, onClick: () => testKeyFor(group) },
+            busy === 'test' ? '测试中…' : '测试连接'));
+        } else if (showInput) {
+          acts.push(h(Btn, { key: 's', primary: true, disabled: !canSave, onClick: () => saveKeyFor(group) },
+            busy === 'save' ? '保存中…' : (view.keyConfigured ? '保存新密钥' : '保存密钥')));
+          acts.push(h(Btn, { key: 't', disabled: busy, onClick: () => testKeyFor(group) },
+            busy === 'test' ? '测试中…' : '测试连接'));
+          if (view.keyConfigured) {
+            acts.push(h(Btn, {
+              key: 'x',
+              disabled: busy,
+              onClick: () => patchSlot(group, { replacing: false, input: '' }),
+              title: '放弃修改，回到掩码显示',
+            }, '取消'));
+          }
+        } else {
+          acts.push(h(Btn, { key: 'r', disabled: busy, onClick: () => focusGroupKey(group) },
+            '替换'));
+          acts.push(h(Btn, { key: 't', disabled: busy, onClick: () => testKeyFor(group) },
+            busy === 'test' ? '测试中…' : '测试连接'));
+          acts.push(h(Btn, {
+            key: 'c',
+            danger: confirm,
+            disabled: busy,
+            onClick: () => clearKeyFor(group),
+            title: confirm ? '5 秒内再点一次即清除' : '清除这一组存在本机 secrets.json 里的密钥',
+          }, busy === 'clear' ? '清除中…' : confirm ? '确认清除' : '清除'));
+        }
+
+        const msg = slot.msg;
+        const msgTone = msg ? (msg.kind === 'ok' ? C.ok : msg.kind === 'err' ? C.bad : C.fg2) : C.fg2;
+        return h('div', { style: { padding: '5px 0' } },
+          h('div', {
+            className: 'mj-textrow',
+            style: { display: 'flex', alignItems: 'center', gap: 10 },
+          },
+            h('div', {
+              className: 'mj-confattr',
+              'aria-hidden': 'true',
+              style: { fontSize: 12, lineHeight: '1.5', color: C.fg2 },
+            }, '密钥'),
+            field,
+            h('div', { className: 'mj-keyact' }, acts)),
+          h(Hint, { className: 'mj-texthint', tone: view.keyConfigured ? undefined : C.warn },
+            '密钥' + ' · ' + keySourceLabel(view) + ' —— ' + keySourceHint(cfg, group, view)),
+          msg
+            ? h('div', {
+              'aria-live': 'polite',
+              style: {
+                fontSize: 12, lineHeight: '1.5', color: msgTone,
+                marginTop: 4, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+              },
+            }, msg.text)
+            : h('div', { 'aria-live': 'polite', style: { minHeight: 0 } }));
       }
 
       /**
@@ -1193,26 +1465,30 @@ window.__ModuleLoader__.load({
         }
         return h('div', null, MODULES.map((m) => {
           const locked = !!(envLocked && envLocked[m.key] === true);
+          const grp = m.group || 'chat';
+          // 缺密钥判断必须按该模块自己那一组：向量缺 embed、精排缺 rerank，
+          // 用全局 hasKey 会在一组配好、另一组没配时给出错误引导。
+          const missKey = !m.readonly && !groupViews[grp].keyConfigured;
           return h(FlagRow, {
             key: m.key,
-            m: m,
+            m: Object.assign({}, m, { groupName: groupTitle(grp) }),
             checked: !!cfg.flags[m.key],
-            needKey: !m.readonly && !hasKey,
+            needKey: missKey,
             locked: locked,
             busy: !!flagBusy[m.key],
             note: flagNote[m.key] || '',
             onToggle: () => toggleFlag(m.key, !cfg.flags[m.key]),
-            onNeedKey: focusKeyInput,
+            onNeedKey: () => focusGroupKey(grp),
           });
         }));
       }
 
       /**
-       * 接口与模型：七行值型设置。回读（configReport）是唯一真值来源，
-       * draft 只覆盖用户动过的键；保存成功后 draft 丢弃，输入框回到回读值。
-       * 这一组存在的理由：不装硅基流动也必须能用——换成任何 OpenAI 兼容端点即可。
+       * 卡尾：全局两项（存储上限 / 写入硬限）+ 统一保存条。
+       * 这两项不属于任何模型组——把存储口径塞进某个组里会让用户以为换供应商就会改容量。
+       * 回读（configReport）是唯一真值来源，draft 只覆盖用户动过的键，保存成功后丢弃。
        */
-      function settingsCardBody() {
+      function globalSettingsBlock() {
         if (statusSt.phase === 'error') {
           return h(ErrorBlock, {
             title: '配置读取失败：' + (statusSt.error || '未知原因'),
@@ -1220,29 +1496,15 @@ window.__ModuleLoader__.load({
           });
         }
         if (!cfg) return h(Hint, null, '读取配置中…');
-        const rows7 = SETTING_ROWS.map((row) => {
-          const base = settingText(row.key, cfg);
-          const val = settingsDraft && Object.prototype.hasOwnProperty.call(settingsDraft, row.key)
-            ? settingsDraft[row.key] : base;
-          const locked = !!(settingsLocked && settingsLocked[row.key] === true);
-          return h(TextField, {
-            key: row.key,
-            label: row.label,
-            value: val,
-            onChange: (text) => editSetting(row.key, text),
-            placeholder: row.placeholder,
-            hint: row.hint,
-            mono: row.mono,
-            inputMode: row.inputMode,
-            locked: locked,
-            disabled: settingsBusy,
-          });
-        });
+        const rows = SETTING_ROWS.filter((r) => !r.group);
         const tone = settingsMsg
           ? (settingsMsg.kind === 'err' ? C.bad : settingsMsg.kind === 'ok' ? C.ok : C.fg2)
           : C.fg2;
         return h('div', null,
-          rows7,
+          h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 2 } },
+            h('div', { style: { fontSize: 13, lineHeight: '1.4', fontWeight: 600, color: C.fg } }, '库体与写入'),
+            h(Hint, { style: { minWidth: 0 } }, '全局项，不属于上面任何一组模型。')),
+          rows.map((row) => settingRow(row)),
           h('div', {
             style: { display: 'flex', alignItems: 'center', gap: 10, marginTop: 10, flexWrap: 'wrap' },
           },
@@ -1251,7 +1513,7 @@ window.__ModuleLoader__.load({
             h(Btn, {
               disabled: settingsBusy,
               onClick: restoreSettingDefaults,
-              title: '只把七个输入框填回出厂值，不提交',
+              title: '只把九个输入框填回出厂值，不提交',
             }, '恢复默认'),
             h('div', {
               'aria-live': 'polite',
@@ -1264,16 +1526,14 @@ window.__ModuleLoader__.load({
               settingsMsg && settingsMsg.extra
                 ? h('span', { style: { minWidth: 0, wordBreak: 'break-word' } }, settingsMsg.extra)
                 : null)),
-          hasKey && cfg.hint ? h(Hint, { style: { marginTop: 8 } }, cfg.hint) : null);
+          cfg.hint ? h(Hint, { style: { marginTop: 8 } }, cfg.hint) : null);
       }
 
       const sectionB = h('div', { className: 'mj-sec' },
         h(SectionTitle, null, '增强能力与密钥'),
-        h(Card, { title: '密钥' }, keyCardBody),
+        h(Card, { title: '接口与模型' }, keyCardBody),
         showBulkCard ? h('div', { style: { height: 10 } }) : null,
         showBulkCard ? h(Card, null, bulkCardBody()) : null,
-        h('div', { style: { height: 10 } }),
-        h(Card, { title: '接口与模型' }, settingsCardBody()),
         h('div', { style: { height: 10 } }),
         h(Card, { title: '增强模块' }, moduleListBlock()));
 
