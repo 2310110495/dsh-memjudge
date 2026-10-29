@@ -20,7 +20,7 @@
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import { open as openStore } from './store.mjs';
+import { open as openStore, normalizeKind, MEMORY_KINDS } from './store.mjs';
 import { SearchIndex } from './search.mjs';
 import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict } from './judge.mjs';
@@ -49,6 +49,7 @@ import {
   createQuota,
   extractCandidates,
   formatSource,
+  isAutoSource,
   resolveAutoConfig,
 } from './auto-capture.mjs';
 import { installMemjudgeRpc } from './rpc.mjs';
@@ -67,6 +68,37 @@ export const SECTION_ORDER = 700;
 
 /** SPEC 能力 8 的硬上限。配置传更大也钳到这里。 */
 export const INJECT_HARD_LIMIT = 2000;
+
+/**
+ * 注入三分区配额（按 INJECT_HARD_LIMIT 的份额定，实际按 injectBudget 等比缩放）。
+ *
+ * 为什么分区：改之前所有条目一视同仁抢 8 席，一条刚写的待办就能把用户的身份信息、
+ * 说好的规矩挤出去——身份与约定被时间冲掉是这套记忆最痛的失败模式。
+ * person/promise 不吃 access_count / recency 淘汰，只受条数与字符上限；
+ * event 段保持原来的「按命中与时间流动」。
+ * 三段之和 = 硬上限；段内不足的余量按顺序借给后面的段（person 优先占满）。
+ */
+export const INJECT_SEGMENTS = Object.freeze([
+  { kind: 'person', label: '人：', cap: 800 },
+  { kind: 'promise', label: '约：', cap: 600 },
+  { kind: 'event', label: '事：', cap: 600 },
+]);
+
+/**
+ * 每段的席位上限（防爆护栏，不是配额）。
+ *
+ * 为什么不用 cfg.injectLimit 当段上限：那个值是「列出几条索引」的旧口径，默认 8。
+ * 三分之后真正决定能列几条的是**字符预算**——真实库 10 条人工记忆在 event 段要
+ * 全部保留，卡 8 席会凭空丢两条。所以席位只做防爆（40 行远超任何段能装下的行数），
+ * 装不下由 renderRecall 按整行丢弃。
+ */
+export const INJECT_SEG_MAX_ROWS = 40;
+
+/** event 段里自动采集条目的席位上界（人工优先，auto 只补位）。 */
+export const INJECT_AUTO_SLOTS = 2;
+
+/** 人工 event 条目少于此数时才让 auto 补位，保证注入主体仍是人工确认过的内容。 */
+export const INJECT_AUTO_MANUAL_FLOOR = 6;
 
 /** 5 个工具名。测试与文档共用这一份真源。 */
 export const TOOL_NAMES = Object.freeze([
@@ -334,39 +366,92 @@ export function apply(ctx, config) {
   };
 
   /**
-   * 固定注入块。只放索引（id + 首行 + 章号），不放全文。
-   * 关闭时返回空串——dsh-system-prompt 会过滤空 section，最终 0 字符。
+   * 固定注入块：三分分区索引（人 / 约 / 事）。只放 descriptor（id + 首行 + 来源），
+   * 正文一个字不进 prompt。关闭时返回空串——dsh-system-prompt 会过滤空 section。
    *
-   * 渲染走 layer.renderRecall（soul-md 同源）：只输出 descriptor 行
-   * `- "id" — 首行：来源`，正文一个字不进 prompt。预算按整行扣：装不下的行整条丢弃，
-   * 绝不截半行——半行 descriptor 对模型是噪声。layer 是被注入路径真正消费的模块，
-   * 不是可 import 的孤儿。
+   * 排序与淘汰规则按 kind 分开，这是本次改造的核心：
+   *   person / promise  importance 降序 + created_at 升序（老的身份事实是地基，
+   *                    同分时先保老的）；**不看 access_count、不看 recency**，
+   *                    只在条数与字符预算上受限——用户的身份与说好的规矩不该被
+   *                    一条刚写的待办挤出注入面。
+   *   event             lastAccessed / createdAt 降序（原逻辑），前面叠「人工优先，
+   *                    auto 最多补 2 席且需 accessCount>0」。
+   *
+   * 渲染仍走 layer.renderRecall（soul-md 同源）：预算按整行扣，装不下的行整条丢掉，
+   * 绝不截半行——半行 descriptor 对模型是噪声。
    */
   const renderInject = () => {
     if (!cfg.autoInject) return '';
     if (injectCache !== null) return injectCache;
 
-    const rows = store.dump()
-      .sort((a, b) => (b.lastAccessed - a.lastAccessed) || (b.createdAt - a.createdAt))
-      .slice(0, cfg.injectLimit);
+    const rows = store.dump();
     if (!rows.length) {
       injectCache = '';
       return injectCache;
     }
 
-    const total = store.stats().memories;
-    const head = `## memjudge 记忆索引（${rows.length}/${total} 条，按最近使用）`;
+    const bucket = { person: [], promise: [], event: [] };
+    for (const row of rows) bucket[normalizeKind(row.kind)].push(row);
+
+    const tie = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const byImportance = (a, b) => (b.importance - a.importance) || (a.createdAt - b.createdAt) || tie(a, b);
+    const byRecency = (a, b) => (b.lastAccessed - a.lastAccessed) || (b.createdAt - a.createdAt) || tie(a, b);
+    bucket.person.sort(byImportance);
+    bucket.promise.sort(byImportance);
+
+    // event：人工条目的席位优先，auto 只在人工不足时补位。
+    // auto 还要求 accessCount>0——一次都没被读过的自动条目进注入面只是噪声。
+    const manualEvent = bucket.event.filter((row) => !isAutoSource(row.source)).sort(byRecency);
+    const autoEvent = bucket.event
+      .filter((row) => isAutoSource(row.source) && row.accessCount > 0)
+      .sort(byRecency);
+    const autoSlots = manualEvent.length < INJECT_AUTO_MANUAL_FLOOR
+      ? Math.min(INJECT_AUTO_SLOTS, Math.max(0, cfg.injectLimit - manualEvent.length))
+      : 0;
+    bucket.event = [...manualEvent, ...autoEvent.slice(0, autoSlots)];
+
+    const total = rows.length;
+    const scale = cfg.injectBudget / INJECT_HARD_LIMIT;
     const tail = '\n用 memjudge_recall 取全文，memjudge_conflicts 查前后矛盾。';
-    const topics = rows.map((row) => {
-      const src = chapterOf(row);
-      return {
-        key: row.id,
-        title: oneLine(row.text, 90),
-        summary: src.chapter ? `ch${src.chapter}` : sourceLabel(row.source),
-      };
+    const heading = (counts) => `## memjudge 记忆索引（人 ${counts.person} / 约 ${counts.promise} / 事 ${counts.event} 条，库内 ${total} 条）`;
+
+    // 预算按 heading 的**上界**扣一次，选完再把真实 heading 写回去：上界取的是
+    // 每段候选条数（≥ 实际选中条数），数字位数只多不少，所以真实 heading 一定比它短，
+    // 总长恒 ≤ injectBudget，也不会因为条数位数变化而在两轮之间振荡。
+    const headMax = heading({
+      person: bucket.person.length,
+      promise: bucket.promise.length,
+      event: bucket.event.length,
     });
-    const body = renderRecall([{ heading: head, topics }], cfg.injectBudget - tail.length);
-    injectCache = body ? `${body}${tail}`.slice(0, cfg.injectBudget) : '';
+    const counts = { person: 0, promise: 0, event: 0 };
+    const parts = [];
+    let left = cfg.injectBudget - headMax.length - tail.length - (INJECT_SEGMENTS.length - 1);
+    let carry = 0; // 前面各段没花完的余量，按顺序借给后面的段
+    for (const seg of INJECT_SEGMENTS) {
+      if (left <= 0) break;
+      const cap = Math.min(left, Math.floor(seg.cap * scale) + carry);
+      const maxRows = INJECT_SEG_MAX_ROWS;
+      const topics = bucket[seg.kind].slice(0, maxRows).map((row) => {
+        const src = chapterOf(row);
+        return {
+          key: row.id,
+          title: oneLine(row.text, 90),
+          summary: src.chapter ? `ch${src.chapter}` : sourceLabel(row.source),
+        };
+      });
+      const body = cap > 0 && topics.length ? renderRecall([{ heading: seg.label, topics }], cap) : '';
+      if (!body) {
+        // 整段装不下任何一行：连小标题都不输出（空标题只是噪声），余量继续往后借。
+        carry += cap;
+        continue;
+      }
+      parts.push(body);
+      counts[seg.kind] = Math.max(0, body.split('\n').length - 1);
+      carry += Math.max(0, cap - body.length);
+      left -= body.length + 1;
+    }
+
+    injectCache = parts.length ? `${heading(counts)}\n${parts.join('\n')}${tail}` : '';
     return injectCache;
   };
 
@@ -639,12 +724,23 @@ export function apply(ctx, config) {
     description:
       '把一条事实写进 memjudge 长期记忆。原文一字不改地落库（写入后 dump 与输入字符级相等），'
       + '同时抽出实体-属性-值三元组供冲突检测与拒答判断使用。同一条文本重复写入是幂等的，'
-      + '不会产生重复行。需要覆盖旧结论时用 supersedes 指向旧 id，旧条目正文不会被改写。',
+      + '不会产生重复行。需要覆盖旧结论时用 supersedes 指向旧 id，旧条目正文不会被改写。'
+      + 'kind 决定这条记忆在注入里的待遇：person=关于用户本人的稳定事实（身份、习惯、偏好、关系），'
+      + 'promise=双方的约定与要求（他要求你怎么做、说好的规矩）——这两类不受使用频率与时间淘汰，'
+      + '会常驻注入面；event=一次性的经过与结果（默认），按命中与时间流动。'
+      + '拿不准就留空用默认 event，但「用户是谁」「说好了什么」必须显式标 person/promise。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         text: { type: 'string', description: '要记住的原文。建议一条一个事实，别整章倾倒。' },
+        kind: {
+          type: 'string',
+          enum: [...MEMORY_KINDS],
+          description: 'person=关于用户本人的稳定事实（身份/习惯/偏好/关系）；'
+            + 'promise=双方的约定与要求（他要求你怎么做、说好的规矩）；'
+            + 'event=一次性的经过与结果（默认）。非法值归 event。',
+        },
         importance: { type: 'number', description: '重要度 0..1，影响衰减地板（≥0.6 时给 0.6 地板）。默认 0。' },
         chapter: { type: 'integer', description: '来源章号，用于章级聚合检索。' },
         para: { type: 'integer', description: '来源段号，用于同章内排序。' },
@@ -670,13 +766,14 @@ export function apply(ctx, config) {
           factCount: { type: 'integer' },
           chars: { type: 'integer' },
           total: { type: 'integer' },
+          kind: { type: 'string' },
         },
-        required: ['id', 'inserted', 'factCount', 'chars', 'total'],
+        required: ['id', 'inserted', 'factCount', 'chars', 'total', 'kind'],
       },
       render: (_args, value) => textBlock(
         value.inserted
-          ? `已写入 ${value.id}（${value.chars} 字，抽出 ${value.factCount} 条三元组，库内共 ${value.total} 条）`
-          : `已存在 ${value.id}（幂等命中，未重复写入；库内共 ${value.total} 条）`,
+          ? `已写入 ${value.id}（${value.kind}，${value.chars} 字，抽出 ${value.factCount} 条三元组，库内共 ${value.total} 条）`
+          : `已存在 ${value.id}（${value.kind}，幂等命中，未重复写入；库内共 ${value.total} 条）`,
       ),
     },
     isConcurrencySafe: () => false,
@@ -689,6 +786,9 @@ export function apply(ctx, config) {
       const explicitSource = typeof args?.source === 'string' ? args.source.trim() : '';
       const result = store.put({
         text,
+        // 未显式给 kind 时传 undefined（而不是 'event'）：put 用「是否显式」区分
+        // 「新增一条 event」与「幂等命中时把已有 person 改回 event」。
+        kind: args?.kind == null || args.kind === '' ? undefined : normalizeKind(args.kind),
         importance: clampNum(args?.importance, 0, 1, 0),
         chapter: args?.chapter,
         para: args?.para,
@@ -704,6 +804,7 @@ export function apply(ctx, config) {
         factCount: result.factCount,
         chars: text.length,
         total: store.stats().memories,
+        kind: result.kind,
       };
     },
   }));
@@ -991,8 +1092,9 @@ export function apply(ctx, config) {
   track(ctx.tools.register({
     name: 'memjudge_stats',
     description:
-      'memjudge 的库体与索引体检：条目数、三元组数、正文与文件字节、是否在 200KB 预算内、'
-      + '倒排规模、当前注入开关与字符数。排查「为什么查不到」时先看这个。',
+      'memjudge 的库体与索引体检：条目数、三分条数（person/promise/event）、三元组数、'
+      + '正文与文件字节、是否在 200KB 预算内、倒排规模、当前注入开关与字符数。'
+      + '排查「为什么查不到」时先看这个。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1007,6 +1109,16 @@ export function apply(ctx, config) {
         properties: {
           memories: { type: 'integer' },
           facts: { type: 'integer' },
+          kinds: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              person: { type: 'integer' },
+              promise: { type: 'integer' },
+              event: { type: 'integer' },
+            },
+            required: ['person', 'promise', 'event'],
+          },
           textChars: { type: 'integer' },
           bytes: { type: 'integer' },
           limitBytes: { type: 'integer' },
@@ -1027,7 +1139,7 @@ export function apply(ctx, config) {
           wiki: { type: 'string', description: 'wiki 编译层投影状态：版本、块数、编译次数、Grounding 结论。' },
         },
         required: [
-          'memories', 'facts', 'textChars', 'bytes', 'limitBytes', 'withinLimit',
+          'memories', 'facts', 'kinds', 'textChars', 'bytes', 'limitBytes', 'withinLimit',
           'docs', 'terms', 'postings', 'chapters',
           'injectEnabled', 'injectChars', 'injectBudget', 'dbPath',
           'modules', 'keyConfigured', 'keySource', 'panelPath',
@@ -1035,6 +1147,7 @@ export function apply(ctx, config) {
       },
       render: (_args, value) => textBlock(
         `记忆 ${value.memories} 条 / 三元组 ${value.facts} 条 / 正文 ${value.textChars} 字\n`
+        + `三分 人 ${value.kinds.person} / 约 ${value.kinds.promise} / 事 ${value.kinds.event}\n`
         + `库体 ${(value.bytes / 1024).toFixed(1)}KB（上限 ${(value.limitBytes / 1024).toFixed(0)}KB，${value.withinLimit ? '在预算内' : '超预算'}）\n`
         + `倒排 ${value.terms} 词 / ${value.postings} 条 posting / ${value.chapters} 章\n`
         + `后台整理 ${value.tidy ?? '未运行'}\n`
@@ -1056,6 +1169,7 @@ export function apply(ctx, config) {
       const out = {
         memories: base.memories,
         facts: base.facts,
+        kinds: base.kinds,
         textChars: base.textChars,
         bytes: base.bytes,
         limitBytes: base.limitBytes,

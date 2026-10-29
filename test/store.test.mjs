@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { open, extractFacts, STORAGE_LIMIT_BYTES, entryUsage, checkBudget, BudgetExceededError, splitSegments, SPLIT_RE } from '../src/store.mjs';
+import { open, extractFacts, STORAGE_LIMIT_BYTES, STORE_SCHEMA_VERSION, entryUsage, checkBudget, BudgetExceededError, splitSegments, SPLIT_RE } from '../src/store.mjs';
 import { chapters } from '../../mem-eval/corpus/novel.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -471,7 +471,9 @@ check('v2 库（covered 为 \'0\'/\'1\' 字符串位图）重开升级到 v3，�
   assert.equal(s2.stats().wornSegments, n0, '重建后段位图应回到未覆盖');
   const afterFirst = s2.segmentDump();
   const version = s2.raw().prepare('SELECT v FROM meta WHERE k = ?').get('schema_version').v;
-  assert.equal(Number(version), 5, `schema_version 应升到 5（facts 改内存派生层，不落盘），实际 ${version}`);
+  // 断言对着常量而不是硬编码数字：版本号每升一版都要来改这里，等于把「迁移真的跑了」
+  // 这条用例变成版本号的复述。真正要钉的是「迁移后版本必须是当前版本」。
+  assert.equal(Number(version), STORE_SCHEMA_VERSION, `schema_version 应升到 ${STORE_SCHEMA_VERSION}，实际 ${version}`);
   s2.close();
 
   const s3 = open(v2Path);

@@ -14,7 +14,27 @@ import path from 'node:path';
 import { makeId } from './schema.mjs';
 import { extractL1 } from './extract.mjs';
 
-export const STORE_SCHEMA_VERSION = 5;
+export const STORE_SCHEMA_VERSION = 6;
+
+// ── 记忆三分（人 / 约 / 事） ───────────────────────────────────────────────
+// 为什么要分：memjudge 此前所有条目一视同仁按 importance 衰减，用户的身份信息与
+// 双方的约定会被时间冲掉。三分把「不该被时间冲掉的」与「该按命中率流动的」分开：
+//   person  关于用户本人的稳定事实（身份、习惯、偏好、关系）
+//   promise 双方的约定与要求（他要求你怎么做、说好的规矩）
+//   event   一次性的经过与结果（默认，按命中与时间流动）
+// 三个值落 TEXT 而不是整数：dump/面板/注入都要读它，可读性优先于那点字节。
+export const MEMORY_KINDS = Object.freeze(['person', 'promise', 'event']);
+export const DEFAULT_MEMORY_KIND = 'event';
+
+/**
+ * kind 归一化：非法值一律归 'event' 而不是抛错。
+ * 写入路径是模型给的（schema 枚举之外的脏值也会进来），保存失败比归默认更糟：
+ * 一条内容正确的记忆不该因为分类标签写错就丢掉。
+ */
+export function normalizeKind(value) {
+  const v = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return MEMORY_KINDS.includes(v) ? v : DEFAULT_MEMORY_KIND;
+}
 /**
  * 库体上限的**旧默认值**（SPEC 能力 7 的 200KB 验收阈值）。
  * 保留导出是给测试与外部脚本用的常量；运行期上限走 open() 的 opts.storageLimitBytes，
@@ -416,7 +436,9 @@ CREATE TABLE IF NOT EXISTS memories (
   access_count  INTEGER NOT NULL DEFAULT 0,
   importance    REAL NOT NULL DEFAULT 0,
   supersedes    TEXT,
-  source        TEXT
+  source        TEXT,
+  -- 三分（v6）：person/promise/event。老库由 open() 的 ALTER TABLE 补齐并回填 'event'。
+  kind          TEXT NOT NULL DEFAULT 'event'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_hash ON memories(text_hash);
 -- 向量：只在开启融合检索时写。**整库压成一行 BLOB**，不逐条建行。
@@ -514,6 +536,19 @@ export function open(dbPath = ':memory:', opts = {}) {
     }
     return info;
   }
+  // ── schema v5 → v6 迁移：memories 加 kind 列（人 / 约 / 事三分） ───────────
+  // CREATE TABLE IF NOT EXISTS 不会给已存在的同名表补列，老库必须显式 ALTER。
+  // 幂等：列已在就跳过 ALTER，重开库不会报「duplicate column name」。
+  // NOT NULL DEFAULT 'event' 让 SQLite 在 ALTER 时把老行就地填成 'event'：
+  // 不需要用户重建库，也不逐行 UPDATE（那条 UPDATE 只碰脏行，干净库上是空操作）。
+  const memCols = db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name);
+  if (!memCols.includes('kind')) {
+    db.exec(`ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT '${DEFAULT_MEMORY_KIND}'`);
+  }
+  // 早期手改库或外部脚本可能把 kind 写成空/脏值；按「归 event 而不报错」的写入语义兜底。
+  db.exec(`UPDATE memories SET kind = '${DEFAULT_MEMORY_KIND}'
+    WHERE kind IS NULL OR kind NOT IN (${MEMORY_KINDS.map((k) => `'${k}'`).join(', ')})`);
+
   // ── 表结构自检：CREATE TABLE IF NOT EXISTS 不会纠偏已存在的同名表 ──────────
   // segments 缺 bits（v2 的 '0'/'1' 字符串位图，或更早的「一段一行 (memory_id, seq)」
   // 形态）或缺 ord 整数键时重建；段元数据完全可以从 memory.text 重切
@@ -580,12 +615,13 @@ export function open(dbPath = ':memory:', opts = {}) {
     : STORAGE_LIMIT_BYTES;
 
   const stmt = {
-    byHash: db.prepare('SELECT id, text FROM memories WHERE text_hash = ?'),
+    byHash: db.prepare('SELECT id, text, kind FROM memories WHERE text_hash = ?'),
     byId: db.prepare('SELECT * FROM memories WHERE id = ?'),
     insMem: db.prepare(`INSERT INTO memories
-      (id, text, text_hash, created_at, last_accessed, access_count, importance, supersedes, source)
-      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`),
+      (id, text, text_hash, created_at, last_accessed, access_count, importance, supersedes, source, kind)
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`),
     touch: db.prepare('UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?'),
+    setKind: db.prepare('UPDATE memories SET kind = ? WHERE id = ?'),
     count: db.prepare('SELECT COUNT(*) AS n FROM memories'),
     countFacts: null, // 改为读内存 memFacts.total（见 stats）
     rowidOf: db.prepare('SELECT rowid AS ord FROM memories WHERE id = ?'),
@@ -715,7 +751,9 @@ export function open(dbPath = ':memory:', opts = {}) {
    * 写入一条记忆。同 text 重复写入不产生新行，直接返回已有 id。
    *
    * @param {{text:string, id?:string, chapter?:number, para?:number, createdAt?:number,
-   *          importance?:number, supersedes?:string|string[]|null, source?:string}} input
+   *          importance?:number, supersedes?:string|string[]|null, source?:string,
+   *          kind?:'person'|'promise'|'event'}} input
+   *   kind 非法或缺省一律归 'event'：分类标签写错不该让一条内容正确的记忆写不进来。
    * @returns {{id:string, inserted:boolean, factCount:number}}
    */
   function put(input = {}) {
@@ -725,11 +763,17 @@ export function open(dbPath = ':memory:', opts = {}) {
       throw new TypeError('put: text 必须是非空字符串');
     }
     const hash = hashText(text);
+    const kindGiven = input.kind != null && input.kind !== '';
+    const kind = normalizeKind(input.kind);
     const hit = stmt.byHash.get(hash);
     if (hit) {
       // 哈希相同但正文不同 → 撞了，宁可炸也不写坏数据
       if (hit.text !== text) throw new Error(`put: text_hash 冲突（${hash}）`);
-      return { id: hit.id, inserted: false, factCount: factsOf(hit.id).length };
+      // 幂等命中不改正文，但允许纠正分类：同一条文本先按 event 落了库、后来用户明确
+      // 说它是 person 时，归属必须能改回来，否则三分永远追不上真实语义。
+      // 这是「不产生新行」的幂等，不是「永不更新任何列」。
+      if (kindGiven && kind !== hit.kind) stmt.setKind.run(kind, hit.id);
+      return { id: hit.id, inserted: false, factCount: factsOf(hit.id).length, kind: kindGiven ? kind : normalizeKind(hit.kind) };
     }
 
     // ── memento 预算硬拒绝：幂等命中之后再查预算，超限抛 BUDGET_EXCEEDED ──
@@ -750,14 +794,14 @@ export function open(dbPath = ':memory:', opts = {}) {
 
     db.exec('BEGIN');
     try {
-      const ord = Number(stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source).lastInsertRowid);
+      const ord = Number(stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source, kind).lastInsertRowid);
       // retcon 不可变原文层：机械切段落 segments，与原文同事务。段文本不复制
       // 整条的存储开销——落盘的只有段数与覆盖位图（BLOB，8 段/字节）。
       const segs = splitSegments(text);
       stmt.insSeg.run(ord, packCovered(segs.length));
       const factCount = buildFactsFor(ord, text);
       db.exec('COMMIT');
-      return { id, inserted: true, factCount, segmentCount: segs.length };
+      return { id, inserted: true, factCount, segmentCount: segs.length, kind };
     } catch (err) {
       db.exec('ROLLBACK');
       throw err;
@@ -784,9 +828,9 @@ export function open(dbPath = ':memory:', opts = {}) {
     const limit = Number.isFinite(opts2.limit) ? opts2.limit : -1;
     const offset = Number.isFinite(opts2.offset) ? opts2.offset : 0;
     const dir = opts2.order === 'desc' ? 'DESC' : 'ASC';
-    const cols = opts2.includeText ? '*' : 'id, text_hash, created_at, last_accessed, access_count, importance, supersedes, source';
+    const cols = opts2.includeText ? '*' : 'id, text_hash, created_at, last_accessed, access_count, importance, supersedes, source, kind';
     return db.prepare(`SELECT ${cols} FROM memories ORDER BY created_at ${dir}, id ${dir} LIMIT ? OFFSET ?`).all(limit, offset)
-      .map((r) => ({ ...r, supersedes: r.supersedes ? JSON.parse(r.supersedes) : null }));
+      .map((r) => ({ ...r, kind: normalizeKind(r.kind), supersedes: r.supersedes ? JSON.parse(r.supersedes) : null }));
   }
 
   /** 命中即刷新：last_accessed = now，access_count + 1 */
@@ -819,6 +863,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       supersedes: r.supersedes ? JSON.parse(r.supersedes) : null,
       supersededBy: supersededBy.get(r.id) ?? null,
       source: r.source,
+      kind: normalizeKind(r.kind),
       facts: factsOf(r.id),
     }));
   }
@@ -839,12 +884,22 @@ export function open(dbPath = ':memory:', opts = {}) {
     return total;
   }
 
+  /** 三种 kind 各自的条数。脏值并入 event（与写入归一化同一口径）。 */
+  function kindCounts() {
+    const out = Object.fromEntries(MEMORY_KINDS.map((k) => [k, 0]));
+    for (const row of db.prepare('SELECT kind, COUNT(*) AS n FROM memories GROUP BY kind').all()) {
+      out[normalizeKind(row.kind)] += Number(row.n) || 0;
+    }
+    return out;
+  }
+
   function stats() {
     assertOpen();
     const s = stmt.sizes.get();
     const w = wear();
     return {
       memories: stmt.count.get().n,
+      kinds: kindCounts(),
       facts: memFacts.total,
       textChars: s.chars,
       textBytes: s.bytes,
@@ -987,4 +1042,17 @@ export function open(dbPath = ':memory:', opts = {}) {
   };
 }
 
-export default { open, extractFacts, STORAGE_LIMIT_BYTES, STORE_SCHEMA_VERSION, entryUsage, checkBudget, BudgetExceededError, SPLIT_RE, splitSegments };
+export default {
+  open,
+  extractFacts,
+  STORAGE_LIMIT_BYTES,
+  STORE_SCHEMA_VERSION,
+  MEMORY_KINDS,
+  DEFAULT_MEMORY_KIND,
+  normalizeKind,
+  entryUsage,
+  checkBudget,
+  BudgetExceededError,
+  SPLIT_RE,
+  splitSegments,
+};
