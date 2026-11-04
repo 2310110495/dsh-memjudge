@@ -166,7 +166,7 @@ await check('默认库路径落在 DSH_HOME 下，不写用户主 profile', () =
 await check('apply 不抛错，5 个工具全部注册且名字全为 memjudge_ 前缀', () => {
   const ctx = hostCtx();
   apply(ctx, { dbPath: path.join(TMP, 'a.db'), now: () => T0 });
-  assert.equal(ctx.tools.map.size, 5);
+  assert.equal(ctx.tools.map.size, TOOL_NAMES.length);
   assert.deepEqual([...ctx.tools.map.keys()].sort(), [...TOOL_NAMES].sort());
   for (const name of ctx.tools.map.keys()) {
     assert.ok(name.startsWith('memjudge_'), `${name} 缺 memjudge_ 前缀`);
@@ -188,7 +188,7 @@ await check('与 memory_read/memory_search/memory_save/memory_list/memory 同装
     });
   }
   apply(ctx, { dbPath: path.join(TMP, 'b.db'), now: () => T0 });
-  assert.equal(ctx.tools.map.size, 10, '5 个占用名 + 5 个 memjudge 工具应共存');
+  assert.equal(ctx.tools.map.size, 5 + TOOL_NAMES.length, '占用名与 memjudge 工具应共存');
   for (const name of TOOL_NAMES) assert.ok(ctx.tools.map.has(name), `${name} 未注册`);
   ctx.dispose();
 });
@@ -357,7 +357,7 @@ await check('stats：20 章整章写入 ≤200KB 且在预算内（SPEC 能力 7
 await check('dispose 干净：工具与 section 全注销，重复 dispose 幂等', () => {
   const ctx = hostCtx();
   const handle = apply(ctx, { dbPath: path.join(TMP, 'k.db'), now: () => T0 });
-  assert.equal(ctx.tools.map.size, 5);
+  assert.equal(ctx.tools.map.size, TOOL_NAMES.length);
   ctx.dispose();
   assert.equal(ctx.tools.map.size, 0, '工具未注销');
   assert.equal(ctx.systemPrompt.map.size, 0, 'section 未注销');
@@ -374,7 +374,7 @@ await check('dispose 后重装成功，且能读回上一次写入的数据', as
 
   const second = hostCtx();
   apply(second, { dbPath, now: () => T0 + DAY });
-  assert.equal(second.tools.map.size, 5, '重装后工具数不对');
+  assert.equal(second.tools.map.size, TOOL_NAMES.length, '重装后工具数不对');
   const out = await tool(second, 'memjudge_recall').execute({ query: '主机功率' });
   assert.equal(out.denied, false, '重装后读不到旧数据');
   assert.ok(out.hits.some((h) => h.text.includes('12000')), '命中内容不含 12000');
@@ -391,7 +391,7 @@ await check('全新空库路径：目录不存在 → open() 建表 + 五工具�
 
   const ctx = hostCtx();
   apply(ctx, { dbPath, autoInject: true, now: () => T0 });
-  assert.equal(ctx.tools.map.size, 5);
+  assert.equal(ctx.tools.map.size, TOOL_NAMES.length);
 
   const ch5 = chapters.find((c) => c.n === 5);
   const firstSeg = ch5.text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean)[0];
@@ -470,7 +470,7 @@ for (const root of [process.env.DSH_HOST_MODULES, 'D:/tmp/dsh-host/dsh/node_modu
       },
     });
     apply(ctx, { dbPath: path.join(TMP, 'cordis.db'), now: () => T0 });
-    assert.equal(tools.size, 5, '真 cordis 下工具数不对');
+    assert.equal(tools.size, TOOL_NAMES.length, '真 cordis 下工具数不对');
     assert.equal(sections.size, 1, '真 cordis 下 section 数不对');
     ctx.dispose?.();
     cordisNote = `cordis: ok (${root})`;

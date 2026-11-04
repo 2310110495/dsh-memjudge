@@ -13,7 +13,14 @@
         autoInject: false
         # 单次注入字符上限，1..2000
         injectBudget: 2000
-        # 衰减半衰期（天），挂 lastAccessed
+        # 实验性逐日注入排序；默认 legacy 保持原行为。daily 每次读取一致快照。
+        experimentalInjectMode: legacy
+        # 仅 daily 事件排序使用，完整 24 小时计一天；取值分别为 0.5..3650 和 0..1。
+        experimentalInjectHalfLifeDays: 30
+        experimentalInjectFloor: 0.1
+        # dual 保持历史双档；改为 uniform 时启用下方统一半衰期，重载插件生效。
+        decayMode: dual
+        # uniform 模式半衰期（天），挂 lastAccessed
         halfLifeDays: 30
         # 检索命中即刷新访问时间
         touchOnRecall: true

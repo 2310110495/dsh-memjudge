@@ -141,9 +141,9 @@ check('searchGraphNodes limit 生效且为空查询返回空', () => {
 
 section('mneme 后台整理：sleepPhase 四阶段');
 
-check('四阶段结果槽位齐全（conflicts/archived/patterns/relations/errors）', () => {
+check('结果槽位齐全（conflicts/archived/tierWrites/patterns/relations/errors）', () => {
   const r = sleepPhase([{ id: 'a', text: '白鲸号吃水九米', createdAt: Date.now() }]);
-  assert.deepEqual(Object.keys(r).sort(), ['archived', 'conflicts', 'errors', 'patterns', 'relations']);
+  assert.deepEqual(Object.keys(r).sort(), ['archived', 'conflicts', 'errors', 'patterns', 'relations', 'tierWrites']);
   assert.deepEqual(r.errors, []);
 });
 

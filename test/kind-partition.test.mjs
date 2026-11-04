@@ -114,16 +114,18 @@ CREATE TABLE vector_blob (id TEXT PRIMARY KEY, dim INTEGER NOT NULL, slots INTEG
   db.close();
 }
 
-test('v5 老库升级：ALTER 补 kind 列，老记录回填 event，版本升到 6', () => {
+test('v5 老库升级：ALTER 补 kind/tier 列，老记录回填 event/t3，版本升到 7', () => {
   const file = path.join(TMP, 'legacy.db');
   buildLegacyDb(file);
   const s = open(file, { now: () => T0 + 10 * DAY });
   const cols = s.raw().prepare('PRAGMA table_info(memories)').all().map((c) => c.name);
   assert.ok(cols.includes('kind'), 'kind 列缺失');
-  const rows = s.raw().prepare('SELECT kind FROM memories').all();
+  assert.ok(cols.includes('tier'), 'tier 列缺失');
+  const rows = s.raw().prepare('SELECT kind, tier FROM memories').all();
   assert.deepEqual(rows.map((r) => r.kind), ['event', 'event'], "老记录必须全部回填 'event'");
-  assert.equal(s.raw().prepare("SELECT v FROM meta WHERE k = 'schema_version'").get().v, '6');
-  assert.equal(STORE_SCHEMA_VERSION, 6);
+  assert.deepEqual(rows.map((r) => r.tier), [3, 3], "v5 无 kind 的老记录按 event 落 tier=3");
+  assert.equal(s.raw().prepare("SELECT v FROM meta WHERE k = 'schema_version'").get().v, '7');
+  assert.equal(STORE_SCHEMA_VERSION, 7);
   assert.deepEqual(s.stats().kinds, { person: 0, promise: 0, event: 2 });
   s.close();
 });

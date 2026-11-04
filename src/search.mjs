@@ -478,7 +478,11 @@ function fillFromScored(scored, o) {
   // 并且只在整取结果为空时才触发，不影响正常预算下的装填。
   if (!out.length && scored.length && o.maxChars > 0) {
     const top = scored[0];
-    const cut = top.doc.text.slice(0, o.maxChars);
+    let end = o.maxChars;
+    const before = top.doc.text.charCodeAt(end - 1);
+    const after = top.doc.text.charCodeAt(end);
+    if (before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) end--;
+    const cut = top.doc.text.slice(0, end);
     out.push({ ...top, doc: { ...top.doc, text: cut }, truncated: true });
     chars = cut.length;
   }

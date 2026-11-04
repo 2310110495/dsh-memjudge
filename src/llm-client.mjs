@@ -14,7 +14,7 @@
 //   3. 端点与模型在**每次调用时**求值，不在模块加载时固化：面板改完 config.json
 //      调 reloadConfig() 后立即生效，不需要重启进程。
 
-import { chatBaseUrl, chatKey, chatModel } from './config.mjs';
+import { chatBaseUrl, chatKey, chatModel, groupReport } from './config.mjs';
 
 /** 默认超时：与三个模块此前的 TIMEOUT_MS 一致（长 prompt 批量提取实测需要这么久）。 */
 export const CHAT_TIMEOUT_MS = 150_000;
@@ -78,7 +78,8 @@ export async function chat(payload, opts = {}) {
   }
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(chatEndpoint(), {
+    const endpoint = chatEndpoint();
+    const init = {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -86,7 +87,14 @@ export async function chat(payload, opts = {}) {
       },
       body: JSON.stringify(payload),
       signal: ctrl.signal,
-    });
+    };
+    // Check after serialization, with no async gap before starting the request.
+    if (!groupReport('chat').enabled) {
+      const err = new Error('chat disabled');
+      err.code = 'DISABLED';
+      throw err;
+    }
+    const res = await fetchImpl(endpoint, init);
     if (!res || !res.ok) {
       // 读 error body 只作诊断；注入的假响应可能没有 text()，失败就当空串
       let body = '';

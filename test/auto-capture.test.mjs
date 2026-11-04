@@ -258,21 +258,21 @@ test('G6：会话表超过上限按最旧淘汰，reset 可清单个或全部', 
 test('source 标记：formatSource ↔ parseSource 往返逐字一致', () => {
   const sessionId = '62856429-ec40-46bd-9cdd-3440650bb343';
   const source = formatSource(sessionId, 7);
-  assert.equal(source, 'auto:chat#62856429-t7', '会话 id 只留前 8 位字母数字');
-  assert.deepEqual(parseSource(source), { auto: true, sessTok: '62856429', turn: 7 });
+  assert.equal(source, `auto:chat:v2#${Buffer.from(sessionId).toString('base64url')}:t7`);
+  assert.deepEqual(parseSource(source), { auto: true, version: 2, sessionId, turn: 7, source });
   assert.equal(formatSource(sessionId, 7), source, '同一输入必须稳定');
 
   for (const [sid, turn] of [
     ['s1a2b3c', 0],
     ['aaaaaaaa-bbbb', 123],
     ['含中文的会话-9f8e7d6c', 42],
-    ['', 3],
+    [' \ufeff😀e\u0301 ', 3],
   ]) {
     const s = formatSource(sid, turn);
     const parsed = parseSource(s);
     assert.ok(parsed, `${s} 必须可解析`);
     assert.equal(parsed.turn, Math.max(0, Math.trunc(Number(turn)) || 0));
-    assert.equal(parsed.sessTok, sessionToken(sid));
+    assert.equal(parsed.sessionId, sid);
     assert.equal(isAutoSource(s), true);
     assert.equal(formatSource(sid, turn), s, '往返必须稳定');
   }
@@ -384,7 +384,8 @@ test('畸形输入一律不抛错（fail-open）', () => {
     assert.doesNotThrow(() => importanceFor(input));
     assert.doesNotThrow(() => captureVerdict(input));
     assert.doesNotThrow(() => extractCandidates(input));
-    assert.doesNotThrow(() => formatSource(input, input));
+    if (typeof input !== 'string' || !input.trim() || !input.isWellFormed()) assert.throws(() => formatSource(input, 0), TypeError);
+    else assert.equal(parseSource(formatSource(input, 0)).sessionId, input);
     assert.doesNotThrow(() => parseSource(input));
     assert.doesNotThrow(() => isAutoSource(input));
     assert.doesNotThrow(() => resolveAutoConfig(input));

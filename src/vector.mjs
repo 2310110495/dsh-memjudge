@@ -8,15 +8,12 @@
 //   3. 任何一种失败（无 key / 超时 / 429 / 5xx / 结构不对）都 return null，
 //      绝不让异常冒到召回路径上——降级必须是静默的。
 //
-// 缓存：按 sha256(text) 前 16 位索引，落 <cacheDir>/vec-cache-<model>-<dims>-<hash>.json，
-// 值存 int8 base64。同一段文本永不重复调用；文本一变 hash 就变，缓存自然失效。
-// **文件名带模型指纹**：键里只有文本哈希时，换 embedModel 或改 dims 会原样复用旧向量
-// ——维度不同直接错，维度碰巧相同则静默算错相似度。指纹进文件名后，换模型只是「新起
-// 一个文件」，旧文件留着可回滚，两者互不污染。
+// schema2 缓存按有效端点/模型/实际维度/预处理版本隔离，旧文件原样保留且不复用。
+// 文件只存身份摘要和完整文本哈希；凭据 URL 仅使用内存，状态不暴露 URL 或 key。
 
 import { embedKey, embedModel, embedDims, embedBaseUrl } from './config.mjs';
-import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 /** 允许的维度（Qwen3 系列支持集合），按库体预算选。 */
 export const DIMS_CHOICES = [64, 128, 256, 512, 1024];
@@ -28,7 +25,25 @@ const TIMEOUT_MS = 20_000;
 const endpointUrl = () => `${embedBaseUrl().replace(/\/+$/, '')}/embeddings`;
 const modelName = () => embedModel();
 
-const hashText = (t) => createHash('sha256').update(String(t)).digest('hex').slice(0, 16);
+const hashText = (t) => createHash('sha256').update(String(t)).digest('hex');
+const CACHE_SCHEMA = 2;
+const PREPROCESSING_VERSION = 'string-v1';
+const MAX_CACHE_IDENTITIES = 8;
+const MAX_CACHE_ENTRIES = 4096;
+
+function snapshot(dims) {
+  const endpoint = endpointUrl();
+  const model = modelName();
+  const key = apiKey();
+  let persistenceDisabled = null;
+  try {
+    const url = new URL(endpoint);
+    // Query/fragment may carry opaque credentials; conservatively keep these URLs in memory.
+    if (url.username || url.password || url.search || url.hash) persistenceDisabled = 'credential-url';
+  } catch { persistenceDisabled = 'invalid-url'; }
+  const identity = hashText(JSON.stringify([CACHE_SCHEMA, endpoint, model, dims, PREPROCESSING_VERSION]));
+  return Object.freeze({ endpoint, model, dims, key, identity, persistenceDisabled });
+}
 
 /** float → int8（[-127,127]）。余弦用 int8 点积算，缩放系数在分子分母里约掉。 */
 export function quantize(vec) {
@@ -58,104 +73,124 @@ export function cosineInt8(a, b) {
 // ── 缓存 ───────────────────────────────────────────────────────────────────
 
 class VecCache {
-  constructor(file) {
-    this.file = file || null;
+  constructor(file, config) {
+    this.file = file;
+    this.identity = config.identity;
+    this.dims = config.dims;
+    this.persistenceDisabled = config.persistenceDisabled;
     this.map = new Map();
     this.dirty = false;
+    this.inFlight = 0;
     if (!file) return;
     try {
       const raw = JSON.parse(readFileSync(file, 'utf8'));
-      for (const [k, v] of Object.entries(raw)) this.map.set(k, Buffer.from(v, 'base64'));
-    } catch {
-      // 没有缓存 / 缓存坏了：当作空，不报错
+      if (raw?.schema !== CACHE_SCHEMA || raw.identity !== this.identity ||
+          !raw.entries || typeof raw.entries !== 'object' || Array.isArray(raw.entries)) throw new Error('cache-header');
+      for (const [k, v] of Object.entries(raw.entries)) {
+        if (!/^[a-f0-9]{64}$/.test(k) || typeof v !== 'string') throw new Error('cache-entry');
+        const buf = Buffer.from(v, 'base64');
+        if (buf.length !== this.dims || buf.toString('base64') !== v) throw new Error('cache-vector');
+        this.map.set(k, buf);
+        if (this.map.size > MAX_CACHE_ENTRIES) this.map.delete(this.map.keys().next().value);
+      }
+    } catch (error) {
+      this.map.clear();
+      if (error.code !== 'ENOENT') _stats.cacheLoadFailures += 1;
     }
   }
 
   get(text) {
-    return this.map.get(hashText(text)) ?? null;
+    const key = hashText(text);
+    const hit = this.map.get(key);
+    if (hit) { this.map.delete(key); this.map.set(key, hit); }
+    return hit ?? null;
   }
 
   set(text, buf) {
-    this.map.set(hashText(text), Buffer.from(buf));
+    const key = hashText(text);
+    this.map.delete(key);
+    this.map.set(key, Buffer.from(buf));
+    if (this.map.size > MAX_CACHE_ENTRIES) this.map.delete(this.map.keys().next().value);
     this.dirty = true;
   }
 
   save() {
     if (!this.file || !this.dirty) return false;
+    const temp = `${this.file}.${randomUUID()}.tmp`;
+    let created = false;
     try {
       mkdirSync(path.dirname(this.file), { recursive: true });
-      const obj = Object.create(null);
-      for (const [k, v] of this.map) obj[k] = Buffer.from(v).toString('base64');
-      writeFileSync(this.file, JSON.stringify(obj));
+      const entries = Object.create(null);
+      for (const [k, v] of this.map) entries[k] = v.toString('base64');
+      writeFileSync(temp, JSON.stringify({ schema: CACHE_SCHEMA, identity: this.identity, entries }), { flag: 'wx', mode: 0o600 });
+      created = true;
+      renameSync(temp, this.file);
       this.dirty = false;
       return true;
     } catch {
+      _stats.cacheSaveFailures += 1;
       return false;
+    } finally {
+      // A write can fail after creating the file; the random name belongs only to this save.
+      if (created || this.dirty) { try { unlinkSync(temp); } catch { /* best effort */ } }
     }
   }
 
-  get size() {
-    return this.map.size;
+  get size() { return this.map.size; }
+}
+
+let _cache = null;
+let _cacheDir = null;
+const _caches = new Map();
+const emptyStats = () => ({ calls: 0, batches: 0, tokens: 0, hits: 0, failures: 0, ms: 0,
+  cacheLoadFailures: 0, cacheSaveFailures: 0 });
+let _stats = emptyStats();
+
+export function vecStats() {
+  return { ..._stats, cacheSize: _cache?.size ?? 0, cacheFile: _cache?.file ?? null,
+    cacheIdentities: _caches.size,
+    cacheActiveIdentities: [..._caches.values()].filter(store => store.inFlight > 0).length,
+    cacheInFlight: [..._caches.values()].reduce((total, store) => total + store.inFlight, 0),
+    persistenceDisabled: _cache?.persistenceDisabled ?? null };
+}
+
+export function resetVecStats() { _stats = emptyStats(); }
+
+/** Explicit test reset; embed's directory option selects a namespace without resetting it. */
+export function _setCacheDir(dir, dims) {
+  for (const [namespace, store] of _caches) {
+    store.save();
+    // A reset must not detach an object still owned by an embed call.
+    if (!store.inFlight) _caches.delete(namespace);
+  }
+  _cacheDir = dir ? path.resolve(String(dir)) : null;
+  const requested = dims ?? embedDims();
+  return cache(snapshot(DIMS_CHOICES.includes(requested) ? requested : DEFAULT_DIMS));
+}
+
+// Retain at most eight stores unless live requests pin more identities. Every
+// release immediately converges to max(8, active identities); no idle overflow.
+function trimCaches() {
+  for (const [namespace, store] of _caches) {
+    if (_caches.size <= MAX_CACHE_IDENTITIES) break;
+    if (store.inFlight) continue;
+    store.save();
+    _caches.delete(namespace);
   }
 }
 
-/** 进程内单例：同一进程多次 embed 共享缓存。 */
-let _cache = null;
-/** 最近一次显式设置的缓存目录；null = 不落盘（纯内存缓存）。 */
-let _cacheDir = null;
-let _stats = { calls: 0, batches: 0, tokens: 0, hits: 0, failures: 0, ms: 0 };
-
-/**
- * 模型名 → 文件名片段。为什么不是纯哈希：`ls` 一眼能看出这堆缓存属于哪个模型，
- * 排查「换了模型还在用旧向量」时不用先算 sha256。为什么还留哈希：slug 化会撞
- * （`a/b` 与 `a\b` 都变 `a-b`），且超长模型名要截断，哈希兜住这两种情况。
- */
-function modelSlug() {
-  const s = embedModel()
-    .replace(/[^a-zA-Z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40);
-  return s || 'model';
-}
-
-/** 缓存文件名：模型 slug + 实际生效维度 + 指纹前 8 位。 */
-function cacheFileName(dims) {
-  const fingerprint = createHash('sha256').update(`${embedModel()}|${dims}`).digest('hex').slice(0, 8);
-  return `vec-cache-${modelSlug()}-${dims}-${fingerprint}.json`;
-}
-
-function cachePathFor(dims) {
-  return _cacheDir ? path.join(_cacheDir, cacheFileName(dims)) : null;
-}
-
-export function vecStats() {
-  return { ..._stats, cacheSize: _cache?.size ?? 0, cacheFile: _cache?.file ?? null };
-}
-
-export function resetVecStats() {
-  _stats = { calls: 0, batches: 0, tokens: 0, hits: 0, failures: 0, ms: 0 };
-}
-
-/** 测试用：注入自定义缓存目录 / 清空单例。传 null 或空串清成纯内存。
- *  第二个参数是本次要用的维度，省略时按配置维度命名（embed() 会显式传实际维度）。 */
-export function _setCacheDir(dir, dims) {
-  _cacheDir = dir ? path.resolve(String(dir)) : null;
-  // 旧实例若有未落盘的向量，先存一次再换文件，别把已经付过 API 费的向量丢掉
-  if (_cache?.dirty) _cache.save();
-  _cache = new VecCache(cachePathFor(Number.isFinite(dims) && dims > 0 ? Math.trunc(dims) : embedDims()));
-  return _cache;
-}
-
-/**
- * 取缓存实例。目录相同但文件不同（换了模型/维度）就换一个新实例：
- * 否则进程内会一直拿旧模型的向量算相似度——这正是本轮要修的那个静默算错。
- */
-function cache(dims = DEFAULT_DIMS) {
-  const file = cachePathFor(dims);
-  if (_cache && _cache.file === file) return _cache;
-  if (_cache?.dirty) _cache.save();
-  _cache = new VecCache(file);
-  return _cache;
+function cache(config, acquire = false) {
+  const directory = config.persistenceDisabled ? null : _cacheDir;
+  const namespace = JSON.stringify([directory, config.identity]);
+  let store = _caches.get(namespace);
+  if (!store) store = new VecCache(directory ? path.join(directory, `vec-cache-v2-${config.identity}.json`) : null, config);
+  _caches.delete(namespace);
+  _caches.set(namespace, store);
+  // Pin before trimming, including the first request for a new namespace.
+  if (acquire) store.inFlight += 1;
+  trimCaches();
+  _cache = store;
+  return store;
 }
 
 /** key 只在内存里读，绝不落盘、不进日志。用 embed 组的 key。 */
@@ -164,15 +199,16 @@ function apiKey() {
   return k && k.length > 8 ? k : null;
 }
 
-async function callEmbed(texts, dims, key) {
+async function callEmbed(texts, config) {
+  const { endpoint, model, dims, key } = config;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   const t0 = Date.now();
   try {
-    const res = await fetch(endpointUrl(), {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: modelName(), input: texts, dimensions: dims, encoding_format: 'float' }),
+      body: JSON.stringify({ model, input: texts, dimensions: dims, encoding_format: 'float' }),
       signal: ac.signal,
     });
     if (!res.ok) return { ok: false, status: res.status };
@@ -204,27 +240,35 @@ export async function embed(texts, opts = {}) {
   const list = (texts || []).map((t) => String(t ?? ''));
   if (!list.length) return [];
   const dims = DIMS_CHOICES.includes(opts.dims) ? opts.dims : DEFAULT_DIMS;
-  if (opts.cacheDir) _setCacheDir(opts.cacheDir, dims);
-  // 传实际生效的 dims：文件名里的维度与写进文件的内容必须同源
-  const store = cache(dims);
+  const config = snapshot(dims);
+  if (Object.hasOwn(opts, 'cacheDir')) _cacheDir = opts.cacheDir ? path.resolve(String(opts.cacheDir)) : null;
+  const store = cache(config, true);
+  try {
+    return await embedWithStore(list, opts, config, store);
+  } finally {
+    store.inFlight -= 1;
+    trimCaches();
+  }
+}
 
+async function embedWithStore(list, opts, config, store) {
+  const { dims } = config;
   const out = new Array(list.length).fill(null);
   const missIdx = [];
   for (let i = 0; i < list.length; i += 1) {
     const hit = store.get(list[i]);
     if (hit && hit.length === dims) { out[i] = new Int8Array(hit); _stats.hits += 1; } else missIdx.push(i);
   }
-  if (!missIdx.length) return out;
+  if (!missIdx.length) { store.save(); return out; }
 
-  const key = apiKey();
-  if (!key) { _stats.failures += 1; return null; } // 无 key：静默降级
+  if (!config.key) { _stats.failures += 1; return null; } // 无 key：静默降级
 
   const batch = Math.max(1, Number(opts.batch) || DEFAULT_BATCH);
   for (let s = 0; s < missIdx.length; s += batch) {
     const slice = missIdx.slice(s, s + batch);
     const inputs = slice.map((i) => list[i]);
-    let r = await callEmbed(inputs, dims, key);
-    if (!r.ok) r = await callEmbed(inputs, dims, key); // 重试一次
+    let r = await callEmbed(inputs, config);
+    if (!r.ok) r = await callEmbed(inputs, config); // 重试一次
     _stats.calls += 1;
     if (!r.ok) { _stats.failures += 1; return null; } // 这一批失败就整次降级
     _stats.batches += 1;

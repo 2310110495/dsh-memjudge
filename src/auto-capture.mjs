@@ -3,16 +3,18 @@
 // 三条不可协商的约束：
 //   1. 零外部依赖：不引 fs / sqlite / cordis / 宿主模块，不发任何网络请求。
 //      拒绝标准（spec §10 T1）：任何一条判定依赖真实 DB 或宿主模块即不合格。
-//   2. fail-open：任何形状不对的输入返回「没有候选」「不拦」「解析失败」，绝不抛错。
+//   2. 判定与解析 fail-open；formatSource 严格校验抛错，由 pre-step 提前捕获。
 //      这条路径将来挂在 agent/pre-step 的 waterfall 上，抛错会 reject 整条链并毁掉
 //      该轮对话（spec §7.1 实测 T5）。所以每个导出函数的入口都是 try 包裹的最外层。
 //   3. 永不截断候选文本：超长整条丢弃（spec §3.1 G3）。记忆库立身之本是逐字可信，
-//      截断等于制造库里没有、原文也没有的半句话。sessionToken 取会话 id 前 8 位是
-//      标记格式规定（spec §4.2），不是文本截断。
+//      截断等于制造库里没有、原文也没有的半句话。v2 来源保留完整会话身份。
+//      sessionToken 仅保留为旧版兼容工具，生产来源不再使用。
 //
 // 设计真源：docs/auto-capture-spec.md §2.2（判定顺序）/ §3.1-§3.6（六道闸与取值）/
 // §4.2（source 标记）/ §6.3（配置键）。接线（pre-step 挂载、store.put、章号分配）
 // 属 T2，本文件不碰。
+
+import { hasUnpairedSurrogate } from './text-wellformed.mjs';
 
 /** 全部默认值集中一处：面板、测试与 T2 共用同一份真源（spec §3.1 表）。 */
 export const AUTO_DEFAULTS = Object.freeze({
@@ -352,7 +354,7 @@ export function importanceFor(text, options = {}) {
 // ---------------------------------------------------------------- G6 配额状态机
 
 function sessionKey(sessionId) {
-  const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+  const key = typeof sessionId === 'string' ? sessionId : '';
   return key === '' ? 'unknown' : key;
 }
 
@@ -469,20 +471,21 @@ export function sessionToken(sessionId) {
   return safe.slice(0, 8) || 'unknown';
 }
 
-function turnOf(turn) {
-  const n = Number(turn);
-  return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0;
-}
-
 /**
- * 生成 source 标记：`auto:chat#<会话 id 前 8 位>-t<turn>`。
+ * 生成 v2 source：完整良构身份的规范 UTF-8 base64url；非法身份或轮次抛错。
+ * pre-step 在候选与配额之前捕获错误并原样放行 decision。
  *
  * 为什么是字符串而不是独立字段/JSON：memories 表没有 origin 列，加列要动 schema 版本与
  * 迁移路径；而 decodeSource 对 `{` 开头的 source 一律当章/段号解析，写 JSON 会让自动条目
  * 在面板上全显示成「手动写入」。字符串是唯一零迁移的落点（spec §4.2）。
  */
 export function formatSource(sessionId, turn) {
-  return `auto:chat#${sessionToken(sessionId)}-t${turnOf(turn)}`;
+  if (typeof sessionId !== 'string' || !sessionId.trim() || !sessionId.isWellFormed()) {
+    throw new TypeError('invalid-session-id');
+  }
+  if (!Number.isSafeInteger(turn) || turn < 0) throw new RangeError('invalid-turn');
+  const t = turn;
+  return `auto:chat:v2#${Buffer.from(sessionId, 'utf8').toString('base64url')}:t${t}`;
 }
 
 /**
@@ -492,9 +495,20 @@ export function formatSource(sessionId, turn) {
  */
 export function parseSource(source) {
   if (typeof source !== 'string') return null;
-  const m = /^auto:chat#([A-Za-z0-9_]{1,8})-t(\d+)$/.exec(source.trim());
-  if (!m) return null;
-  return { auto: true, sessTok: m[1], turn: Number(m[2]) };
+  try {
+    const v2 = /^auto:chat:v2#([A-Za-z0-9_-]+):t(0|[1-9][0-9]*)$/.exec(source);
+    if (v2 && v2[0] === source) {
+      const bytes = Buffer.from(v2[1], 'base64url');
+      if (bytes.toString('base64url') !== v2[1]) return null;
+      const sessionId = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      const turn = Number(v2[2]);
+      if (!Number.isSafeInteger(turn) || formatSource(sessionId, turn) !== source) return null;
+      return { auto: true, version: 2, sessionId, turn, source };
+    }
+    const m = /^auto:chat#([A-Za-z0-9_]{1,8})-t(\d+)$/.exec(source);
+    if (!m || m[0] !== source) return null;
+    return { auto: true, version: 1, legacy: true, ambiguous: true, sessTok: m[1], turn: Number(m[2]), source };
+  } catch { return null; }
 }
 
 /** 面板/inject 用的快速判据：是不是自动条目的来源串（spec §5.2 的 isAuto）。 */
@@ -520,6 +534,7 @@ export function captureVerdict(message, options = {}) {
 
     const { problem, text } = inspectMessage(message);
     if (problem !== null) return { ...miss, reason: problem };
+    if (hasUnpairedSurrogate(text)) return { ...miss, reason: 'unpaired-surrogate' };
 
     const gate = shouldCapture(text, cfg);
     if (!gate.ok) return { ...miss, reason: gate.reason };
@@ -564,6 +579,9 @@ export function extractCandidates(messages, options = {}) {
     const out = [];
     for (const message of messages) {
       const verdict = captureVerdict(message, { ...cfg, existing });
+      if (verdict.reason === 'unpaired-surrogate' && typeof options?.onInvalidText === 'function') {
+        try { options.onInvalidText(verdict.reason); } catch { /* diagnostics must not stop capture */ }
+      }
       if (!verdict.ok) continue;
 
       if (quota && typeof quota.admit === 'function') {

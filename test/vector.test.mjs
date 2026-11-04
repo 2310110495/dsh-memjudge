@@ -1,4 +1,21 @@
-process.env.MEMJUDGE_NO_SECRETS = "1";
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import net from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
+import { syncBuiltinESMExports } from 'node:module';
+const root = mkdtempSync(join(tmpdir(), 'vector-unit-'));
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('MEMJUDGE_') || ['DSH_HOME', 'DSH_WORKBENCH_HOME'].includes(key)) delete process.env[key];
+}
+for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'DSH_HOME', 'DSH_WORKBENCH_HOME']) process.env[key] = root;
+process.env.MEMJUDGE_NO_SECRETS = '1';
+const blocked = () => { throw new Error('network disabled by vector fixture'); };
+globalThis.fetch = blocked;
+net.connect = net.createConnection = net.Socket.prototype.connect = blocked;
+http.request = http.get = https.request = https.get = blocked;
+syncBuiltinESMExports();
 // 向量层与 RRF 融合的契约测试 —— 全程不碰网络。
 //
 // 三条不变量在这里钉死：
@@ -11,8 +28,8 @@ process.env.MEMJUDGE_NO_SECRETS = "1";
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { quantize, cosineInt8, embed, embedOne, vecStats, resetVecStats } from '../src/vector.mjs';
-import { rrfFuse, SearchIndex, index, search } from '../src/search.mjs';
+const { quantize, cosineInt8, embed, embedOne, vecStats, resetVecStats } = await import('../src/vector.mjs');
+const { rrfFuse, SearchIndex, index, search } = await import('../src/search.mjs');
 
 // ── 量化与相似度 ───────────────────────────────────────────────────────────
 

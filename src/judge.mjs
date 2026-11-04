@@ -910,6 +910,57 @@ export function adjudicateConflicts(memories, opts = {}) {
  *
  * @param {Array<{id:string,text:string,createdAt?:number,ch?:number}>} memories
  */
+export function documentConflicts(memories, options = {}) {
+  const maxComparisons = Number.isSafeInteger(options.maxComparisons) && options.maxComparisons >= 0
+    ? options.maxComparisons : Infinity;
+  const scan = options.scan;
+  let comparisons = 0;
+  let incomplete = false;
+  const documents = new Map();
+  for (const mem of memories) {
+    const unknown = [];
+    for (const occurrence of mem.occurrences || []) {
+      const id = occurrence.documentId;
+      if (typeof id !== 'string' || id.length === 0) { unknown.push(occurrence); continue; }
+      if (!documents.has(id)) documents.set(id, new Map());
+      const entries = documents.get(id);
+      if (!entries.has(mem.id)) entries.set(mem.id, { mem, positions: [] });
+      entries.get(mem.id).positions.push(occurrence);
+    }
+    if (unknown.length || !(mem.occurrences || []).length) {
+      documents.set(Symbol(mem.id), new Map([[mem.id, { mem, positions: unknown }]]));
+    }
+  }
+  const conflicts = [];
+  documentsLoop: for (const [documentId, entries] of documents) {
+    const byUnit = new Map();
+    for (const { mem, positions } of entries.values()) {
+      for (const q of extractQuantities(mem.text)) {
+        if (!byUnit.has(q.unit)) byUnit.set(q.unit, []);
+        byUnit.get(q.unit).push({ ...q, memoryId: mem.id, positions });
+      }
+    }
+    for (const [unit, items] of byUnit) {
+      for (let i = 0; i < items.length; i += 1) {
+        for (let j = i + 1; j < items.length; j += 1) {
+          if (comparisons >= maxComparisons) { incomplete = true; break documentsLoop; }
+          comparisons += 1;
+          const a = items[i], b = items[j];
+          if (a.value === b.value) continue;
+          const attr = sharedNoun([a.sent, b.sent]);
+          if (!attr) continue;
+          conflicts.push({ documentId: typeof documentId === 'symbol' ? null : documentId,
+            attr, unit, values: [a.value, b.value], evidence: [a, b].map(item => ({
+              value: item.value, memoryId: item.memoryId, text: item.sent, positions: item.positions,
+            })) });
+        }
+      }
+    }
+  }
+  if (scan) Object.assign(scan, { comparisons, incomplete });
+  return conflicts;
+}
+
 export function resolveConflict(memories) {
   const byUnit = new Map();
   for (const mem of memories) {

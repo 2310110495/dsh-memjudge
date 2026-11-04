@@ -12,6 +12,7 @@
     "./judge": "./src/judge.mjs",
     "./layer": "./src/layer.mjs",
     "./schema": "./src/schema.mjs",
+    "./service": "./src/service.mjs",
     "./package.json": "./package.json"
   },
   "optionalDependencies": {
@@ -20,6 +21,7 @@
   "files": [
     "src",
     "docs",
+    "reports/stage-2026-11-04-t366.md",
     "README.md",
     "client.js",
     "cordis.patch.yml"

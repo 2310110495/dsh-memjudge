@@ -151,6 +151,22 @@ window.__ModuleLoader__.load({
       return view.keyConfigured ? '来源未知' : '未配置';
     }
 
+    // Model actions never render exception text or provider response bodies.
+    function modelError(res) {
+      const code = res && (res.code || (res.error && res.error.code));
+      const labels = {
+        'missing-key': '未配置密钥', disabled: '该组已禁用',
+        'incomplete-config': '端点或模型为空', 'bad-request': '参数无效，请检查输入',
+        'invalid-response': '响应结构或内容无效', 'http-error': '服务返回 HTTP 错误',
+        'network-error': '网络请求失败', timeout: '请求超时',
+      };
+      return labels[code] || '调用失败，请重试';
+    }
+
+    function modelSaved(res) {
+      return !!(res && res.ok === true && !(res.value && res.value.ok === false));
+    }
+
     function errMsg(res) {
       if (res && res.error && res.error.message) return String(res.error.message);
       if (res && res.error && res.error.code) return String(res.error.code);
@@ -455,11 +471,11 @@ window.__ModuleLoader__.load({
      */
     function TextField({
       label, value, onChange, placeholder, hint, mono, disabled, locked, lockedReason,
-      ariaLabel, type, inputMode, maxLength,
+      ariaLabel, type, inputMode, maxLength, disabledReason,
     }) {
       const off = !!disabled || !!locked;
       const lockText = lockedReason || '该项由环境变量决定，改面板不生效';
-      const reason = locked ? lockText : disabled ? '正在保存，稍候' : undefined;
+      const reason = locked ? lockText : disabled ? (disabledReason || '正在保存，稍候') : undefined;
       return h('div', { style: { padding: '5px 0' } },
         h('div', { className: 'mj-textrow', style: { display: 'flex', alignItems: 'center', gap: 10 } },
           h('div', {
@@ -514,8 +530,8 @@ window.__ModuleLoader__.load({
     /** 组名即后端 group 参数；title/desc 只用于面板文案，不参与请求。 */
     const CRED_GROUPS = [
       { id: 'chat', title: '对话模型', desc: '查询扩展、LLM 选段与提取、面板的测试连接都走这一组。' },
-      { id: 'embed', title: '向量模型', desc: '向量召回用这一组；未单独配置时端点与密钥继承对话模型。' },
-      { id: 'rerank', title: '重排模型', desc: '精排重打分用这一组；同样支持继承对话模型的端点与密钥。' },
+      { id: 'embed', title: '向量模型', desc: '向量召回用这一组；可显式选择继承对话端点与密钥，模型名独立。' },
+      { id: 'rerank', title: '重排模型', desc: '精排重打分用这一组；可独立配置或显式继承对话端点与密钥。' },
     ];
 
     /** 组 → 九项白名单里的键名（与 src/config.mjs 的 SETTING_ENV 同一套，别在此处另造命名）。 */
@@ -536,11 +552,11 @@ window.__ModuleLoader__.load({
     })();
 
     const SETTING_DEFAULTS = {
-      chatBaseUrl: 'https://api.siliconflow.cn/v1',
+      chatBaseUrl: '',
       chatModel: 'deepseek-ai/DeepSeek-V4-Flash',
-      embedBaseUrl: 'https://api.siliconflow.cn/v1',
+      embedBaseUrl: '',
       embedModel: 'Qwen/Qwen3-Embedding-8B',
-      rerankBaseUrl: 'https://api.siliconflow.cn/v1',
+      rerankBaseUrl: '',
       rerankModel: 'Qwen/Qwen3-Reranker-8B',
       dims: '64',
       storageLimitBytes: '2048',
@@ -600,6 +616,7 @@ window.__ModuleLoader__.load({
      */
     function groupView(cfg, group) {
       const empty = {
+        mode: 'legacy', migrationRequired: true, enabled: true, inheritedEnv: {},
         baseUrl: '', baseUrlSource: '', baseUrlInherited: false, baseUrlEnv: null,
         model: '', modelSource: '', modelEnv: null,
         keyConfigured: false, keyMasked: '', keySource: 'none', keyInherited: false, keyEnvLocked: false,
@@ -624,11 +641,13 @@ window.__ModuleLoader__.load({
     /** 一组密钥来源的一句话说明：自己的 / 继承的 / 环境变量里的，三种不能混着说。 */
     function keySourceHint(cfg, group, view) {
       const spec = cfg && cfg.credSpec ? cfg.credSpec[group] : null;
-      const keyEnvName = spec && Array.isArray(spec.keyEnv) && spec.keyEnv.length ? spec.keyEnv[0] : '';
+      const keyEnvName = view.keyEnv || (spec && Array.isArray(spec.keyEnv) && spec.keyEnv.length ? spec.keyEnv[0] : '');
       if (view.keyEnvLocked) {
         return '密钥由环境变量 ' + (keyEnvName || 'MEMJUDGE_*_KEY') + ' 决定，面板写入不生效。';
       }
-      if (view.keyInherited) return '继承自对话模型密钥：填本组自己的 key 即切换为独立配置。';
+      if (view.keyInherited) return (view.keySource === 'legacy-inherit' ? '旧配置兼容继承，尚未主动选择模式。' : '显式继承对话密钥。')
+        + (view.inheritedEnv && view.inheritedEnv.key ? '继承源锁：' + view.inheritedEnv.key + '。' : '')
+        + '先保存独立模式，再配置本组密钥；清除会退出继承。';
       if (view.keySource === 'env') {
         return '来自环境变量' + (keyEnvName ? ' ' + keyEnvName : '') + '，换机器需重新配置。';
       }
@@ -770,10 +789,10 @@ window.__ModuleLoader__.load({
             setState({ phase: 'ready', data: res.value || null, error: '' });
             return;
           }
-          setState({ phase: 'error', data: null, error: errMsg(res) });
+          setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError(res) : errMsg(res) });
         }, (e) => {
           if (!alive.current) return;
-          setState({ phase: 'error', data: null, error: e && e.message ? String(e.message) : String(e) });
+          setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError() : (e && e.message ? String(e.message) : String(e)) });
         });
       }, [rpc, endpoint]);
       useEffect(() => { load(); }, [load]);
@@ -854,10 +873,10 @@ window.__ModuleLoader__.load({
       const pullStatus = useCallback(() => {
         return Promise.resolve(rpc('status', {})).then((res) => {
           if (res && res.ok) { setStatusSt({ phase: 'ready', data: res.value || null, error: '' }); return res.value; }
-          setStatusSt({ phase: 'error', data: null, error: errMsg(res) });
+          setStatusSt({ phase: 'error', data: null, error: modelError(res) });
           return null;
         }, (e) => {
-          setStatusSt({ phase: 'error', data: null, error: e && e.message ? String(e.message) : String(e) });
+          setStatusSt({ phase: 'error', data: null, error: modelError() });
           return null;
         });
       }, [rpc, setStatusSt]);
@@ -870,17 +889,18 @@ window.__ModuleLoader__.load({
         patchSlot(group, { busy: 'save' });
         setKeyFeedback(group, null);
         Promise.resolve(rpc('saveKey', { key: v, group })).then((res) => {
-          if (!(res && res.ok)) {
-            setKeyFeedback(group, { kind: 'err', text: '保存失败：' + errMsg(res) });
+          if (!modelSaved(res)) {
+            setKeyFeedback(group, { kind: 'err', text: '保存失败：' + modelError(res && (res.value || res)) });
             return null;
           }
-          return pullStatus().then(() => {
-            patchSlot(group, { input: '', replacing: false });
+          return pullStatus().then((value) => {
+            if (!value) { setKeyFeedback(group, { kind: 'err', text: '写入已返回，状态回读失败，请刷新确认。' }); return; }
+            patchSlot(group, { input: '', replacing: false, shown: false });
             setKeyFeedback(group, { kind: 'ok', text: '已保存，这一组即刻生效。' }, true);
             return null;
           });
         }, (e) => {
-          setKeyFeedback(group, { kind: 'err', text: '保存失败：' + (e && e.message ? e.message : String(e)) });
+          setKeyFeedback(group, { kind: 'err', text: '保存失败：' + modelError() });
         }).then(() => { patchSlot(group, { busy: '' }); });
       }, [slotOf, patchSlot, rpc, pullStatus, setKeyFeedback]);
 
@@ -891,7 +911,7 @@ window.__ModuleLoader__.load({
        */
       const testKeyFor = useCallback((group) => {
         const slot = slotOf(group);
-        if (slot.busy) return;
+        if (slot.busy || groupView(cfg, group).mode === 'disabled') return;
         patchSlot(group, { busy: 'test' });
         setKeyFeedback(group, null);
         const payload = { group };
@@ -899,28 +919,27 @@ window.__ModuleLoader__.load({
         if (typed) payload.key = typed;
         Promise.resolve(rpc('testKey', payload)).then((res) => {
           if (!(res && res.ok)) {
-            setKeyFeedback(group, { kind: 'err', text: '连接失败：' + errMsg(res) });
+            setKeyFeedback(group, { kind: 'err', text: '连接失败：' + modelError(res) });
             return;
           }
           const v = res.value || {};
-          if (v.ok) {
+          if (v.ok === true) {
             setKeyFeedback(group, {
               kind: 'ok',
               text: '连接正常 · ' + (Number.isFinite(v.latencyMs) ? v.latencyMs : '—')
-                + ' ms · 模型 ' + (v.model || '未知'),
+                + ' ms',
             });
           } else {
-            // 后端原文照登：status 与 message 都是它自己的话，面板只加一句读法提示
+            // Only stable error codes reach the UI; provider bodies stay private.
             setKeyFeedback(group, {
               kind: 'err',
-              text: '连接失败：' + (v.status != null ? v.status + ' ' : '') + (v.message || '无返回信息')
-                + '\n401 表示该组 key 无效或已过期；连不上表示该组端点不可达。',
+              text: '连接失败：' + modelError(v),
             });
           }
         }, (e) => {
-          setKeyFeedback(group, { kind: 'err', text: '连接失败：' + (e && e.message ? e.message : String(e)) });
+          setKeyFeedback(group, { kind: 'err', text: '连接失败：' + modelError() });
         }).then(() => { patchSlot(group, { busy: '' }); });
-      }, [slotOf, patchSlot, rpc, setKeyFeedback]);
+      }, [slotOf, patchSlot, rpc, setKeyFeedback, cfg]);
 
       /** 清除一组密钥，二段确认（5 秒内再点一次）。 */
       const clearKeyFor = useCallback((group) => {
@@ -939,17 +958,18 @@ window.__ModuleLoader__.load({
         patchSlot(group, { busy: 'clear' });
         setKeyFeedback(group, null);
         Promise.resolve(rpc('clearKey', { group })).then((res) => {
-          if (!(res && res.ok)) {
-            setKeyFeedback(group, { kind: 'err', text: '清除失败：' + errMsg(res) });
+          if (!modelSaved(res)) {
+            setKeyFeedback(group, { kind: 'err', text: '清除失败：' + modelError(res && (res.value || res)) });
             return null;
           }
-          return pullStatus().then(() => {
-            patchSlot(group, { input: '', replacing: false });
+          return pullStatus().then((value) => {
+            if (!value) { setKeyFeedback(group, { kind: 'err', text: '写入已返回，状态回读失败，请刷新确认。' }); return; }
+            patchSlot(group, { input: '', replacing: false, shown: false });
             setKeyFeedback(group, { kind: 'ok', text: '这一组的密钥已清除。' }, true);
             return null;
           });
         }, (e) => {
-          setKeyFeedback(group, { kind: 'err', text: '清除失败：' + (e && e.message ? e.message : String(e)) });
+          setKeyFeedback(group, { kind: 'err', text: '清除失败：' + modelError() });
         }).then(() => { patchSlot(group, { busy: '' }); });
       }, [slotOf, patchSlot, resetConfirm, rpc, pullStatus, setKeyFeedback]);
 
@@ -1056,19 +1076,30 @@ window.__ModuleLoader__.load({
       // 「恢复默认」只改输入框，不发请求：用户可能只想拿回默认值再手改两个字段。
       const restoreSettingDefaults = useCallback(() => {
         setSettingsMsg(null);
-        setSettingsDraft(Object.assign({}, SETTING_DEFAULTS));
-      }, []);
+        const next = {};
+        for (const [key, value] of Object.entries(SETTING_DEFAULTS)) {
+          if (value !== '' && !(settingsLocked && settingsLocked[key])) next[key] = value;
+        }
+        setSettingsDraft(next);
+      }, [settingsLocked]);
 
       const saveSettings = useCallback(() => {
         if (settingsBusy) return;
-        // 只提交与回读值不同的字段；空串也算改动，交给后端报「不能为空」。
+        // Absent and empty drafts are unchanged; null is an explicit clear action.
         const patch = {};
         for (const row of SETTING_ROWS) {
-          const base = settingText(row.key, cfg);
-          const cur = settingsDraft && Object.prototype.hasOwnProperty.call(settingsDraft, row.key)
-            ? settingsDraft[row.key] : base;
-          if (String(cur) === String(base)) continue;
+          if (!settingsDraft || !Object.prototype.hasOwnProperty.call(settingsDraft, row.key)) continue;
+          if (settingsLocked && settingsLocked[row.key]) continue;
+          if (row.group && settingEnvName(groupView(cfg, row.group), row.key, row.group)) continue;
+          const cur = settingsDraft[row.key];
+          if (cur !== null && (!String(cur).trim() || String(cur) === settingText(row.key, cfg))) continue;
           patch[row.key] = settingValue(row.key, cur);
+        }
+        for (const g of CRED_GROUPS) {
+          const key = g.id + 'Mode';
+          const mode = settingsDraft && settingsDraft[key];
+          if (['independent', 'disabled', ...(g.id === 'chat' ? [] : ['inherit'])].includes(mode)
+              && mode !== groupView(cfg, g.id).mode) patch[key] = mode;
         }
         if (Object.keys(patch).length === 0) {
           setSettingsMsg({ kind: 'info', text: '没有改动需要保存。' });
@@ -1077,15 +1108,16 @@ window.__ModuleLoader__.load({
         setSettingsBusy(true);
         setSettingsMsg(null);
         Promise.resolve(rpc('saveSettings', { settings: patch })).then((res) => {
-          if (!(res && res.ok)) {
-            setSettingsMsg({ kind: 'err', text: '保存失败：' + errMsg(res) });
+          if (!modelSaved(res)) {
+            setSettingsMsg({ kind: 'err', text: '保存失败：' + modelError(res && (res.value || res)) });
             return null;
           }
           const vecReset = !!(res.value && res.value.vecCacheReset === true);
           setSettingsDraft(null);
           // 不乐观更新：保存成功也重拉 status，输入框显示的是配置层真正的生效值
           // （被 env 钉住的项写进 config.json 也不会变，只有回读能说出这件事）。
-          return pullStatus().then(() => {
+          return pullStatus().then((value) => {
+            if (!value) { setSettingsMsg({ kind: 'err', text: '写入已返回，状态回读失败，请刷新确认。' }); return; }
             setSettingsMsg({
               kind: 'ok',
               text: '已保存。',
@@ -1096,7 +1128,7 @@ window.__ModuleLoader__.load({
             return null;
           });
         }, (e) => {
-          setSettingsMsg({ kind: 'err', text: '保存失败：' + (e && e.message ? e.message : String(e)) });
+          setSettingsMsg({ kind: 'err', text: '保存失败：' + modelError() });
         }).then(() => { setSettingsBusy(false); });
       }, [settingsBusy, settingsDraft, cfg, rpc, pullStatus]);
 
@@ -1237,25 +1269,44 @@ window.__ModuleLoader__.load({
           h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 2 } },
             h('div', { style: { fontSize: 13, lineHeight: '1.4', fontWeight: 600, color: C.fg } }, g.title),
             h(Hint, { style: { minWidth: 0 } }, g.desc)),
+          h('div', { style: { margin: '8px 0', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+            h('label', null, g.title + '模式 ', h('select', {
+              'aria-label': g.title + ' 模式', className: 'mj-text',
+              value: (settingsDraft && settingsDraft[g.id + 'Mode']) || (view.mode === 'legacy' ? '' : view.mode),
+              disabled: settingsBusy || !!slotOf(g.id).busy,
+              style: { color: C.fg, background: C.layer2, border: '1px solid ' + C.line2, borderRadius: C.radiusSm, minHeight: 32, maxWidth: '100%' },
+              onChange: (e) => editSetting(g.id + 'Mode', e.target.value),
+            },
+              view.mode === 'legacy' ? h('option', { value: '', disabled: true }, '请选择迁移模式') : null,
+              h('option', { value: 'independent' }, '独立配置'),
+              g.id !== 'chat' ? h('option', { value: 'inherit' }, '继承对话端点与密钥') : null,
+              h('option', { value: 'disabled' }, '禁用'))),
+            h(Hint, null, view.mode === 'disabled' ? '已禁用：不发送能力请求。' : '当前生效：' + view.mode)),
+          view.migrationRequired ? h(Hint, { tone: C.warn }, 'legacy：旧配置兼容状态，请选择模式并保存完成迁移。') : null,
+          settingsDraft && settingsDraft[g.id + 'Mode'] && settingsDraft[g.id + 'Mode'] !== view.mode
+            ? h(Hint, { tone: C.warn }, '模式尚未保存；先点下方保存，再编辑或测试本组。') : null,
+          h(Hint, { style: { overflowWrap: 'anywhere' } }, '有效来源：端点 ' + (view.baseUrlSource || 'none') + ' · 模型 ' + (view.modelSource || 'none') + ' · 密钥 ' + view.keySource),
+          view.inheritedEnv && (view.inheritedEnv.baseUrl || view.inheritedEnv.key)
+            ? h(Hint, { style: { overflowWrap: 'anywhere' } }, '继承源环境锁：端点 ' + (view.inheritedEnv.baseUrl || '无') + '；密钥 ' + (view.inheritedEnv.key || '无')) : null,
           urlRow ? settingRow(urlRow) : null,
           keyBlock(g, view),
           restRows.map((row) => settingRow(row)));
       }
 
-      /** 一行值型设置。继承来的端点不算锁：写进去就变成这一组自己的显式设置。 */
+      /** Inherited endpoints require an explicit mode switch or clear action. */
       function settingRow(row) {
         const base = settingText(row.key, cfg);
         const val = settingsDraft && Object.prototype.hasOwnProperty.call(settingsDraft, row.key)
           ? settingsDraft[row.key] : base;
-        const locked = !!(settingsLocked && settingsLocked[row.key] === true);
         const gid = row.group || GROUP_OF_SETTING[row.key] || null;
         const view = gid ? groupViews[gid] : null;
         const envName = view ? settingEnvName(view, row.key, gid) : '';
-        const inherited = !!(view && view.baseUrlInherited && GROUP_KEYS[gid].baseUrl === row.key);
-        const hint = inherited
-          ? '当前继承自对话模型的端点；在这里填值即改为这一组自己的端点。' + (row.hint ? ' ' + row.hint : '')
-          : row.hint;
-        return h(TextField, {
+        const locked = !!(settingsLocked && settingsLocked[row.key]) || !!envName;
+        const inherited = !!(view && view.mode === 'inherit' && GROUP_KEYS[gid].baseUrl === row.key);
+        const modePending = !!(gid && settingsDraft && settingsDraft[gid + 'Mode'] && settingsDraft[gid + 'Mode'] !== view.mode);
+        const off = settingsBusy || modePending || !!(view && (view.mode === 'disabled' || slotOf(gid).busy));
+        const hint = inherited ? '当前继承对话端点。先保存独立模式再编辑；明确清空会退出继承。' : row.hint;
+        return h('div', { key: row.key }, h(TextField, {
           key: row.key,
           label: row.label,
           ariaLabel: gid ? groupTitle(gid) + ' ' + row.label : row.label,
@@ -1267,8 +1318,20 @@ window.__ModuleLoader__.load({
           inputMode: row.inputMode,
           locked: locked,
           lockedReason: envName ? '该项由环境变量 ' + envName + ' 决定，改面板不生效' : undefined,
-          disabled: settingsBusy,
-        });
+          disabled: off || inherited,
+          disabledReason: view && view.mode === 'disabled' ? '该组已禁用，请先选择模式并保存'
+            : modePending ? '模式尚未保存' : inherited ? '继承对话端点；切换独立模式后编辑' : undefined,
+        }),
+          gid && row.key !== 'dims' ? h(Btn, {
+            ariaLabel: '清空' + groupTitle(gid) + ' ' + row.label,
+            disabled: off || locked,
+            onClick: () => {
+              editSetting(row.key, null);
+              if (inherited) editSetting(gid + 'Mode', 'independent');
+            },
+            title: '明确清空此项；点击保存后生效',
+          }, '清空' + row.label) : null,
+          val === null ? h(Hint, { tone: C.warn }, '待清空，保存后生效。') : null);
       }
 
       /**
@@ -1279,12 +1342,15 @@ window.__ModuleLoader__.load({
       function keyBlock(g, view) {
         const group = g.id;
         const slot = slotOf(group);
-        const busy = !!slot.busy;
+        const modePending = !!(settingsDraft && settingsDraft[group + 'Mode'] && settingsDraft[group + 'Mode'] !== view.mode);
+        const busy = !!slot.busy || settingsBusy || modePending;
+        const disabledGroup = view.mode === 'disabled';
+        const inherited = view.mode === 'inherit';
         const locked = !!view.keyEnvLocked;
         const spec = cfg && cfg.credSpec ? cfg.credSpec[group] : null;
-        const keyEnvName = spec && Array.isArray(spec.keyEnv) && spec.keyEnv.length ? spec.keyEnv[0] : '';
+        const keyEnvName = view.keyEnv || (spec && Array.isArray(spec.keyEnv) && spec.keyEnv.length ? spec.keyEnv[0] : '');
         const showInput = locked || !view.keyConfigured || !!slot.replacing;
-        const canSave = !locked && slot.input.trim().length > 0 && !busy;
+        const canSave = !locked && !inherited && !disabledGroup && slot.input.trim().length > 0 && !busy;
         const confirm = !!slot.confirmClear;
 
         let field;
@@ -1295,7 +1361,7 @@ window.__ModuleLoader__.load({
               className: 'mj-input',
               type: slot.shown ? 'text' : 'password',
               value: slot.input,
-              disabled: busy || locked,
+              disabled: busy || locked || inherited || disabledGroup,
               placeholder: locked
                 ? '由环境变量 ' + (keyEnvName || 'MEMJUDGE_*_KEY') + ' 提供，面板不可写'
                 : (view.keyInherited ? '填这一组自己的 key（不填就继续继承）' : '粘贴 API key（sk-...）'),
@@ -1340,13 +1406,13 @@ window.__ModuleLoader__.load({
 
         const acts = [];
         if (locked) {
-          acts.push(h(Btn, { key: 't', disabled: busy, onClick: () => testKeyFor(group) },
-            busy === 'test' ? '测试中…' : '测试连接'));
+          acts.push(h(Btn, { key: 't', disabled: busy || disabledGroup, onClick: () => testKeyFor(group) },
+            slot.busy === 'test' ? '测试中…' : '测试连接'));
         } else if (showInput) {
           acts.push(h(Btn, { key: 's', primary: true, disabled: !canSave, onClick: () => saveKeyFor(group) },
-            busy === 'save' ? '保存中…' : (view.keyConfigured ? '保存新密钥' : '保存密钥')));
-          acts.push(h(Btn, { key: 't', disabled: busy, onClick: () => testKeyFor(group) },
-            busy === 'test' ? '测试中…' : '测试连接'));
+            slot.busy === 'save' ? '保存中…' : (view.keyConfigured ? '保存新密钥' : '保存密钥')));
+          acts.push(h(Btn, { key: 't', disabled: busy || disabledGroup, onClick: () => testKeyFor(group) },
+            slot.busy === 'test' ? '测试中…' : '测试连接'));
           if (view.keyConfigured) {
             acts.push(h(Btn, {
               key: 'x',
@@ -1356,17 +1422,17 @@ window.__ModuleLoader__.load({
             }, '取消'));
           }
         } else {
-          acts.push(h(Btn, { key: 'r', disabled: busy, onClick: () => focusGroupKey(group) },
+          acts.push(h(Btn, { key: 'r', disabled: busy || inherited || disabledGroup, onClick: () => focusGroupKey(group) },
             '替换'));
-          acts.push(h(Btn, { key: 't', disabled: busy, onClick: () => testKeyFor(group) },
-            busy === 'test' ? '测试中…' : '测试连接'));
+          acts.push(h(Btn, { key: 't', disabled: busy || disabledGroup, onClick: () => testKeyFor(group) },
+            slot.busy === 'test' ? '测试中…' : '测试连接'));
           acts.push(h(Btn, {
             key: 'c',
             danger: confirm,
             disabled: busy,
             onClick: () => clearKeyFor(group),
             title: confirm ? '5 秒内再点一次即清除' : '清除这一组存在本机 secrets.json 里的密钥',
-          }, busy === 'clear' ? '清除中…' : confirm ? '确认清除' : '清除'));
+          }, slot.busy === 'clear' ? '清除中…' : confirm ? '确认清除' : '清除'));
         }
 
         const msg = slot.msg;
@@ -1788,7 +1854,7 @@ window.__ModuleLoader__.load({
         try {
           return ctx.connection.rpc.call(CHANNEL, endpoint, payload, undefined);
         } catch (e) {
-          console.log('[memjudge] rpc 调用失败', CHANNEL, endpoint, e);
+          console.log('[memjudge] rpc 调用失败', CHANNEL, endpoint);
           return Promise.resolve({ ok: false, error: { code: 'call', message: String(e && e.message ? e.message : e) } });
         }
       };

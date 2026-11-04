@@ -13,8 +13,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeId } from './schema.mjs';
 import { extractL1 } from './extract.mjs';
+import { normalizeConflictScanOptions, scanConflictConnectionV2 } from './conflict-scan-v2.mjs';
 
-export const STORE_SCHEMA_VERSION = 6;
+import { hasUnpairedSurrogate } from './text-wellformed.mjs';
+
+export const STORE_SCHEMA_VERSION = 7;
 
 // ── 记忆三分（人 / 约 / 事） ───────────────────────────────────────────────
 // 为什么要分：memjudge 此前所有条目一视同仁按 importance 衰减，用户的身份信息与
@@ -35,6 +38,66 @@ export function normalizeKind(value) {
   const v = typeof value === 'string' ? value.trim().toLowerCase() : '';
   return MEMORY_KINDS.includes(v) ? v : DEFAULT_MEMORY_KIND;
 }
+
+// ── 记忆层级（tier，v7） ───────────────────────────────────────────────────
+// 与下面两个同名字概念**不是一回事**，三者别混：
+//   - 本文件的 tier：记忆的衰减层级 1..5，数字越小越靠前。1 = 钉住，5 = 最该淘汰。
+//   - src/layer.mjs 注释里的「阶梯 T0–T4」：图谱演进阶梯（邻接表→CTE→闭包表→Kuzu）。
+//   - src/schema.mjs 的 tier：warm/cold 两个衰减半衰期档位。
+// 为什么不复用 kind 表达强度：kind 是**语义分类**（这条讲的是谁），tier 是**时效状态**
+// （这条现在还该不该占注入席位）。一条 event 被反复命中后该往上浮，一条 person 则
+// 永远钉在 1——把这两件事塞进一列，就没法在不改语义的前提下做 nightly 升降。
+// 人 / 约恒 1：身份与约定不该被时间冲掉，这是 v6 三分就定下的立场，tier 只把它写实。
+export const MEMORY_TIER_PINNED = 1;
+export const MEMORY_TIER_EVENT = 3;
+export const MEMORY_TIER_MIN = 1;
+export const MEMORY_TIER_MAX = 5;
+
+// 升降阈值（nightly.mjs 与 layer.sleepPhase 共用这一份，别在两处各写一个数字）。
+//   TIER_IDLE_DAYS：距上次命中超过这么多天 → 下沉一级（MIN(5, tier+1)）。
+//   TIER_PROMOTE_ACCESS：命中次数到这个数 → 上浮一级（tier-1，但不下探到 1 以下）。
+// 两个阈值都只对 event 生效；人 / 约恒 1，连算都不算。
+export const TIER_IDLE_DAYS = 30;
+export const TIER_PROMOTE_ACCESS = 5;
+
+/** kind → 默认 tier。person/promise 钉 1，event 落 3（中间态，可升可降）。 */
+export function defaultTier(kind) {
+  const k = normalizeKind(kind);
+  return k === 'person' || k === 'promise' ? MEMORY_TIER_PINNED : MEMORY_TIER_EVENT;
+}
+
+/**
+ * tier 归一化：非法值回落该 kind 的默认值，再钳到 1..5。
+ *
+ * person/promise **无论传什么都归 1**：这是结构保证，不靠 nightly 的 WHERE 兜住。
+ * 否则一次手滑 `put({kind:'person', tier:4})` 就能把用户身份写进淘汰区，
+ * 而 nightly 只扫 event，那条记录就永远沉在下面——错的地方必须在写入侧堵死。
+ */
+export function normalizeTier(value, kind) {
+  const k = normalizeKind(kind);
+  const n = Number(value);
+  if (!Number.isFinite(n)) return defaultTier(k);
+  if (k === 'person' || k === 'promise') return MEMORY_TIER_PINNED;
+  return Math.min(MEMORY_TIER_MAX, Math.max(MEMORY_TIER_MIN, Math.trunc(n)));
+}
+/**
+ * LIKE 模式的字面量化：`%` `_` `\` 各自转义，配合 `ESCAPE '\'` 使用。
+ *
+ * 不转义的后果是具体的：自动采集的 source 形如 `auto:chat#ab_cd12ef-t0`，
+ * 里面的 `_` 会被当单字符通配符，`bySourcePrefix('auto:chat#ab_cd')` 就会把
+ * `auto:chat#abXcd` 也算进去。前缀查询必须逐字，不是「差不多」。
+ */
+export function escapeLikePattern(value) {
+  return String(value ?? '').replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/** 只读查询的 limit 归一化：非有限值回落 fallback，其余钳到 1..max。 */
+function clampQueryLimit(limit, fallback = 50, max = 10000) {
+  const n = Number(limit);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(1, Math.trunc(n)));
+}
+
 /**
  * 库体上限的**旧默认值**（SPEC 能力 7 的 200KB 验收阈值）。
  * 保留导出是给测试与外部脚本用的常量；运行期上限走 open() 的 opts.storageLimitBytes，
@@ -438,9 +501,25 @@ CREATE TABLE IF NOT EXISTS memories (
   supersedes    TEXT,
   source        TEXT,
   -- 三分（v6）：person/promise/event。老库由 open() 的 ALTER TABLE 补齐并回填 'event'。
-  kind          TEXT NOT NULL DEFAULT 'event'
+  kind          TEXT NOT NULL DEFAULT 'event',
+  -- 层级（v7）：1..5，越小越靠前。老库由 open() 的 ALTER TABLE 补齐为 3，
+  -- 随后把 person/promise 兜底纠正成 1（见下面的 v6→v7 迁移）。
+  tier          INTEGER NOT NULL DEFAULT 3
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_hash ON memories(text_hash);
+CREATE TABLE IF NOT EXISTS memory_occurrences (
+  memory_id TEXT NOT NULL,
+  source TEXT,
+  document_id TEXT,
+  chapter INTEGER,
+  para INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_occurrences_position ON memory_occurrences
+  (memory_id, source IS NULL, coalesce(source, ''), document_id IS NULL,
+   coalesce(document_id, ''), chapter IS NULL, coalesce(chapter, 0), para IS NULL, coalesce(para, 0));
+CREATE TRIGGER IF NOT EXISTS memory_occurrences_delete AFTER DELETE ON memories BEGIN
+  DELETE FROM memory_occurrences WHERE memory_id = OLD.id;
+END;
 -- 向量：只在开启融合检索时写。**整库压成一行 BLOB**，不逐条建行。
 -- 逐行存 294 × (8B id + 64B int8) 实测要 +40960 B（SQLite 页与行头把 19KB 撑成 40KB），
 -- 直接顶穿 199680 的验收线；打包成一行的页开销只有一页。槽位按 memories.rowid 排，
@@ -482,18 +561,122 @@ export function open(dbPath = ':memory:', opts = {}) {
   if (!isMemory) fs.mkdirSync(path.dirname(file), { recursive: true });
 
   const db = new DatabaseSync(file);
+  try {
+  let scanningConflicts = false;
+  let readingInjectionSnapshot = false;
+  let storeFault = null;
+  function failStore(cause) {
+    if (storeFault) return storeFault.cause;
+    storeFault = new Error('store fault', { cause });
+    try {
+      if (typeof opts.onFault === 'function') opts.onFault(cause);
+    } catch (notification) {
+      const combined = new AggregateError([cause, notification], 'store fault notification failed', { cause });
+      storeFault = new Error('store fault', { cause: combined });
+      return combined;
+    }
+    return cause;
+  }
+  // Bounds apply to values crossing into JS, not SQLite execution resources.
+  function injectionSnapshot(options = {}) {
+    if (readingInjectionSnapshot || db.isTransaction) throw new Error('injection snapshot requires an idle connection');
+    readingInjectionSnapshot = true;
+    try {
+      const { maxRows = 1000, maxFieldBytes = 65536, maxBytes = 1048576 } = options;
+      for (const [name, value, ceiling] of [['maxRows', maxRows, 100000], ['maxFieldBytes', maxFieldBytes, 1048576], ['maxBytes', maxBytes, 16777216]]) {
+        if (!Number.isSafeInteger(value) || value < 0 || value > ceiling) throw new RangeError(`invalid ${name}`);
+      }
+      if (db.isTransaction) throw new Error('injection snapshot requires an idle connection');
+      const strings = ['id', 'text', 'source', 'kind'];
+      const checks = strings.map(c => `(typeof(${c}) = 'text' AND length(CAST(${c} AS BLOB)) <= $field)${c === 'source' ? " OR source IS NULL" : ''}`).map(s => `(${s})`).join(' AND ');
+      // Timestamps may be fractional; count must be an exactly representable nonnegative integer.
+      const numeric = ['created_at', 'last_accessed'].map(c => `(typeof(${c}) IN ('integer','real') AND ${c} BETWEEN -9007199254740991 AND 9007199254740991)`).concat([
+        "(typeof(access_count) IN ('integer','real') AND access_count BETWEEN 0 AND 9007199254740991 AND access_count = CAST(access_count AS INTEGER))",
+        "(typeof(importance) IN ('integer','real') AND importance BETWEEN 0 AND 1)",
+      ]).join(' AND ');
+      const bytes = strings.map(c => `coalesce(length(CAST(${c} AS BLOB)), 0)`).join(' + ');
+      const projected = strings.map(c => `CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN ${c} ELSE NULL END AS ${c}`).join(', ');
+      const sql = `WITH measured AS (
+        SELECT *, ROW_NUMBER() OVER (ORDER BY created_at, id) AS rn,
+          (${checks} AND ${numeric}) AS valid, (${bytes}) AS row_bytes
+        FROM memories
+      ), budgeted AS (
+        SELECT *, SUM(row_bytes) OVER (ORDER BY rn) AS total_bytes FROM measured
+      ) SELECT rn, valid, total_bytes, ${projected},
+        CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN created_at END AS created_at,
+        CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN last_accessed END AS last_accessed,
+        CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN access_count END AS access_count,
+        CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN importance END AS importance
+      FROM budgeted WHERE rn <= $rows + 1 ORDER BY rn`;
+      const rows = [];
+      let decodedBytes = 0;
+      let candidateBytes = 0;
+      for (const row of db.prepare(sql).iterate({ $rows: maxRows, $field: maxFieldBytes, $total: maxBytes })) {
+        if (row.rn > maxRows || !row.valid || row.total_bytes > maxBytes) return { complete: false, candidates: [] };
+        for (const field of strings) {
+          const value = row[field];
+          if (field === 'source' && value === null) continue;
+          if (typeof value !== 'string') return { complete: false, candidates: [] };
+          const size = Buffer.byteLength(value, 'utf8');
+          decodedBytes += size;
+          if (size > maxFieldBytes || decodedBytes > maxBytes) return { complete: false, candidates: [] };
+        }
+        const candidate = { id: row.id, text: row.text, source: row.source, kind: normalizeKind(row.kind), createdAt: row.created_at, lastAccessed: row.last_accessed, accessCount: row.access_count, importance: row.importance };
+        for (const field of strings) {
+          const size = Buffer.byteLength(candidate[field] ?? '', 'utf8');
+          candidateBytes += size;
+          if (size > maxFieldBytes || candidateBytes > maxBytes) return { complete: false, candidates: [] };
+        }
+        rows.push(candidate);
+      }
+      return { complete: true, candidates: rows };
+    } finally {
+      readingInjectionSnapshot = false;
+    }
+  }
+  // Cooperative read-only scan: raw() still exposes the same connection to trusted code.
+  function scanConflictsV2(options = {}) {
+    if (scanningConflicts || db.isTransaction) throw new Error('conflict scan requires an idle connection');
+    scanningConflicts = true;
+    let started = false, failure;
+    try {
+      const normalized = normalizeConflictScanOptions(options);
+      if (db.isTransaction) throw new Error('conflict scan requires an idle connection');
+      db.exec('BEGIN DEFERRED');
+      started = true;
+      return scanConflictConnectionV2(db, normalized);
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      try {
+        if (started) db.exec('ROLLBACK');
+      } catch (cleanup) {
+        if (failure !== undefined) throw new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure });
+        throw cleanup;
+      } finally {
+        scanningConflicts = false;
+      }
+    }
+  }
   const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
 
   // journal_mode=DELETE：关库后只剩单个 .db，字节统计不被 -wal 干扰
   if (!isMemory) db.exec('PRAGMA journal_mode = DELETE');
   db.exec(DDL);
+  db.exec(`BEGIN IMMEDIATE;
+    INSERT INTO memory_occurrences (memory_id, source)
+      SELECT id, source FROM memories
+      WHERE NOT EXISTS (SELECT 1 FROM meta WHERE k = 'occurrences_v1_migrated');
+    INSERT OR IGNORE INTO meta (k, v) VALUES ('occurrences_v1_migrated', '1');
+    COMMIT;`);
 
   // ── facts 内存派生层（v5：不落盘） ────────────────────────────────────────
   // 结构：byOrd（ord → Fact[]，供 factsOf/dump）与 slot（attr → [{ord,fact}]，
   // 供 (entity, attr) 存在性查询）。句子指针留在 fact 上，grounding 时回
   // memories.text 切片，不需要在库里再抄一份原文。
   const memFacts = { byOrd: new Map(), slot: new Map(), total: 0 };
-  function addMemFact(ord, f) {
+  function addMemFact(ord, f, target = memFacts) {
     const vtype = VTYPE[f.valueType ?? 'text'] ?? VTYPE.text;
     const fact = {
       entity: f.entity ?? null,
@@ -506,27 +689,107 @@ export function open(dbPath = ':memory:', opts = {}) {
       sent_off: f.sentOff ?? f.at ?? 0,
       sent_len: f.sentLen ?? 0,
     };
-    let list = memFacts.byOrd.get(ord);
-    if (!list) { list = []; memFacts.byOrd.set(ord, list); }
+    let list = target.byOrd.get(ord);
+    if (!list) { list = []; target.byOrd.set(ord, list); }
     list.push(fact);
-    memFacts.total += 1;
-    let slot = memFacts.slot.get(f.attr);
-    if (!slot) { slot = []; memFacts.slot.set(f.attr, slot); }
+    target.total += 1;
+    let slot = target.slot.get(f.attr);
+    if (!slot) { slot = []; target.slot.set(f.attr, slot); }
     slot.push({ ord, fact });
   }
-  function buildFactsFor(ord, text) {
+  function buildFactsFor(ord, text, target = memFacts) {
     const facts = extractL1(text);
-    for (const f of facts) addMemFact(ord, f);
+    for (const f of facts) addMemFact(ord, f, target);
     return facts.length;
+  }
+  // Bounds cover values crossing into JS, not SQLite scanning/sorting or CPU/memory.
+  // extractL1 creates one complete array per row: its peak depends on maxFieldBytes.
+  function contentSnapshot(options = {}) {
+    assertOpen();
+    if (db.isTransaction) throw new Error('content snapshot requires an idle connection');
+    const { maxRows = 1000, maxFieldBytes = 65536, maxBytes = 1048576, maxFacts = 10000, maxExtractBytes = 1048576 } = options;
+    for (const [name, value, ceiling] of [['maxRows', maxRows, 100000], ['maxFieldBytes', maxFieldBytes, 1048576], ['maxBytes', maxBytes, 16777216], ['maxFacts', maxFacts, 100000], ['maxExtractBytes', maxExtractBytes, 16777216]]) {
+      if (!Number.isSafeInteger(value) || value < 0 || value > ceiling) throw new RangeError(`invalid ${name}`);
+    }
+    if (db.isTransaction) throw new Error('content snapshot requires an idle connection');
+    const version = () => db.prepare('PRAGMA data_version').get().data_version;
+    const before = version();
+    let owned = false;
+    let failure;
+    let snapshot;
+    try {
+      db.exec('BEGIN DEFERRED');
+      owned = true;
+      const strings = ['id', 'text', 'text_hash', 'supersedes', 'source', 'kind'];
+      const nullable = new Set(['supersedes', 'source']);
+      const checks = strings.map(c => `((typeof(${c}) = 'text' AND length(CAST(${c} AS BLOB)) <= $field)${nullable.has(c) ? ` OR ${c} IS NULL` : ''})`).join(' AND ');
+      const numeric = ['created_at', 'last_accessed', 'access_count', 'importance', 'tier'].map(c => `(typeof(${c}) IN ('integer','real') AND ${c} BETWEEN -9007199254740991 AND 9007199254740991)`).join(' AND ');
+      const bytes = strings.map(c => `coalesce(length(CAST(${c} AS BLOB)), 0)`).join(' + ');
+      const fields = [...strings, 'created_at', 'last_accessed', 'access_count', 'importance', 'tier'];
+      const projection = fields.map(c => `CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN ${c} END AS ${c}`).join(', ');
+      const sql = `WITH measured AS (
+        SELECT rowid AS ord, ${fields.join(', ')}, ROW_NUMBER() OVER (ORDER BY created_at, id) AS rn,
+          (${checks} AND ${numeric} AND rowid BETWEEN 1 AND 9007199254740991) AS valid, (${bytes}) AS row_bytes
+        FROM memories
+      ), budgeted AS (
+        SELECT *, SUM(row_bytes) OVER (ORDER BY rn) AS total_bytes FROM measured
+      ) SELECT rn, valid, total_bytes, CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN ord END AS ord, ${projection}
+        FROM budgeted WHERE rn <= $rows + 1 ORDER BY rn`;
+      const rows = [];
+      const facts = { byOrd: new Map(), slot: new Map(), total: 0 };
+      let decodedBytes = 0, extractBytes = 0;
+      for (const row of db.prepare(sql).iterate({ $rows: maxRows, $field: maxFieldBytes, $total: maxBytes })) {
+        if (row.rn > maxRows || !row.valid || row.total_bytes > maxBytes) throw new RangeError('content snapshot limit exceeded');
+        for (const field of strings) {
+          const value = row[field];
+          if (value === null && nullable.has(field)) continue;
+          if (typeof value !== 'string') throw new RangeError('content snapshot invalid field');
+          const size = Buffer.byteLength(value, 'utf8');
+          decodedBytes += size;
+          if (size > maxFieldBytes || decodedBytes > maxBytes) throw new RangeError('content snapshot limit exceeded');
+        }
+        extractBytes += Buffer.byteLength(row.text, 'utf8');
+        if (extractBytes > maxExtractBytes) throw new RangeError('content snapshot extraction limit exceeded');
+        const extracted = extractL1(row.text);
+        if (facts.total + extracted.length > maxFacts) throw new RangeError('content snapshot facts limit exceeded');
+        for (const fact of extracted) addMemFact(row.ord, fact, facts);
+        const { rn, valid, total_bytes, ...content } = row;
+        rows.push(content);
+      }
+      snapshot = { rows, facts, dataVersion: before };
+    } catch (error) {
+      failure = error;
+    }
+    // BEGIN may have taken effect even when its wrapper throws.
+    if (owned || db.isTransaction) {
+      try { db.exec('ROLLBACK'); }
+      catch (cleanup) {
+        const cause = failure !== undefined
+          ? new AggregateError([failure, cleanup], 'content snapshot and cleanup failed', { cause: failure })
+          : cleanup;
+        throw failStore(cause);
+      }
+    }
+    if (db.isTransaction) {
+      const cleanup = new Error('content snapshot cleanup left an active transaction');
+      const cause = failure !== undefined
+        ? new AggregateError([failure, cleanup], 'content snapshot and cleanup failed', { cause: failure })
+        : cleanup;
+      throw failStore(cause);
+    }
+    if (failure !== undefined) throw failure;
+    if (version() !== before) throw new Error('content snapshot changed during read');
+    return snapshot;
   }
   /** 从 memories.text 全量重建内存 facts。返回 {facts, memories, ms} 以便打印耗时。 */
   function rebuildFacts(reason = 'startup') {
     const t0 = Date.now();
-    memFacts.byOrd.clear();
-    memFacts.slot.clear();
-    memFacts.total = 0;
+    const next = { byOrd: new Map(), slot: new Map(), total: 0 };
     const rows = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
-    for (const m of rows) buildFactsFor(m.ord, m.text);
+    for (const m of rows) buildFactsFor(m.ord, m.text, next);
+    memFacts.byOrd = next.byOrd;
+    memFacts.slot = next.slot;
+    memFacts.total = next.total;
     const ms = Date.now() - t0;
     const info = { facts: memFacts.total, memories: rows.length, ms, reason };
     // 重建耗时是 captain 要看的数字：磁盘库默认打一行到 stderr；
@@ -548,6 +811,22 @@ export function open(dbPath = ':memory:', opts = {}) {
   // 早期手改库或外部脚本可能把 kind 写成空/脏值；按「归 event 而不报错」的写入语义兜底。
   db.exec(`UPDATE memories SET kind = '${DEFAULT_MEMORY_KIND}'
     WHERE kind IS NULL OR kind NOT IN (${MEMORY_KINDS.map((k) => `'${k}'`).join(', ')})`);
+
+  // ── schema v6 → v7 迁移：memories 加 tier 列（记忆层级 1..5） ─────────────
+  // 手法与上面 kind 完全一致：列已在就跳过 ALTER，重复打开不会撞 duplicate column。
+  // NOT NULL DEFAULT 3 让 ALTER 就地给老行填 3（event 的中性档）。
+  // 紧随其后的 UPDATE 才是这套分层的立场：人 / 约恒 1。它兜的是两类行——
+  // ALTER 刚补出来的 person/promise（一律 3），以及早期手改库写脏的 tier。
+  // 幂等：条件里带 tier != 1，干净库上是空操作，重复打开不改一字节。
+  if (!memCols.includes('tier')) {
+    db.exec(`ALTER TABLE memories ADD COLUMN tier INTEGER NOT NULL DEFAULT ${MEMORY_TIER_EVENT}`);
+  }
+  db.exec(`UPDATE memories SET tier = ${MEMORY_TIER_PINNED}
+    WHERE kind IN ('person', 'promise') AND tier != ${MEMORY_TIER_PINNED}`);
+  // tier 越界的脏行（外部脚本写过 0 / 9）钳回 1..5：越界值会让 ORDER BY 把该淘汰的
+  // 顶到最前面。只碰越界行，正常行一个字节不动。
+  db.exec(`UPDATE memories SET tier = ${MEMORY_TIER_MAX} WHERE tier > ${MEMORY_TIER_MAX}`);
+  db.exec(`UPDATE memories SET tier = ${MEMORY_TIER_MIN} WHERE tier < ${MEMORY_TIER_MIN}`);
 
   // ── 表结构自检：CREATE TABLE IF NOT EXISTS 不会纠偏已存在的同名表 ──────────
   // segments 缺 bits（v2 的 '0'/'1' 字符串位图，或更早的「一段一行 (memory_id, seq)」
@@ -615,17 +894,21 @@ export function open(dbPath = ':memory:', opts = {}) {
     : STORAGE_LIMIT_BYTES;
 
   const stmt = {
-    byHash: db.prepare('SELECT id, text, kind FROM memories WHERE text_hash = ?'),
+    byHash: db.prepare('SELECT id, text, kind, tier FROM memories WHERE text_hash = ?'),
     byId: db.prepare('SELECT * FROM memories WHERE id = ?'),
     insMem: db.prepare(`INSERT INTO memories
-      (id, text, text_hash, created_at, last_accessed, access_count, importance, supersedes, source, kind)
-      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`),
+      (id, text, text_hash, created_at, last_accessed, access_count, importance, supersedes, source, kind, tier)
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`),
     touch: db.prepare('UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?'),
     setKind: db.prepare('UPDATE memories SET kind = ? WHERE id = ?'),
+    setTier: db.prepare('UPDATE memories SET tier = ? WHERE id = ?'),
+    insOccurrence: db.prepare(`INSERT OR IGNORE INTO memory_occurrences
+      (memory_id, source, document_id, chapter, para) VALUES (?, ?, ?, ?, ?)`),
     count: db.prepare('SELECT COUNT(*) AS n FROM memories'),
     countFacts: null, // 改为读内存 memFacts.total（见 stats）
     rowidOf: db.prepare('SELECT rowid AS ord FROM memories WHERE id = ?'),
     sizes: db.prepare('SELECT COALESCE(SUM(LENGTH(text)), 0) AS chars, COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) AS bytes FROM memories'),
+    budgetTexts: db.prepare('SELECT text FROM memories'),
     insSeg: db.prepare('INSERT OR IGNORE INTO segments (ord, bits) VALUES (?, ?)'),
     segRow: db.prepare(`SELECT m.id AS memory_id, s.bits
       FROM segments s JOIN memories m ON m.rowid = s.ord WHERE m.id = ?`),
@@ -633,11 +916,22 @@ export function open(dbPath = ':memory:', opts = {}) {
       FROM segments s JOIN memories m ON m.rowid = s.ord`),
     allBits: db.prepare('SELECT bits FROM segments'),
     coverMem: db.prepare('UPDATE segments SET bits = ? WHERE ord = (SELECT rowid FROM memories WHERE id = ?)'),
+    // ── 只读查询（ctx.provide 服务契约用） ──────────────────────────────────
+    // 与 list() 的区别：这两条**必须**带 text（下游要原文），且都限定返回形状与排序。
+    // ORDER BY created_at ASC 之后加 id 兜底：同毫秒写入的一批记忆（自动采集按轮
+    // 落库，created_at 常常相等）若不定二级序，两次查询的顺序可能不同。
+    bySourcePrefix: db.prepare(`SELECT id, text, kind, importance, created_at, source
+      FROM memories WHERE CASE WHEN ? = 1
+        THEN instr(CAST(source AS BLOB), CAST(? AS BLOB)) = 1
+        ELSE source LIKE ? ESCAPE '\\' END ORDER BY created_at ASC, id ASC LIMIT ?`),
+    byKind: db.prepare(`SELECT id, text, kind, importance, created_at, source
+      FROM memories WHERE kind = ? ORDER BY created_at ASC, id ASC LIMIT ?`),
   };
 
   let closed = false;
   const assertOpen = () => {
     if (closed) throw new Error('store 已关闭');
+    if (storeFault) throw storeFault;
   };
 
   function factsOf(id) {
@@ -752,9 +1046,11 @@ export function open(dbPath = ':memory:', opts = {}) {
    *
    * @param {{text:string, id?:string, chapter?:number, para?:number, createdAt?:number,
    *          importance?:number, supersedes?:string|string[]|null, source?:string,
-   *          kind?:'person'|'promise'|'event'}} input
+   *          kind?:'person'|'promise'|'event', tier?:number}} input
    *   kind 非法或缺省一律归 'event'：分类标签写错不该让一条内容正确的记忆写不进来。
-   * @returns {{id:string, inserted:boolean, factCount:number}}
+   *   tier 缺省由 kind 决定（person/promise→1，event→3）；显式传值只对 event 生效，
+   *   人 / 约无论传什么都被钳回 1（见 normalizeTier）。
+   * @returns {{id:string, inserted:boolean, factCount:number, kind:string, tier:number}}
    */
   function put(input = {}) {
     assertOpen();
@@ -762,9 +1058,20 @@ export function open(dbPath = ':memory:', opts = {}) {
     if (typeof text !== 'string' || text.length === 0) {
       throw new TypeError('put: text 必须是非空字符串');
     }
+    if (hasUnpairedSurrogate(text)) throw new TypeError('put: text contains unpaired UTF-16 surrogate');
     const hash = hashText(text);
+    const source = input.source == null ? null : String(input.source);
+    const documentId = input.documentId == null ? null : String(input.documentId);
+    const chapter = Number.isSafeInteger(input.chapter) ? input.chapter : null;
+    const para = Number.isSafeInteger(input.para) ? input.para : null;
     const kindGiven = input.kind != null && input.kind !== '';
     const kind = normalizeKind(input.kind);
+    // 「是否显式传 tier」单独判：幂等命中只在这一个条件成立时才改已有行，
+    // 否则一次不关心 tier 的重写就会把 nightly 算出来的层级静默抹掉。
+    const tierGiven = input.tier != null && input.tier !== '' && Number.isFinite(Number(input.tier));
+    const tier = tierGiven ? normalizeTier(input.tier, kind) : defaultTier(kind);
+    db.exec('BEGIN IMMEDIATE');
+    try {
     const hit = stmt.byHash.get(hash);
     if (hit) {
       // 哈希相同但正文不同 → 撞了，宁可炸也不写坏数据
@@ -773,13 +1080,26 @@ export function open(dbPath = ':memory:', opts = {}) {
       // 说它是 person 时，归属必须能改回来，否则三分永远追不上真实语义。
       // 这是「不产生新行」的幂等，不是「永不更新任何列」。
       if (kindGiven && kind !== hit.kind) stmt.setKind.run(kind, hit.id);
-      return { id: hit.id, inserted: false, factCount: factsOf(hit.id).length, kind: kindGiven ? kind : normalizeKind(hit.kind) };
+      // tier 同一条规矩：只有显式传了才纠正。kind 被改成 person 而 tier 没显式传时，
+      // 这里也不顺手把它钉到 1——那是 open() 迁移与 nightly 的职责，写入侧不猜。
+      if (tierGiven && tier !== Number(hit.tier)) stmt.setTier.run(tier, hit.id);
+      if (input.recordDuplicateOccurrence !== false) stmt.insOccurrence.run(hit.id, source, documentId, chapter, para);
+      const factCount = factsOf(hit.id).length;
+      db.exec('COMMIT');
+      return {
+        id: hit.id,
+        inserted: false,
+        factCount,
+        kind: kindGiven ? kind : normalizeKind(hit.kind),
+        tier: tierGiven ? tier : normalizeTier(hit.tier, kindGiven ? kind : hit.kind),
+      };
     }
 
     // ── memento 预算硬拒绝：幂等命中之后再查预算，超限抛 BUDGET_EXCEEDED ──
     // 语义：库满即拒写，绝不截断这条 text、绝不静默丢。预算单位是 text.length。
     if (maxChars > 0) {
-      const used = stmt.sizes.get().chars;
+      let used = 0;
+      for (const row of stmt.budgetTexts.iterate()) used += row.text.length;
       const verdict = checkBudget(used, maxChars, text.length);
       if (!verdict.ok) throw new BudgetExceededError(verdict);
     }
@@ -790,20 +1110,18 @@ export function open(dbPath = ':memory:', opts = {}) {
     const supersedes = input.supersedes == null
       ? null
       : JSON.stringify(Array.isArray(input.supersedes) ? input.supersedes : [input.supersedes]);
-    const source = input.source == null ? null : String(input.source);
-
-    db.exec('BEGIN');
-    try {
-      const ord = Number(stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source, kind).lastInsertRowid);
+      const ord = Number(stmt.insMem.run(id, text, hash, createdAt, createdAt, importance, supersedes, source, kind, tier).lastInsertRowid);
+      stmt.insOccurrence.run(id, source, documentId, chapter, para);
       // retcon 不可变原文层：机械切段落 segments，与原文同事务。段文本不复制
       // 整条的存储开销——落盘的只有段数与覆盖位图（BLOB，8 段/字节）。
       const segs = splitSegments(text);
       stmt.insSeg.run(ord, packCovered(segs.length));
       const factCount = buildFactsFor(ord, text);
       db.exec('COMMIT');
-      return { id, inserted: true, factCount, segmentCount: segs.length, kind };
+      return { id, inserted: true, factCount, segmentCount: segs.length, kind, tier };
     } catch (err) {
       db.exec('ROLLBACK');
+      rebuildFacts('put rollback');
       throw err;
     }
   }
@@ -828,9 +1146,76 @@ export function open(dbPath = ':memory:', opts = {}) {
     const limit = Number.isFinite(opts2.limit) ? opts2.limit : -1;
     const offset = Number.isFinite(opts2.offset) ? opts2.offset : 0;
     const dir = opts2.order === 'desc' ? 'DESC' : 'ASC';
-    const cols = opts2.includeText ? '*' : 'id, text_hash, created_at, last_accessed, access_count, importance, supersedes, source, kind';
+    const cols = opts2.includeText
+      ? '*'
+      : 'id, text_hash, created_at, last_accessed, access_count, importance, supersedes, source, kind, tier';
     return db.prepare(`SELECT ${cols} FROM memories ORDER BY created_at ${dir}, id ${dir} LIMIT ? OFFSET ?`).all(limit, offset)
-      .map((r) => ({ ...r, kind: normalizeKind(r.kind), supersedes: r.supersedes ? JSON.parse(r.supersedes) : null }));
+      .map((r) => ({
+        ...r,
+        kind: normalizeKind(r.kind),
+        // tier 归一化后再出：库里的脏值（越界 / NULL）不该漏到调用方。
+        tier: normalizeTier(r.tier, r.kind),
+        supersedes: r.supersedes ? JSON.parse(r.supersedes) : null,
+      }));
+  }
+
+  /** SELECT 行 → 对外形状（列名驼峰化，kind 归一化）。只读查询共用。 */
+  const shapeRow = (r) => ({
+    id: r.id,
+    text: r.text,
+    kind: normalizeKind(r.kind),
+    importance: Number(r.importance) || 0,
+    createdAt: Number(r.created_at) || 0,
+    source: r.source == null ? null : r.source,
+  });
+
+  /**
+   * 按 source 前缀取（只读，按 created_at 升序）。
+   *
+   * 用途：自动采集写的是 `auto:chat#<会话>#t<轮>` 形态的 source，下游要「这次会话
+   * 新增了哪些记忆」只能靠前缀。前缀做 LIKE 转义（见 escapeLikePattern），否则
+   * 会话 token 里的 `_` 会变成通配符。
+   *
+   * limit 缺省 50、钳到 1..10000；非有限值（含 Infinity）回落缺省值而不是全量。
+   */
+  function bySourcePrefix(prefix, limit = 50) {
+    assertOpen();
+    const n = clampQueryLimit(limit);
+    const p = String(prefix ?? '');
+    const v2 = p.startsWith('auto:chat:v2#');
+    const pattern = v2 ? null : `${escapeLikePattern(p)}%`;
+    return stmt.bySourcePrefix.all(v2 ? 1 : 0, p, pattern, n).map(shapeRow);
+  }
+
+  // Versioned separately from the legacy single-source query.
+  function occurrencesV1(memoryId) {
+    assertOpen();
+    return db.prepare(`SELECT memory_id AS memoryId, source, document_id AS documentId, chapter, para
+      FROM memory_occurrences WHERE memory_id = ? ORDER BY rowid`).all(String(memoryId));
+  }
+
+  function bySourcePrefixV1(prefix, limit = 50) {
+    assertOpen();
+    const p = String(prefix ?? '');
+    const v2 = p.startsWith('auto:chat:v2#');
+    return db.prepare(`SELECT m.id, m.text, m.kind, m.importance, m.created_at,
+      o.source, o.document_id AS documentId, o.chapter, o.para
+      FROM memory_occurrences o JOIN memories m ON m.id = o.memory_id
+      WHERE CASE WHEN ? = 1 THEN instr(CAST(o.source AS BLOB), CAST(? AS BLOB)) = 1
+        ELSE o.source LIKE ? ESCAPE '\\' END
+      ORDER BY m.created_at, m.id, o.rowid LIMIT ?`)
+      .all(v2 ? 1 : 0, p, v2 ? null : `${escapeLikePattern(p)}%`, clampQueryLimit(limit))
+      .map((r) => ({ ...shapeRow(r), documentId: r.documentId, chapter: r.chapter, para: r.para }));
+  }
+
+  /**
+   * 按 kind 取（只读，按 created_at 升序）。非法 kind 归 'event'——与写入路径
+   * 同一口径（normalizeKind），不因为下游传了脏值就返回空表。
+   */
+  function byKind(kind, limit = 50) {
+    assertOpen();
+    const n = clampQueryLimit(limit);
+    return stmt.byKind.all(normalizeKind(kind), n).map(shapeRow);
   }
 
   /** 命中即刷新：last_accessed = now，access_count + 1 */
@@ -839,6 +1224,36 @@ export function open(dbPath = ':memory:', opts = {}) {
     const t = Number.isFinite(when) ? when : now();
     stmt.touch.run(t, id);
     return get(id, false);
+  }
+
+  function touchSnapshot(ids, when, version, generation) {
+    assertOpen();
+    if (db.isTransaction) throw new Error('snapshot touch requires an idle connection');
+    let committing = false;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      if (generation() !== version.generation || db.prepare('PRAGMA data_version').get().data_version !== version.dataVersion) {
+        throw new Error('snapshot view stale');
+      }
+      for (const id of new Set(ids)) {
+        if (stmt.touch.run(when, id).changes !== 1) throw new Error('snapshot view stale');
+      }
+      committing = true;
+      db.exec('COMMIT');
+      committing = false;
+      if (db.isTransaction) throw new Error('snapshot touch commit left an active transaction');
+    } catch (error) {
+      let failure = error;
+      if (db.isTransaction) {
+        try { db.exec('ROLLBACK'); }
+        catch (cleanup) { failure = new AggregateError([error, cleanup], 'snapshot touch cleanup failed', { cause: error }); committing = true; }
+      }
+      if (db.isTransaction || committing) throw failStore(failure);
+      throw failure;
+    }
+    if (generation() !== version.generation || db.prepare('PRAGMA data_version').get().data_version !== version.dataVersion) {
+      throw new Error('snapshot view stale');
+    }
   }
 
   /** 全量导出，按写入顺序。text 原样返回，供逐字往返校验 */
@@ -864,6 +1279,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       supersededBy: supersededBy.get(r.id) ?? null,
       source: r.source,
       kind: normalizeKind(r.kind),
+      tier: normalizeTier(r.tier, r.kind),
       facts: factsOf(r.id),
     }));
   }
@@ -893,6 +1309,19 @@ export function open(dbPath = ':memory:', opts = {}) {
     return out;
   }
 
+  /**
+   * 各 tier 的条数，键是 '1'..'5'（数值键在 JS 对象里就是字符串键）。
+   * 越界 / NULL 按 normalizeTier 并入边界档：统计口径必须与写入、排序一致，
+   * 否则 nightly 打印的「下沉 N 条」会和这里的分布对不上。
+   */
+  function tierCounts() {
+    const out = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+    for (const row of db.prepare('SELECT tier, kind, COUNT(*) AS n FROM memories GROUP BY tier, kind').all()) {
+      out[normalizeTier(row.tier, row.kind)] += Number(row.n) || 0;
+    }
+    return out;
+  }
+
   function stats() {
     assertOpen();
     const s = stmt.sizes.get();
@@ -900,6 +1329,7 @@ export function open(dbPath = ':memory:', opts = {}) {
     return {
       memories: stmt.count.get().n,
       kinds: kindCounts(),
+      tiers: tierCounts(),
       facts: memFacts.total,
       textChars: s.chars,
       textBytes: s.bytes,
@@ -1005,15 +1435,22 @@ export function open(dbPath = ':memory:', opts = {}) {
     return { segments: total, worn, wear: Number((worn / total).toFixed(4)) };
   }
 
-  return {
+  const api = {
     path: file,
     put,
     get,
     list,
+    bySourcePrefix,
+    occurrencesV1,
+    bySourcePrefixV1,
+    byKind,
     updateAccess,
+    touchSnapshot,
     dump,
     bytes,
     stats,
+    /** tier 分布（1..5 的条数），nightly 与面板共用这一份口径。 */
+    tierCounts,
     compact,
     rebuildFacts,
     rebuildFactsHybrid,
@@ -1036,10 +1473,25 @@ export function open(dbPath = ':memory:', opts = {}) {
     coverSegments,
     wear,
     maxChars,
+    scanConflictsV2,
+    injectionSnapshot,
+    contentSnapshot,
     close,
     /** 直接拿底层连接做诊断查询（只读用法） */
     raw: () => db,
   };
+  for (const [name, fn] of Object.entries(api)) {
+    if (typeof fn === 'function' && name !== 'close' && name !== 'raw') {
+      api[name] = (...args) => { assertOpen(); return fn(...args); };
+    }
+  }
+  return api;
+  } catch (err) {
+    // Initialization can fail with or without an active transaction.
+    try { db.exec('ROLLBACK'); } catch {}
+    try { db.close(); } catch {}
+    throw err;
+  }
 }
 
 export default {
@@ -1050,6 +1502,15 @@ export default {
   MEMORY_KINDS,
   DEFAULT_MEMORY_KIND,
   normalizeKind,
+  MEMORY_TIER_PINNED,
+  MEMORY_TIER_EVENT,
+  MEMORY_TIER_MIN,
+  MEMORY_TIER_MAX,
+  defaultTier,
+  normalizeTier,
+  TIER_IDLE_DAYS,
+  TIER_PROMOTE_ACCESS,
+  escapeLikePattern,
   entryUsage,
   checkBudget,
   BudgetExceededError,

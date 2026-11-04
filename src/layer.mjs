@@ -22,6 +22,16 @@
 //      关系补全。每阶段独立包裹，一个失败不拖垮其他。跨 scope 对永远人工审，不进 LLM。
 
 import { norm, splitSentences, extractQuantities, extractFacts, resolveConflict, decayWeight, fitBudget, CONFLICT_THRESHOLDS } from './judge.mjs';
+// tier 的口径（默认值、钳位、升降阈值）只有一份真源，在 store.mjs 里与列定义同处。
+// 依赖方向是单向的：layer → store（store 不认识 layer），不会成环。
+import {
+  normalizeKind,
+  normalizeTier,
+  MEMORY_TIER_PINNED,
+  MEMORY_TIER_MAX,
+  TIER_IDLE_DAYS,
+  TIER_PROMOTE_ACCESS,
+} from './store.mjs';
 
 // ── soul-md 索引（queryTerms + searchTopics + renderRecall） ──────────────
 // soul-md 的索引设计：只给模型看 descriptor rows（key + title + summary），
@@ -169,21 +179,34 @@ export function searchGraphNodes(nodes, query, limit = 10) {
 //      要么由 LLM 裁决（winner kept / loser archived）。跨 scope 对永远人工审。
 //   2. archival demotion — 超过 sleepArchiveDays 未被引用的记忆缩成一行摘要，
 //      全文移到 _full_content；超过 sleepCompressDays 直接归档。
+//      memjudge 的最小版把它拆成两个提案：archived（材料多老了）与 tierWrites（该不该
+//      换层级）。两者都只出提案，落库只在 scripts/nightly.mjs --apply。
 //   3. pattern discovery — LLM 扫描最近的记忆，生成 type=pattern 条目。
 //   4. relation completion — 孤儿实体（零关系）从记忆共现补全隐含关系。
 // 每阶段独立包裹，一个失败不拖垮其他。AbortController signal 可中断。
 
 /**
- * 后台整理四阶段：冲突消解 → 归档降级 → 模式发现 → 关系补全。
+ * 后台整理四阶段：冲突消解 → 层级提案 → 模式发现 → 关系补全。
  * 与 mneme 的 sleep 同构，但 memjudge 没有 LLM 路由，用确定性规则回退。
  *
- * @param {Array<{id:string,text:string,createdAt?:number,ch?:number,scope?:string}>} memories
- * @param {{conflictMode?: 'gentle'|'normal'|'aggressive', archiveDays?: number, compressDays?: number, llm?: Function}} [opts]
- * @returns {{conflicts: Array, archived: Array, patterns: Array, relations: Array, errors: Array}}
+ * **本函数不写库**：四个阶段产出的都是「提案」。谁落库由调用方决定——
+ * 目前唯一的落库入口是 scripts/nightly.mjs 的 --apply，且默认是 dry-run。
+ * 早期版本让 archived 看起来像「已经归档了」，那是误导：函数是纯的，
+ * 报告不能假装动作已经发生。
+ *
+ * @param {Array<{id:string,text:string,createdAt?:number,ch?:number,scope?:string,
+ *          kind?:string,tier?:number,lastAccessed?:number,accessCount?:number}>} memories
+ * @param {{conflictMode?: 'gentle'|'normal'|'aggressive', archiveDays?: number,
+ *          compressDays?: number, llm?: Function, tierRows?: Array, now?: number}} [opts]
+ *   tierRows：逐条的库行（store.dump() 的形状，含 kind/tier/lastAccessed/accessCount）。
+ *   冲突阶段要的是「按章合并且文本」，tier 阶段要的是「逐条」，两者输入形状不同，
+ *   所以分开传；不给 tierRows 时退回 memories 自身（纯函数调用方的默认）。
+ * @returns {{conflicts: Array, archived: Array, tierWrites: Array, patterns: Array,
+ *   relations: Array, errors: Array}}
  */
 export function sleepPhase(memories, opts = {}) {
   const errors = [];
-  const results = { conflicts: [], archived: [], patterns: [], relations: [], errors };
+  const results = { conflicts: [], archived: [], tierWrites: [], patterns: [], relations: [], errors };
 
   // Phase 1: 冲突消解
   try {
@@ -193,21 +216,69 @@ export function sleepPhase(memories, opts = {}) {
     errors.push({ phase: 'conflict', error: e.message });
   }
 
-  // Phase 2: 归档降级（超过 archiveDays 未被引用的记忆缩成摘要）
+  // Phase 2: 归档降级**提案**（超过 archiveDays 未被引用的记忆缩成摘要）
+  // 注意 age 的口径是 createdAt：这一阶段问的是「这条材料多老了」（该不该压缩成摘要），
+  // 与 Phase 2b 问的「多久没被用到」是两个问题，别混。
   try {
     const archiveDays = opts.archiveDays ?? 30;
     const compressDays = opts.compressDays ?? 90;
-    const now = Date.now();
+    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
     for (const mem of memories) {
       const age = (now - (mem.createdAt ?? mem.ch ?? 0)) / 86400000;
       if (age > compressDays) {
-        results.archived.push({ id: mem.id, action: 'archive', age: Math.round(age) });
+        results.archived.push({ id: mem.id, action: 'archive', age: Math.round(age), proposal: true });
       } else if (age > archiveDays) {
-        results.archived.push({ id: mem.id, action: 'demote', age: Math.round(age) });
+        results.archived.push({ id: mem.id, action: 'demote', age: Math.round(age), proposal: true });
       }
     }
   } catch (e) {
     errors.push({ phase: 'archive', error: e.message });
+  }
+
+  // Phase 2b: 层级升降**提案**（描述「将要写什么」，一个字节都不落库）
+  //
+  // 两条规则的互斥关系是有意定的：一条命中过 TIER_PROMOTE_ACCESS 次以上的 event
+  // 不参与下沉，即使它 30 天没被读。「最近没读」远弱于「被反复读过」——
+  // 让前者把后者摁下去，这套分层就退化成只看最后访问时间的 LRU。
+  // 人 / 约连算都不算：恒 1 是结构保证（写入侧 normalizeTier 也钉死了）。
+  try {
+    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+    const rows = Array.isArray(opts.tierRows) && opts.tierRows.length ? opts.tierRows : memories;
+    for (const row of rows) {
+      const id = row?.id;
+      if (!id) continue;
+      const kind = normalizeKind(row.kind);
+      const tier = normalizeTier(row.tier, kind);
+      if (kind === 'person' || kind === 'promise') {
+        if (tier !== MEMORY_TIER_PINNED) {
+          results.tierWrites.push({ id, kind, action: 'pin', from: tier, to: MEMORY_TIER_PINNED, reason: '人/约恒 1' });
+        }
+        continue;
+      }
+      const lastAccess = Number.isFinite(row.lastAccessed)
+        ? row.lastAccessed
+        : Number.isFinite(row.last_accessed)
+          ? row.last_accessed
+          : (Number.isFinite(row.createdAt) ? row.createdAt : now);
+      const accessCount = Number(row.accessCount ?? row.access_count ?? 0) || 0;
+      const idleDays = (now - lastAccess) / 86400000;
+      if (accessCount >= TIER_PROMOTE_ACCESS && tier > MEMORY_TIER_PINNED) {
+        results.tierWrites.push({
+          id, kind, action: 'promote', from: tier, to: tier - 1, reason: `命中 ${accessCount} 次`,
+        });
+      } else if (accessCount < TIER_PROMOTE_ACCESS && idleDays > TIER_IDLE_DAYS && tier < MEMORY_TIER_MAX) {
+        results.tierWrites.push({
+          id,
+          kind,
+          action: 'demote',
+          from: tier,
+          to: Math.min(MEMORY_TIER_MAX, tier + 1),
+          reason: `距上次命中 ${Math.round(idleDays)} 天`,
+        });
+      }
+    }
+  } catch (e) {
+    errors.push({ phase: 'tier', error: e.message });
   }
 
   // Phase 3: 模式发现（LLM 扫描最近记忆，生成 pattern 条目）

@@ -16,8 +16,8 @@
 //   - secrets.json 旧形状 {llmKey} 读时视为 chatKey；新写入用 {chatKey, embedKey, rerankKey}。
 //   - 旧 env MEMJUDGE_LLM_KEY / MEMJUDGE_LLM_BASE_URL 视为 chat 组的值。
 //   - config.json 旧键 baseUrl 视为 chatBaseUrl。
-//   - embed / rerank 未单独配置时**继承 chat 组**的 baseUrl 与 key：老用户一个 key、
-//     一个端点，升级后行为不变。继承是显式的（inherited: true），不会被当成用户显式设置。
+//   - 旧配置未选择模式时以 legacy 状态保持原行为，来源 legacy-inherit 可见。
+//   - 新配置按组独立；inherit 只由用户显式选择，disabled 优先于环境密钥。
 
 import { existsSync, readFileSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -250,6 +250,45 @@ function resolveModelName(group, cfg) {
   return { value: spec.modelDefault, source: 'default', inherited: false };
 }
 
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+function modelMode(group, cfg, sec) {
+  const mode = cfg[`${group}Mode`];
+  if (['legacy', 'independent', 'disabled', ...(group === 'chat' ? [] : ['inherit'])].includes(mode)) return mode;
+  const legacy = Object.keys(GROUP_SPEC).some(g => {
+    const s = GROUP_SPEC[g];
+    return hasOwn(cfg, s.baseUrlKey) || hasOwn(cfg, s.modelKey) || hasOwn(sec, s.secretKey);
+  }) || hasOwn(cfg, 'baseUrl') || hasOwn(sec, 'llmKey') || envFirst(['MEMJUDGE_LLM_KEY', 'MEMJUDGE_LLM_BASE_URL']) !== null;
+  return legacy ? 'legacy' : 'independent';
+}
+
+function resolveGroup(group, cfg, sec, groups) {
+  const spec = GROUP_SPEC[group];
+  const mode = modelMode(group, cfg, sec);
+  const field = (kind, names, obj, key) => {
+    const env = envFirst(names);
+    if (env) return { value: kind === 'baseUrl' ? stripSlash(env.value) : env.value, source: 'env', envName: env.envName };
+    if (mode === 'legacy') {
+      const value = kind === 'baseUrl' ? resolveBaseUrl(group, cfg, groups)
+        : kind === 'key' ? resolveKey(group, sec, groups) : resolveModelName(group, cfg);
+      if (value.source === 'inherit') {
+        value.source = 'legacy-inherit';
+        value.inheritedEnv = groups.chat[kind].envName ?? null;
+      }
+      return value;
+    }
+    if (mode === 'inherit' && kind !== 'model') {
+      const from = groups.chat[kind];
+      return { value: from.value, source: 'inherit', inherited: true, inheritedEnv: from.envName ?? null };
+    }
+    const legacyKey = group === 'chat' ? (kind === 'key' ? 'llmKey' : kind === 'baseUrl' ? 'baseUrl' : '') : '';
+    const value = hasOwn(obj, key) ? asText(obj[key]) : legacyKey && hasOwn(obj, legacyKey) ? asText(obj[legacyKey]) : kind === 'model' ? spec.modelDefault : '';
+    return { value: kind === 'baseUrl' ? stripSlash(value) : value, source: hasOwn(obj, key) || (legacyKey && hasOwn(obj, legacyKey)) ? (kind === 'key' ? 'secrets.json' : 'config') : (kind === 'model' ? 'default' : 'none') };
+  };
+  return { mode, baseUrl: field('baseUrl', spec.baseUrlEnv, cfg, spec.baseUrlKey),
+    key: field('key', spec.keyEnv, sec, spec.secretKey), model: field('model', spec.modelEnv, cfg, spec.modelKey) };
+}
+
 let cache = null;
 
 /**
@@ -291,11 +330,7 @@ function load() {
   const groups = {};
   // chat 必须最先解：embed / rerank 的继承源是它的**生效值**（可能来自 env / 旧键 / 默认）
   for (const group of CRED_GROUPS) {
-    groups[group] = {
-      baseUrl: resolveBaseUrl(group, cfg, groups),
-      key: resolveKey(group, sec, groups),
-      model: resolveModelName(group, cfg),
-    };
+    groups[group] = resolveGroup(group, cfg, sec, groups);
   }
   cache = {
     envSig: sig,
@@ -339,6 +374,7 @@ function groupOf(group) {
 
 function keyOf(group) {
   const g = normalizeGroup(group);
+  if (groupOf(g).mode === 'disabled') return '';
   if (keyOverrides.has(g)) return keyOverrides.get(g);
   return groupOf(g).key.value;
 }
@@ -391,6 +427,13 @@ export function groupReport(group) {
   const keyValue = keyOf(g);
   const keySourceValue = keyOverrides.has(g) ? 'override' : grp.key.source;
   return {
+    mode: grp.mode,
+    migrationRequired: grp.mode === 'legacy',
+    enabled: grp.mode !== 'disabled',
+    keyEnv: grp.key.envName ?? null,
+    baseUrlEnvLocked: Boolean(grp.baseUrl.envName),
+    modelEnvLocked: Boolean(grp.model.envName),
+    inheritedEnv: { baseUrl: grp.baseUrl.inheritedEnv ?? null, key: grp.key.inheritedEnv ?? null },
     baseUrl: grp.baseUrl.value,
     baseUrlSource: grp.baseUrl.source,           // env | config | inherit | default
     baseUrlInherited: grp.baseUrl.inherited === true,
@@ -428,7 +471,16 @@ export function credSpec() {
 export function saveConfig(patch) {
   mkdirSync(STATE_DIR, { recursive: true });
   const cur = readJson(CONFIG_PATH);
+  const sec = process.env.MEMJUDGE_NO_SECRETS === '1' ? {} : readJson(SECRETS_PATH);
   const next = { ...cur, ...(patch || {}) };
+  for (const g of CRED_GROUPS) {
+    const s = GROUP_SPEC[g];
+    const previousMode = modelMode(g, cur, sec);
+    if (!hasOwn(next, `${g}Mode`)) next[`${g}Mode`] = previousMode;
+    const touched = patch && (hasOwn(patch, s.baseUrlKey) || hasOwn(patch, s.modelKey));
+    if (touched && !hasOwn(patch, `${g}Mode`) && (previousMode === 'legacy' || (previousMode === 'inherit' && patch[s.baseUrlKey] === ''))) next[`${g}Mode`] = 'independent';
+    if (g === 'chat' && touched && !hasOwn(next, s.baseUrlKey) && hasOwn(cur, 'baseUrl')) next[s.baseUrlKey] = cur.baseUrl;
+  }
   writeFileSync(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
   cache = null;
   return next;
@@ -443,10 +495,15 @@ export function saveKey(group, key) {
   const g = normalizeGroup(group);
   const spec = GROUP_SPEC[g];
   mkdirSync(STATE_DIR, { recursive: true });
-  const next = { ...readJson(SECRETS_PATH) };
+  const cfg = readJson(CONFIG_PATH);
+  const oldSec = readJson(SECRETS_PATH);
+  const modes = Object.fromEntries(CRED_GROUPS.map(name => [`${name}Mode`, modelMode(name, cfg, process.env.MEMJUDGE_NO_SECRETS === '1' ? {} : oldSec)]));
+  if (modes[`${g}Mode`] === 'legacy' || (modes[`${g}Mode`] === 'inherit' && !String(key || '').trim())) modes[`${g}Mode`] = 'independent';
+  saveConfig(modes);
+  const next = { ...oldSec };
   if (Object.prototype.hasOwnProperty.call(next, LEGACY_SECRET_KEY)) {
     const legacy = asText(next[LEGACY_SECRET_KEY]);
-    if (legacy && !asText(next.chatKey)) next.chatKey = legacy;
+    if (legacy && !hasOwn(next, 'chatKey')) next.chatKey = legacy;
     delete next[LEGACY_SECRET_KEY];
   }
   const k = String(key || '').trim();

@@ -8,7 +8,7 @@
 //   2. grounding：LLM 给的 sent 必须在原文里逐字 indexOf 得到，否则整条丢弃并计数。
 //   3. 缓存按 text 的 sha256 去重，同一段文本永不重复调用（文本改了 hash 就变）。
 
-import { chatKey } from './config.mjs';
+import { chatKey, groupReport } from './config.mjs';
 import { chat, resolveModel } from './llm-client.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -174,10 +174,13 @@ export async function extractBatch(entries, opts = {}) {
   });
 
   for (let p = 0; p < pending.length; p += BATCH_SIZE) {
+    if (!groupReport('chat').enabled) break;
     const idxs = pending.slice(p, p + BATCH_SIZE);
     const texts = idxs.map((i) => entries[i].text);
     let parsed = null;
     for (let attempt = 0; attempt < 2 && !parsed; attempt += 1) {
+      // A settled request may have observed a saved disable while awaiting I/O.
+      if (!groupReport('chat').enabled) break;
       try {
         if (attempt > 0) llmStats.retries += 1;
         llmStats.calls += 1;

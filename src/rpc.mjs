@@ -54,7 +54,8 @@ const MAX_CHARS_MAX = 1e8;
 const BASE_URL_KEYS = ['chatBaseUrl', 'embedBaseUrl', 'rerankBaseUrl'];
 const MODEL_KEYS = ['chatModel', 'embedModel', 'rerankModel'];
 /** 九项值型设置白名单：与 config.mjs 的 SETTING_ENV 一一对应。 */
-const SETTING_KEYS = [...BASE_URL_KEYS, ...MODEL_KEYS, 'dims', 'storageLimitBytes', 'maxChars'];
+const MODE_KEYS = CRED_GROUPS.map(g => `${g}Mode`);
+const SETTING_KEYS = [...BASE_URL_KEYS, ...MODEL_KEYS, ...MODE_KEYS, 'dims', 'storageLimitBytes', 'maxChars'];
 
 /**
  * 旧面板兼容别名：client.js 未同步改造前只发 baseUrl 与 chatModel 这类旧键。
@@ -91,7 +92,12 @@ function validateSettings(settings) {
     const raw = src[key];
     if (typeof raw !== 'string') return { error: `${key}：必须是字符串` };
     const trimmed = raw.trim().replace(/\/+$/, '');
-    if (!/^https?:\/\//i.test(trimmed)) return { error: `${key}：必须以 http:// 或 https:// 开头` };
+    if (trimmed) {
+      try {
+        const url = new URL(trimmed);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error();
+      } catch { return { error: `${key}：需要无凭据、查询和片段的 HTTP(S) 地址` }; }
+    }
     if (trimmed.length > BASE_URL_CAP) return { error: `${key}：长度不能超过 ${BASE_URL_CAP} 字符` };
     out[key] = trimmed;
   }
@@ -101,9 +107,15 @@ function validateSettings(settings) {
     const raw = src[key];
     if (typeof raw !== 'string') return { error: `${key}：必须是字符串` };
     const trimmed = raw.trim();
-    if (!trimmed) return { error: `${key}：不能为空` };
     if (trimmed.length > MODEL_TEXT_CAP) return { error: `${key}：长度不能超过 ${MODEL_TEXT_CAP} 字符` };
     out[key] = trimmed;
+  }
+
+  for (const g of CRED_GROUPS) {
+    const k = `${g}Mode`;
+    if (!has(k)) continue;
+    if (!['independent', 'disabled', ...(g === 'chat' ? [] : ['inherit'])].includes(src[k])) return { error: `${k}：模式无效` };
+    out[k] = src[k];
   }
 
   if (has('dims')) {
@@ -139,6 +151,15 @@ const ERROR_TEXT_CAP = 200;
 
 function ok(value) {
   return { ok: true, value };
+}
+
+function previewText(value) {
+  const text = String(value ?? '');
+  let end = 200;
+  const before = text.charCodeAt(end - 1);
+  const after = text.charCodeAt(end);
+  if (before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) end--;
+  return text.slice(0, end);
 }
 
 function fail(message, code = 'bad-request') {
@@ -225,7 +246,7 @@ function probeSpec(group) {
     return {
       endpoint: `${embedBaseUrl()}/embeddings`,
       model: embedModel(),
-      body: (model) => ({ model, input: 'ping' }),
+      body: (model) => ({ model, input: 'ping', dimensions: embedDims() }),
     };
   }
   if (group === 'rerank') {
@@ -254,6 +275,13 @@ function probeSpec(group) {
  */
 async function testKey(group, key) {
   const spec = probeSpec(group);
+  const requestBody = spec.body(spec.model);
+  const redact = value => {
+    let text = String(value);
+    for (const secret of [key, ...CRED_GROUPS.map(g => GROUP_KEY[g]())].filter(Boolean)) text = text.split(secret).join('[REDACTED]');
+    return text.slice(0, ERROR_TEXT_CAP);
+  };
+  const diagnostics = { model: redact(spec.model), endpoint: redact(spec.endpoint.replace(/\/\/[^/@]*@/, '//[REDACTED]@').split(/[?#]/)[0]) };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TEST_KEY_TIMEOUT_MS);
   const started = Date.now();
@@ -264,20 +292,34 @@ async function testKey(group, key) {
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(spec.body(spec.model)),
+      body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
     const latencyMs = Date.now() - started;
     const body = await res.text().catch(() => '');
-    if (res.ok) return { ok: true, group, status: res.status, latencyMs, model: spec.model, endpoint: spec.endpoint };
+    let valid = false;
+    if (res.ok) {
+      try {
+        const data = JSON.parse(body);
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+          if (group === 'chat') valid = Array.isArray(data.choices) && data.choices.some(c => typeof c?.message?.content === 'string' && c.message.content.trim());
+          if (group === 'embed') valid = Array.isArray(data.data) && data.data.length === 1 && data.data.every(row => Array.isArray(row?.embedding) && row.embedding.length === requestBody.dimensions && row.embedding.every(v => typeof v === 'number' && Number.isFinite(v)));
+          if (group === 'rerank') {
+            const rows = data.results;
+            valid = Array.isArray(rows) && rows.length === 1 && new Set(rows.map(r => r?.index)).size === rows.length && rows.every(r => Number.isInteger(r?.index) && r.index >= 0 && r.index < 1 && typeof r.relevance_score === 'number' && Number.isFinite(r.relevance_score));
+          }
+        }
+      } catch { /* Malformed payload is an unsuccessful capability probe. */ }
+    }
+    if (valid) return { ok: true, group, status: res.status, latencyMs, ...diagnostics };
     return {
       ok: false,
       group,
       status: res.status,
       latencyMs,
-      model: spec.model,
-      endpoint: spec.endpoint,
-      message: String(body ?? '').slice(0, ERROR_TEXT_CAP),
+      ...diagnostics,
+      code: res.ok ? 'invalid-response' : 'http-error',
+      message: res.ok ? '响应结构或内容无效' : `HTTP ${res.status}`,
     };
   } catch (err) {
     return {
@@ -285,11 +327,9 @@ async function testKey(group, key) {
       group,
       status: null,
       latencyMs: Date.now() - started,
-      model: spec.model,
-      endpoint: spec.endpoint,
-      message: (err?.name === 'AbortError'
-        ? `请求超时（${TEST_KEY_TIMEOUT_MS}ms）`
-        : String(err?.message ?? err)).slice(0, ERROR_TEXT_CAP),
+      ...diagnostics,
+      code: err?.name === 'AbortError' ? 'timeout' : 'network-error',
+      message: err?.name === 'AbortError' ? `请求超时（${TEST_KEY_TIMEOUT_MS}ms）` : '网络请求失败',
     };
   } finally {
     clearTimeout(timer);
@@ -334,7 +374,7 @@ export function installMemjudgeRpc(ctx, opts = {}) {
               created: r.created_at,
               accessed: r.last_accessed,
               importance: r.importance,
-              text: String(r.text ?? '').slice(0, 200),
+              text: previewText(r.text),
               // source 一列两用：无显式来源时存章段编码（c0-p0），有来源时存用户给的串。
               // 原样回传，判据留给面板（面板才知道「这种值不该显示」）。
               source: r.source ? String(r.source) : '',
@@ -351,8 +391,9 @@ export function installMemjudgeRpc(ctx, opts = {}) {
           const { group, error: groupError } = groupParam(payload?.group);
           if (groupError) return fail(groupError);
           // 只收字符串：数字/对象被 String() 化后能落成 "12345" 这种假密钥，宁可拒。
-          const key = typeof payload?.key === 'string' ? payload.key.trim() : '';
-          if (!key) return fail('密钥为空');
+          if (!Object.prototype.hasOwnProperty.call(payload ?? {}, 'key')) return ok(keyState());
+          if (typeof payload.key !== 'string') return fail('key必须是字符串');
+          const key = payload.key.trim();
           saveKey(group, key);
           // saveKey 已置 cache = null，紧接着读就是新值，status 立即一致
           return ok(keyState());
@@ -388,16 +429,19 @@ export function installMemjudgeRpc(ctx, opts = {}) {
           const beforeEmbed = embedModel();
           const beforeDims = embedDims();
           saveConfig(patch);
-          const vecCacheReset = (patch.embedModel !== undefined && patch.embedModel !== beforeEmbed)
-            || (patch.dims !== undefined && patch.dims !== beforeDims);
+          const vecCacheReset = embedModel() !== beforeEmbed || embedDims() !== beforeDims;
           return ok({ config: configReport(), vecCacheReset });
         }
         case 'testKey': {
           const { group, error: groupError } = groupParam(payload?.group);
           if (groupError) return fail(groupError);
-          const supplied = typeof payload?.key === 'string' ? payload.key.trim() : '';
-          const key = supplied || GROUP_KEY[group]();
-          if (!key) return fail(`未配置密钥（${group} 组）`);
+          if (!groupReport(group).enabled) return fail('该组已禁用', 'disabled');
+          const supplied = Object.prototype.hasOwnProperty.call(payload ?? {}, 'key');
+          if (supplied && typeof payload.key !== 'string') return fail('key必须是字符串');
+          const key = supplied ? payload.key.trim() : GROUP_KEY[group]();
+          if (!key) return fail(`未配置密钥（${group} 组）`, 'missing-key');
+          const report = groupReport(group);
+          if (!report.baseUrl || !report.model) return fail('端点或模型为空', 'incomplete-config');
           return ok(await testKey(group, key));
         }
         default:
