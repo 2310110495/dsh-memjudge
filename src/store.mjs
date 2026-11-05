@@ -661,15 +661,86 @@ export function open(dbPath = ':memory:', opts = {}) {
   }
   const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
 
-  // journal_mode=DELETE：关库后只剩单个 .db，字节统计不被 -wal 干扰
-  if (!isMemory) db.exec('PRAGMA journal_mode = DELETE');
+  // Preserve the existing journal mode: changing it is not transactional.
+  db.exec('BEGIN IMMEDIATE');
+  const objects = db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name").all();
+  const meta = objects.find(o => o.name === 'meta' && o.type === 'table');
+  let fromVersion = 0;
+  if (meta) {
+    // Only the historical/current table is understood; PRAGMA alone misses CHECK,
+    // conflict policies and other constraints hidden in the CREATE statement.
+    const canonicalMeta = 'createtablemeta(ktextprimarykey,vtextnotnull)';
+    if (meta.sql?.replace(/\s+/g, '').toLowerCase() !== canonicalMeta) {
+      throw new Error('unrecognized meta table');
+    }
+    const metaIndexes = db.prepare('PRAGMA index_list(meta)').all();
+    if (metaIndexes.length !== 1 || metaIndexes[0].name !== 'sqlite_autoindex_meta_1' ||
+        metaIndexes[0].unique !== 1 || metaIndexes[0].origin !== 'pk' || metaIndexes[0].partial !== 0) {
+      throw new Error('unrecognized meta indexes');
+    }
+    const metaIndexColumns = db.prepare('PRAGMA index_xinfo(sqlite_autoindex_meta_1)').all();
+    if (metaIndexColumns.length !== 2 || metaIndexColumns.some((column, i) =>
+      [column.seqno, column.cid, column.name, column.desc, column.coll, column.key].some((value, j) =>
+        value !== [[0, 0, 'k', 0, 'BINARY', 1], [1, -1, null, 0, 'BINARY', 0]][i][j]))) {
+      throw new Error('unrecognized meta index columns');
+    }
+    const rows = db.prepare("SELECT v FROM meta WHERE k = 'schema_version'").all();
+    if (rows.length > 1) throw new Error('invalid schema version');
+    if (rows.length) {
+      const value = rows[0].v;
+      if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('invalid schema version');
+      fromVersion = Number(value);
+      if (fromVersion > STORE_SCHEMA_VERSION) throw new Error('unsupported future schema version');
+    }
+  }
+  if (objects.length) {
+    const expected = [
+      ['id', 'TEXT', 0, null, 1], ['text', 'TEXT', 1, null, 0],
+      ['text_hash', 'TEXT', 1, null, 0], ['created_at', 'INTEGER', 1, null, 0],
+      ['last_accessed', 'INTEGER', 1, null, 0], ['access_count', 'INTEGER', 1, '0', 0],
+      ['importance', 'REAL', 1, '0', 0], ['supersedes', 'TEXT', 0, null, 0],
+      ['source', 'TEXT', 0, null, 0],
+    ];
+    const columns = db.prepare('PRAGMA table_xinfo(memories)').all();
+    const extra = [['kind', 'TEXT', 1, "'event'", 0], ['tier', 'INTEGER', 1, '3', 0]];
+    const schema = [...expected, ...extra.slice(0, Math.max(0, columns.length - expected.length))];
+    const badMemory = columns.length < expected.length || columns.length > schema.length || columns.some((c, i) => c.hidden || [c.name, c.type, c.notnull, c.dflt_value, c.pk].some((v, j) => v !== schema[i][j]));
+    const allowed = new Set(fromVersion
+      ? ['table:meta', 'table:memories', 'table:memory_occurrences', 'table:segments', 'table:vector_blob', 'table:facts', 'index:ux_memories_hash', 'index:ux_memory_occurrences_position', 'trigger:memory_occurrences_delete']
+      : ['table:memories', 'table:memory_occurrences']);
+    if (badMemory || objects.some(o => !allowed.has(`${o.type}:${o.name}`))) throw new Error(`unrecognized ${fromVersion ? 'versioned' : 'unversioned'} database`);
+    const facts = objects.find(o => o.type === 'table' && o.name === 'facts');
+    if (facts) {
+      const normalize = sql => sql?.replace(/\s+/g, '').toLowerCase();
+      const historical = 'CREATE TABLE facts (memory_id INTEGER NOT NULL, entity TEXT, attr TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, unit TEXT, kind TEXT NOT NULL, at INTEGER NOT NULL)';
+      if (normalize(facts.sql) !== normalize(historical)) throw new Error('unrecognized versioned database: unrecognized historical facts table');
+    }
+    const indexDefinitions = {
+      ux_memories_hash: ['memories', 'CREATE UNIQUE INDEX ux_memories_hash ON memories(text_hash)'],
+      ux_memory_occurrences_position: ['memory_occurrences', "CREATE UNIQUE INDEX ux_memory_occurrences_position ON memory_occurrences (memory_id, source IS NULL, coalesce(source, ''), document_id IS NULL, coalesce(document_id, ''), chapter IS NULL, coalesce(chapter, 0), para IS NULL, coalesce(para, 0))"],
+    };
+    for (const index of objects.filter(o => o.type === 'index')) {
+      const [table, sql] = indexDefinitions[index.name];
+      if (index.tbl_name !== table || index.sql?.replace(/\s+/g, ' ').trim() !== sql) throw new Error('unrecognized database index');
+    }
+    if (objects.some(o => o.name === 'memory_occurrences' && o.type === 'table')) {
+      const occurrence = db.prepare('PRAGMA table_xinfo(memory_occurrences)').all();
+      const shape = [['memory_id', 'TEXT', 1], ['source', 'TEXT', 0], ['document_id', 'TEXT', 0], ['chapter', 'INTEGER', 0], ['para', 'INTEGER', 0]];
+      if (occurrence.length !== shape.length || occurrence.some((c, i) => c.hidden || c.pk || c.dflt_value !== null || [c.name, c.type, c.notnull].some((v, j) => v !== shape[i][j]))) throw new Error('unrecognized occurrence table');
+    }
+    const trigger = objects.find(o => o.type === 'trigger');
+    if (trigger) {
+      const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(trigger.name)?.sql;
+      const canonical = 'CREATE TRIGGER memory_occurrences_delete AFTER DELETE ON memories BEGIN DELETE FROM memory_occurrences WHERE memory_id = OLD.id; END';
+      if (sql?.replace(/\s+/g, ' ').trim() !== canonical) throw new Error('unrecognized database trigger');
+    }
+  }
   db.exec(DDL);
-  db.exec(`BEGIN IMMEDIATE;
+  db.exec(`
     INSERT INTO memory_occurrences (memory_id, source)
       SELECT id, source FROM memories
       WHERE NOT EXISTS (SELECT 1 FROM meta WHERE k = 'occurrences_v1_migrated');
-    INSERT OR IGNORE INTO meta (k, v) VALUES ('occurrences_v1_migrated', '1');
-    COMMIT;`);
+    INSERT OR IGNORE INTO meta (k, v) VALUES ('occurrences_v1_migrated', '1');`);
 
   // ── facts 内存派生层（v5：不落盘） ────────────────────────────────────────
   // 结构：byOrd（ord → Fact[]，供 factsOf/dump）与 slot（attr → [{ord,fact}]，
@@ -829,30 +900,47 @@ export function open(dbPath = ':memory:', opts = {}) {
   db.exec(`UPDATE memories SET tier = ${MEMORY_TIER_MIN} WHERE tier < ${MEMORY_TIER_MIN}`);
 
   // ── 表结构自检：CREATE TABLE IF NOT EXISTS 不会纠偏已存在的同名表 ──────────
-  // segments 缺 bits（v2 的 '0'/'1' 字符串位图，或更早的「一段一行 (memory_id, seq)」
-  // 形态）或缺 ord 整数键时重建；段元数据完全可以从 memory.text 重切
-  // （splitSegments 是纯函数），零信息损失。facts 的 memory_id 若是 TEXT（老库按
-  // 21 字符字符串 id 存）也重建，三元组由 extractFacts 从原文重抽，同样无损。
-  const segCols = db.prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
+  // Only the documented v2 layout has a known conversion for coverage state.
+  const segInfo = db.prepare('PRAGMA table_xinfo(segments)').all();
+  const segCols = segInfo.map((c) => c.name);
   let rebuiltSegs = false;
-  if (segCols.length > 0 && (!segCols.includes('bits') || !segCols.includes('ord'))) {
+  if (fromVersion >= 2 && !objects.some(o => o.type === 'table' && o.name === 'segments')) {
+    throw new Error('segments migration: missing historical table');
+  }
+  if (segInfo.some(c => c.hidden)) throw new Error('segments migration: unrecognized layout');
+  if (segCols.join(',') === 'ord,seg_count,covered') {
+    const expected = [['INTEGER', 1, 1], ['INTEGER', 1, 0], ['TEXT', 1, 0]];
+    if (fromVersion !== 2 || segInfo.some((c, i) => c.type.toUpperCase() !== expected[i][0] || c.notnull !== expected[i][1] || c.pk !== expected[i][2])) {
+      throw new Error('segments migration: unrecognized v2 layout');
+    }
+    const rows = db.prepare(`SELECT s.ord, s.seg_count, s.covered, m.rowid AS memory_ord, m.text,
+      typeof(s.ord) AS ord_type, typeof(s.seg_count) AS count_type, typeof(s.covered) AS covered_type,
+      typeof(m.text) AS text_type FROM segments s LEFT JOIN memories m ON m.rowid = s.ord`).all();
+    const count = db.prepare('SELECT count(*) AS n FROM memories').get().n;
+    if (rows.length !== count) throw new Error('segments migration: missing or orphaned rows');
+    const converted = rows.map(row => {
+      if (row.ord_type !== 'integer' || !Number.isSafeInteger(row.ord) || row.memory_ord !== row.ord ||
+          row.count_type !== 'integer' || !Number.isSafeInteger(row.seg_count) || row.seg_count < 0 ||
+          row.seg_count > BITS_MAX_SEGMENTS || row.covered_type !== 'text' || row.text_type !== 'text' ||
+          splitSegments(row.text).length !== row.seg_count) {
+        throw new Error('segments migration: invalid row or segment count');
+      }
+      return [row.ord, packCovered(row.seg_count, row.covered)];
+    });
     db.exec('DROP TABLE segments');
     db.exec(SEGMENTS_DDL);
+    const insert = db.prepare('INSERT INTO segments (ord, bits) VALUES (?, ?)');
+    for (const [ord, bits] of converted) insert.run(ord, bits);
     rebuiltSegs = true;
+  } else if (segCols.join(',') !== 'ord,bits') {
+    throw new Error('segments migration: unrecognized layout');
   }
   // v5：facts 不再落盘，老库的 facts/str_dict 一并清掉（数据可由原文重建，零损失）。
-  db.exec('DROP TABLE IF EXISTS facts');
-  db.exec('DROP INDEX IF EXISTS ux_facts_slot');
-  db.exec('DROP TABLE IF EXISTS str_dict');
-  db.exec('DROP TABLE IF EXISTS entity_dict');
-  db.exec('DROP TABLE IF EXISTS attr_dict');
+  // Legacy tables are rejected by preflight instead of being dropped.
 
   // ── schema v1/v2 → v3 迁移：段层形状演进 ────────────────────────────────
-  // v1 无 segments 表（DDL 的 IF NOT EXISTS 已建空表），v2 是 '0'/'1' 字符串位图
-  // （自检已 DROP 重建）。两种都在这里从 memory.text 重切补写段数 + 位图，
-  // 幂等：INSERT OR IGNORE + 全 0 位图，重开会话不会改写已有覆盖状态。
-  const versionRow = db.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version');
-  const fromVersion = versionRow ? Number(versionRow.v) : 0;
+  // v1 has no coverage state; v2 rows were converted above before this backfill.
+
   if (fromVersion < STORE_SCHEMA_VERSION || rebuiltSegs) {
     const mems = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
     const insSegMig = db.prepare('INSERT OR IGNORE INTO segments (ord, bits) VALUES (?, ?)');
@@ -861,7 +949,10 @@ export function open(dbPath = ':memory:', opts = {}) {
       insSegMig.run(m.ord, packCovered(n));
     }
   }
-  db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_version', String(STORE_SCHEMA_VERSION));
+  const versionUpdate = db.prepare('UPDATE meta SET v = ? WHERE k = ?').run(String(STORE_SCHEMA_VERSION), 'schema_version');
+  if (versionUpdate.changes === 0) {
+    db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)').run('schema_version', String(STORE_SCHEMA_VERSION));
+  }
   // 表结构定稿后重建内存 facts（captain 要的重建耗时在这里打印）。
   const rebuildStats = rebuildFacts('startup');
 
@@ -1080,9 +1171,13 @@ export function open(dbPath = ':memory:', opts = {}) {
       // 说它是 person 时，归属必须能改回来，否则三分永远追不上真实语义。
       // 这是「不产生新行」的幂等，不是「永不更新任何列」。
       if (kindGiven && kind !== hit.kind) stmt.setKind.run(kind, hit.id);
-      // tier 同一条规矩：只有显式传了才纠正。kind 被改成 person 而 tier 没显式传时，
-      // 这里也不顺手把它钉到 1——那是 open() 迁移与 nightly 的职责，写入侧不猜。
-      if (tierGiven && tier !== Number(hit.tier)) stmt.setTier.run(tier, hit.id);
+      const effectiveKind = kindGiven ? kind : normalizeKind(hit.kind);
+      const pinned = effectiveKind === 'person' || effectiveKind === 'promise';
+      const effectiveTier = pinned ? MEMORY_TIER_PINNED
+        : tierGiven ? normalizeTier(input.tier, effectiveKind) : normalizeTier(hit.tier, effectiveKind);
+      if (pinned ? hit.tier !== MEMORY_TIER_PINNED : tierGiven && effectiveTier !== Number(hit.tier)) {
+        stmt.setTier.run(effectiveTier, hit.id);
+      }
       if (input.recordDuplicateOccurrence !== false) stmt.insOccurrence.run(hit.id, source, documentId, chapter, para);
       const factCount = factsOf(hit.id).length;
       db.exec('COMMIT');
@@ -1090,8 +1185,8 @@ export function open(dbPath = ':memory:', opts = {}) {
         id: hit.id,
         inserted: false,
         factCount,
-        kind: kindGiven ? kind : normalizeKind(hit.kind),
-        tier: tierGiven ? tier : normalizeTier(hit.tier, kindGiven ? kind : hit.kind),
+        kind: effectiveKind,
+        tier: effectiveTier,
       };
     }
 
@@ -1485,6 +1580,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       api[name] = (...args) => { assertOpen(); return fn(...args); };
     }
   }
+  db.exec('COMMIT');
   return api;
   } catch (err) {
     // Initialization can fail with or without an active transaction.

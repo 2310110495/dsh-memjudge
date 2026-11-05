@@ -20,11 +20,13 @@
 import { installRawHostAdapter } from './raw-host-adapter.mjs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { open as openStore, normalizeKind, MEMORY_KINDS } from './store.mjs';
 import { SearchIndex } from './search.mjs';
 import { embed as embedVec, vecStats } from './vector.mjs';
 import { gate, resolveConflict, documentConflicts } from './judge.mjs';
+import { attributeValues } from './attribute-evidence.mjs';
 import {
   renderRecall,
   sleepPhase,
@@ -323,9 +325,10 @@ export function isHardDeny(verdict, query, body) {
     return typeof verdict.coverage !== 'number' || verdict.coverage < 0.4;
   }
   if (reason === 'no-facts') {
-    const latin = (String(query).match(/[A-Za-z][A-Za-z0-9]{1,}/g) || []).map((s) => s.toLowerCase());
-    const hay = String(body).toLowerCase();
-    return latin.some((s) => !hay.includes(s));
+    const fold = (s) => String(s).replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0)).toLowerCase();
+    const latin = fold(query).match(/[a-z][a-z0-9]{1,}/g) || [];
+    const tokens = fold(body).match(/[a-z][a-z0-9]*/g) || [];
+    return latin.some((s) => !tokens.includes(s));
   }
   return false;
 }
@@ -859,13 +862,14 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
           chars: { type: 'integer' },
           total: { type: 'integer' },
           kind: { type: 'string' },
+          version: { type: 'string' },
         },
         required: ['id', 'inserted', 'factCount', 'chars', 'total', 'kind'],
       },
       render: (_args, value) => textBlock(
         value.inserted
-          ? `已写入 ${value.id}（${value.kind}，${value.chars} 字，抽出 ${value.factCount} 条三元组，库内共 ${value.total} 条）`
-          : `已存在 ${value.id}（${value.kind}，幂等命中，未重复写入；库内共 ${value.total} 条）`,
+          ? `已写入 ${value.id}（${value.kind}，${value.chars} 字，抽出 ${value.factCount} 条三元组，库内共 ${value.total} 条）；原文版本 ${value.version}`
+          : `已存在 ${value.id}（${value.kind}，幂等命中，未重复写入；库内共 ${value.total} 条）；原文版本 ${value.version}`,
       ),
     },
     isConcurrencySafe: () => false,
@@ -899,6 +903,7 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
         chars: text.length,
         total: store.stats().memories,
         kind: result.kind,
+        version: createHash('sha256').update(text, 'utf16le').digest('hex'),
       };
     },
   }));
@@ -953,9 +958,14 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
 
     // 先裁剪再判断：在整章上跑 gate 判据恒真，裁到预算内才有区分力。
     const body = found.hits.map((h) => h.text).join('\n\n');
+    const values = attributeValues(query, found.hits);
+    const evidence = values === null ? null : values.length > 0;
+    if (evidence === false) {
+      return finish({ denied: true, reason: 'attribute-evidence-missing', detail: '交付片段中未找到足够的属性证据', chars: 0, elapsedMs: found.elapsedMs, hits: [] });
+    }
     // t15：属性缺席判据要 L1 的 (entity, attr) 集合；store 的 facts 就是 L1 产物。
     const l1Facts = view ? view.allFacts() : store.allFacts();
-    const verdict = gate(query, body, { l1Facts });
+    const verdict = evidence === true ? { deny: false } : gate(query, body, { l1Facts });
     // 硬拒必须在**全文口径**上复核：body 是裁剪后的检索结果，名词块覆盖率天然偏低，
     // 在它上面判「材料里没有这个说法」会把 R12「硫含量」、R45「待了多久」、
     // R78「邮件包编号」这类真问题误拒（body 口径 0.25–0.33，全文口径 0.33–0.56）。
@@ -1012,7 +1022,7 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
       denied: false,
       chars: found.chars,
       elapsedMs: found.elapsedMs,
-      conflictLine: '',
+      conflictLine: values && values.length > 1 ? `本次交付片段中属性存在不同取值：${values.join('、')}；请结合原文核对。` : '',
       hits: found.hits.map((h) => ({
         id: h.id,
         chapter: h.chapter,
@@ -1020,7 +1030,9 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
         chars: h.chars,
         score: h.score,
         text: h.text,
+        version: h.version,
         truncated: Boolean(h.truncated),
+        ...(h.truncated && Number.isInteger(h.windowStart) ? { windowStart: h.windowStart, windowEnd: h.windowEnd, startsAtBoundary: h.startsAtBoundary } : {}),
       })),
     });
   };
@@ -1065,7 +1077,11 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
                 chars: { type: 'integer' },
                 score: { type: 'number' },
                 text: { type: 'string' },
+                 version: { type: 'string' },
                 truncated: { type: 'boolean' },
+                windowStart: { type: 'integer' },
+                windowEnd: { type: 'integer' },
+                startsAtBoundary: { type: 'boolean' },
               },
               required: ['id', 'chapter', 'para', 'chars', 'score', 'text'],
             },
@@ -1075,9 +1091,10 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
       },
       render: (_args, value) => {
         if (value.denied) {
-          return textBlock(`没有记载（${value.reason}${value.detail ? `：${value.detail}` : ''}）`);
+          const label = value.reason === 'attribute-evidence-missing' ? '交付片段证据不足' : '没有记载';
+          return textBlock(`${label}（${value.reason}${value.detail ? `：${value.detail}` : ''}）`);
         }
-        const lines = value.hits.map((h) => `[${h.id} ch${h.chapter}${h.truncated ? ' 截断' : ''}] ${h.text}`);
+        const lines = value.hits.map((h) => `[${h.id} ch${h.chapter}${h.truncated ? ` 截断 ${h.windowStart}:${h.windowEnd}` : ''} 版本 ${h.version}] ${h.text}`);
         const head = value.conflictLine ? `${value.conflictLine}\n\n` : '';
         return textBlock(`${head}命中 ${value.hits.length} 段，共 ${value.chars} 字：\n\n${lines.join('\n\n')}`);
       },
@@ -1093,13 +1110,14 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
 
   track(ctx.tools.register({
     name: 'memjudge_read',
-    description: '按记忆 id 分页读取原文。offset 和 nextOffset 是 UTF-16 码元偏移；读取不刷新访问时间。',
+    description: '按记忆 id 分页读取原文。续页传入首页 version 校验内容；offset 和 nextOffset 是 UTF-16 码元偏移；读取不刷新访问时间。',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         id: { type: 'string', description: '召回结果中的记忆 id。' },
         offset: { type: 'integer', minimum: 0, description: '起始偏移，默认 0。' },
         limit: { type: 'integer', minimum: 2, maximum: 2000, description: '每页 2..2000 个 UTF-16 码元，默认 2000。' },
+        version: { type: 'string', description: '首页返回的原文版本，续页传入以检查内容变化。' },
       }, required: ['id'],
     },
     output: {
@@ -1109,18 +1127,25 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
           found: { type: 'boolean' }, id: { type: 'string' }, text: { type: 'string' },
           offset: { type: 'integer' }, nextOffset: { type: 'integer' },
           total: { type: 'integer' }, truncated: { type: 'boolean' },
+          version: { type: 'string' },
         }, required: ['found', 'id', 'text', 'offset', 'nextOffset', 'total', 'truncated'],
       },
       render: (_args, value) => textBlock(JSON.stringify(value)),
     },
     isConcurrencySafe: () => false,
-    execute({ id, offset = 0, limit = 2000 }) {
+    execute({ id, offset = 0, limit = 2000, version }) {
       assertHealthy();
       if (typeof id !== 'string' || !id || !Number.isSafeInteger(offset) || offset < 0 ||
-          !Number.isSafeInteger(limit) || limit < 2 || limit > 2000) throw new Error('memjudge_read: invalid arguments');
+          !Number.isSafeInteger(limit) || limit < 2 || limit > 2000 ||
+          (version !== undefined && (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version)))) throw new Error('memjudge_read: invalid arguments');
       const row = store.get(id, false);
-      if (!row) return { found: false, id, text: '', offset: 0, nextOffset: 0, total: 0, truncated: false };
+      if (!row) {
+        if (version !== undefined) throw new Error('memjudge_read: stale version');
+        return { found: false, id, text: '', offset: 0, nextOffset: 0, total: 0, truncated: false };
+      }
       const text = row.text;
+      const currentVersion = createHash('sha256').update(text, 'utf16le').digest('hex');
+      if (version !== undefined && version !== currentVersion) throw new Error('memjudge_read: stale version');
       if (offset > text.length || (offset > 0 && offset < text.length &&
           text.charCodeAt(offset - 1) >= 0xD800 && text.charCodeAt(offset - 1) <= 0xDBFF &&
           text.charCodeAt(offset) >= 0xDC00 && text.charCodeAt(offset) <= 0xDFFF)) {
@@ -1129,7 +1154,7 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
       let end = Math.min(text.length, offset + limit);
       if (end < text.length && text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF &&
           text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF) end--;
-      return { found: true, id, text: text.slice(offset, end), offset, nextOffset: end, total: text.length, truncated: end < text.length };
+      return { found: true, id, text: text.slice(offset, end), offset, nextOffset: end, total: text.length, truncated: end < text.length, version: currentVersion };
     },
   }));
 

@@ -126,11 +126,11 @@ test('failed occurrence migration releases lock and preserves legacy data', () =
     CREATE TABLE memory_occurrences (memory_id TEXT NOT NULL, source TEXT, document_id TEXT, chapter INTEGER, para INTEGER);
     CREATE TRIGGER fail_migration BEFORE INSERT ON memory_occurrences BEGIN SELECT RAISE(ABORT, 'migration fixture'); END;`);
   db.close();
-  assert.throws(() => open(file), /migration fixture/);
+  assert.throws(() => open(file), /unrecognized unversioned database/);
   db = new DatabaseSync(file);
   try {
-    db.exec(`BEGIN IMMEDIATE; INSERT INTO meta (k, v) VALUES ('independent_write', 'ok'); COMMIT;`);
-    assert.equal(db.prepare("SELECT count(*) AS n FROM meta WHERE k = 'occurrences_v1_migrated'").get().n, 0);
+    db.exec('BEGIN IMMEDIATE; ROLLBACK');
+    assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name = 'meta'").get().n, 0);
     assert.equal(db.prepare('SELECT count(*) AS n FROM memory_occurrences').get().n, 0);
     assert.equal(db.prepare("SELECT text FROM memories WHERE id = 'legacy'").get().text, 'legacy text');
     db.exec('DROP TRIGGER fail_migration');

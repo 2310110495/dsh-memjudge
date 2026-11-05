@@ -146,8 +146,7 @@ function validateSettings(settings) {
 
 /** testKey 的超时：面板上点一下不该把宿主进程挂住。 */
 const TEST_KEY_TIMEOUT_MS = 8000;
-/** 错误文本回传上限，别把整段 JSON 塞进面板。 */
-const ERROR_TEXT_CAP = 200;
+
 
 function ok(value) {
   return { ok: true, value };
@@ -189,6 +188,23 @@ function openConfiguredStore(dbPath) {
     maxChars: configuredMaxChars(),
     storageLimitBytes: configuredStorageLimitBytes(),
   });
+}
+
+function queryWithStore(dbPath, query) {
+  const store = openConfiguredStore(dbPath);
+  let failed = false;
+  try {
+    return query(store);
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    if (failed) {
+      try { store.close(); } catch { /* Preserve the query error. */ }
+    } else {
+      store.close();
+    }
+  }
 }
 
 /**
@@ -239,7 +255,7 @@ function keyState() {
 /**
  * 每组的探测请求：端点、请求体都用**该组**自己的 baseUrl / model。
  * 三组协议不同（chat/completions、embeddings、rerank），所以按组分派而不是只换 URL。
- * 返回的 endpoint 里不含 key——诊断需要看打到哪，但绝不能让 key 落到返回值里。
+ * 诊断固定掩码，请求使用原始端点与模型。
  */
 function probeSpec(group) {
   if (group === 'embed') {
@@ -276,27 +292,84 @@ function probeSpec(group) {
 async function testKey(group, key) {
   const spec = probeSpec(group);
   const requestBody = spec.body(spec.model);
-  const redact = value => {
-    let text = String(value);
-    for (const secret of [key, ...CRED_GROUPS.map(g => GROUP_KEY[g]())].filter(Boolean)) text = text.split(secret).join('[REDACTED]');
-    return text.slice(0, ERROR_TEXT_CAP);
-  };
-  const diagnostics = { model: redact(spec.model), endpoint: redact(spec.endpoint.replace(/\/\/[^/@]*@/, '//[REDACTED]@').split(/[?#]/)[0]) };
+  const diagnostics = { model: "[REDACTED]", endpoint: "[REDACTED]" };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TEST_KEY_TIMEOUT_MS);
+  let timer;
   const started = Date.now();
+  const monotonicStarted = performance.now();
+  let expire;
+  const timeoutError = new Error('testKey timeout');
+  timeoutError.name = 'AbortError';
   try {
-    const res = await fetch(spec.endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
+    const timeout = new Promise((_, reject) => {
+      expire = () => {
+        if (controller.signal.aborted) return;
+        reject(timeoutError);
+        controller.abort();
+      };
+      timer = setTimeout(expire, TEST_KEY_TIMEOUT_MS);
     });
-    const latencyMs = Date.now() - started;
-    const body = await res.text().catch(() => '');
+    const expired = () => performance.now() - monotonicStarted >= TEST_KEY_TIMEOUT_MS;
+    const checkDeadline = () => {
+      if (expired()) { expire(); throw timeoutError; }
+    };
+    const cancel = target => {
+      try { Promise.resolve(target?.cancel()).catch(() => {}); } catch { /* Best effort. */ }
+    };
+    const request = (async () => {
+      const res = await fetch(spec.endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted || expired()) {
+        // Do not start reading a response that arrived after the timeout.
+        cancel(res.body);
+        if (!controller.signal.aborted) checkDeadline();
+        return;
+      }
+      const latencyMs = Date.now() - started;
+      if (!res.ok) {
+        cancel(res.body);
+        return { res, body: '', latencyMs };
+      }
+      let body = '';
+      if (res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let size = 0, complete = false, chunks = 0;
+        const onAbort = () => cancel(reader);
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          while (true) {
+            checkDeadline();
+            const { value, done } = await reader.read();
+            if (controller.signal.aborted) return;
+            checkDeadline();
+            if (done) { complete = true; body += decoder.decode(); break; }
+            if (!ArrayBuffer.isView(value) || Object.prototype.toString.call(value) !== '[object Uint8Array]' || (size += value.byteLength) > 1024 * 1024) break;
+            body += decoder.decode(value, { stream: true });
+            if (++chunks % 256 === 0) await new Promise(resolve => setImmediate(resolve));
+          }
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+          checkDeadline();
+          body = '';
+        } finally {
+          controller.signal.removeEventListener('abort', onAbort);
+          if (!complete) { body = ''; cancel(reader); }
+          try { reader.releaseLock(); } catch { /* Pending reads can retain the lock. */ }
+        }
+      }
+      checkDeadline();
+      return { res, body, latencyMs };
+    })();
+    const { res, body, latencyMs } = await Promise.race([request, timeout]);
+    checkDeadline();
     let valid = false;
     if (res.ok) {
       try {
@@ -311,6 +384,7 @@ async function testKey(group, key) {
         }
       } catch { /* Malformed payload is an unsuccessful capability probe. */ }
     }
+    checkDeadline();
     if (valid) return { ok: true, group, status: res.status, latencyMs, ...diagnostics };
     return {
       ok: false,
@@ -322,6 +396,10 @@ async function testKey(group, key) {
       message: res.ok ? '响应结构或内容无效' : `HTTP ${res.status}`,
     };
   } catch (err) {
+    if (performance.now() - monotonicStarted >= TEST_KEY_TIMEOUT_MS) {
+      expire();
+      err = timeoutError;
+    }
     return {
       ok: false,
       group,
@@ -348,11 +426,10 @@ export function installMemjudgeRpc(ctx, opts = {}) {
     try {
       switch (endpoint) {
         case 'status': {
-          const store = openConfiguredStore(dbPath);
-          const stats = store.stats();
-          const totalFacts = stats.facts;
-          const attrCount = new Set(store.allFacts().map((f) => f.attr)).size;
-          store.close();
+          const { stats, attrCount } = queryWithStore(dbPath, store => {
+            const stats = store.stats();
+            return { stats, attrCount: new Set(store.allFacts().map((f) => f.attr)).size };
+          });
           // config.groups 里三组各自的 baseUrl/model/key 掩码/继承标记齐全
           return ok({ stats: { ...stats, attrCount }, config: configReport() });
         }
@@ -361,10 +438,10 @@ export function installMemjudgeRpc(ctx, opts = {}) {
           // 规格 §11.2：默认 desc（用户直觉是「最新的」，不是「最早的」）。
           // 只有显式 asc 才回到旧行为，store 层默认值保持 asc 不动，内部导出不受影响。
           const order = payload?.order === 'asc' ? 'asc' : 'desc';
-          const store = openConfiguredStore(dbPath);
-          const rows = store.list({ limit, includeText: true, order });
-          const total = store.stats().memories;
-          store.close();
+          const { rows, total } = queryWithStore(dbPath, store => ({
+            rows: store.list({ limit, includeText: true, order }),
+            total: store.stats().memories,
+          }));
           return ok({
             order,
             total,
@@ -382,9 +459,7 @@ export function installMemjudgeRpc(ctx, opts = {}) {
           });
         }
         case 'conflicts': {
-          const store = openConfiguredStore(dbPath);
-          const conflicts = collectConflicts(store.allFacts(), payload?.cap ?? 40);
-          store.close();
+          const conflicts = queryWithStore(dbPath, store => collectConflicts(store.allFacts(), payload?.cap ?? 40));
           return ok({ conflicts });
         }
         case 'saveKey': {
@@ -448,6 +523,7 @@ export function installMemjudgeRpc(ctx, opts = {}) {
           return fail(`未知端点 ${endpoint}`);
       }
     } catch (err) {
+      if (endpoint === 'testKey') return fail('密钥测试失败', 'internal-error');
       return fail(err?.message ?? String(err));
     }
   };

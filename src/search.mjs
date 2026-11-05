@@ -49,6 +49,7 @@
 //   中文词典切碎，仍走二元组）。
 
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { rankWeight, decayFactor, DECAY } from './schema.mjs';
 import { embed as defaultEmbed, cosineInt8 } from './vector.mjs';
 import { expand as defaultExpand } from './query-expand.mjs';
@@ -403,7 +404,54 @@ export function rrfFuse(bm25Ranked, vecRanked, k = 60) {
  * 章级聚合 + 预算装填。search() 与 searchAsync() 共用这一份：
  * 两条路径各写一遍装填迟早会漂移，而 0.989 是压在这套装填上的硬底线。
  */
-function fillFromScored(scored, o) {
+function normalizedTextMap(text) {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  let compatibility = '';
+  const starts = [], ends = [];
+  for (const { segment, index } of segmenter.segment(text)) {
+    const part = segment.normalize('NFKC');
+    compatibility += part;
+    for (let i = 0; i < part.toLowerCase().length; i++) {
+      starts.push(index);
+      ends.push(index + segment.length);
+    }
+  }
+  // Lowercase the whole normalized text so contextual mappings (final sigma) apply.
+  if (compatibility !== text.normalize('NFKC')) return null;
+  const normalized = compatibility.toLowerCase();
+  if (normalized.length !== starts.length) return null;
+  return { normalized, starts, ends };
+}
+
+function evidenceWindow(text, query, budget, requireMatch = false) {
+  let start = 0, found = false;
+  if (budget > 0 && text.length > budget) {
+    const candidates = [String(query ?? ''), ...tokenize(query).strong].filter(Boolean).sort((a, b) => b.length - a.length);
+    let mapping;
+    for (const candidate of candidates) {
+      const needle = candidate.normalize('NFKC').toLowerCase();
+      if (!needle) continue;
+      if (mapping === undefined) mapping = normalizedTextMap(text);
+      if (!mapping) break;
+      const index = mapping.normalized.indexOf(needle);
+      const match = index < 0 ? null : { start: mapping.starts[index], end: mapping.ends[index + needle.length - 1] };
+      if (match && match.end - match.start <= budget) {
+        start = Math.max(0, Math.min(match.start - Math.floor((budget - (match.end - match.start)) / 2), text.length - budget));
+        found = true;
+        break;
+      }
+    }
+  }
+  if (requireMatch && !found) return null;
+  if (start > 0 && text.charCodeAt(start) >= 0xDC00 && text.charCodeAt(start) <= 0xDFFF &&
+      text.charCodeAt(start - 1) >= 0xD800 && text.charCodeAt(start - 1) <= 0xDBFF) start++;
+  let end = Math.min(text.length, start + budget);
+  const before = text.charCodeAt(end - 1), after = text.charCodeAt(end);
+  if (before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) end--;
+  return { text: text.slice(start, end), start, end, startsAtBoundary: start === 0 || /[。！？!?;；\n.]/u.test(text[start - 1]) };
+}
+
+function fillFromScored(scored, o, query) {
   // 融合路径也必须走章级聚合：实测把章聚合跳过（纯 RRF 序直接装填）会让召回从
   // 91/92 掉到 87/92——RRF 排序再准，装填时不保证跨章覆盖，正确段照样被长段挤掉。
   // 这段话留着是因为「跳过章聚合」看起来更合理，但数据说不行。
@@ -452,6 +500,7 @@ function fillFromScored(scored, o) {
 
   const picked = new Set();
   const out = [];
+  const ordered = [];
   let chars = 0;
   const push = (s) => {
     if (picked.has(s.idx) || out.length >= o.limit) return;
@@ -470,7 +519,20 @@ function fillFromScored(scored, o) {
       }
       return b.score - a.score;
     });
-    for (const s of list) push(s);
+    for (const s of list) { ordered.push(s); push(s); }
+  }
+
+  if (out.length && out.length < o.limit && o.maxChars - chars >= 16) {
+    const budget = o.maxChars - chars;
+    for (const s of ordered) {
+      if (picked.has(s.idx) || s.doc.text.length <= budget) continue;
+      const cut = evidenceWindow(s.doc.text, query, budget, true);
+      if (cut === null) continue;
+      const at = out.findIndex(existing => ordered.indexOf(existing) > ordered.indexOf(s));
+      out.splice(at < 0 ? out.length : at, 0, { ...s, originalText: s.doc.text, doc: { ...s.doc, text: cut.text }, window: cut, truncated: true });
+      chars += cut.text.length;
+      break;
+    }
   }
 
   // 预算比最短候选段还小时，逐段整取会一个都装不下 —— 那等于「有命中却报零结果」，
@@ -478,13 +540,9 @@ function fillFromScored(scored, o) {
   // 并且只在整取结果为空时才触发，不影响正常预算下的装填。
   if (!out.length && scored.length && o.maxChars > 0) {
     const top = scored[0];
-    let end = o.maxChars;
-    const before = top.doc.text.charCodeAt(end - 1);
-    const after = top.doc.text.charCodeAt(end);
-    if (before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) end--;
-    const cut = top.doc.text.slice(0, end);
-    out.push({ ...top, doc: { ...top.doc, text: cut }, truncated: true });
-    chars = cut.length;
+    const cut = evidenceWindow(top.doc.text, query, o.maxChars);
+    out.push({ ...top, originalText: top.doc.text, doc: { ...top.doc, text: cut.text }, window: cut, truncated: true });
+    chars = cut.text.length;
   }
   return { out, chars, chapterRank };
 }
@@ -686,7 +744,7 @@ class SearchIndex {
       };
     }
 
-    const { out, chars, chapterRank } = fillFromScored(scored, o);
+    const { out, chars, chapterRank } = fillFromScored(scored, o, query);
 
     const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
     const hits = out.map((s) => ({
@@ -694,8 +752,10 @@ class SearchIndex {
       chapter: s.doc.chapter,
       para: s.doc.para,
       text: s.doc.text,
+      version: createHash('sha256').update(s.originalText ?? s.doc.text, 'utf16le').digest('hex'),
       chars: s.doc.text.length,
       truncated: Boolean(s.truncated),
+      ...(s.window ? { windowStart: s.window.start, windowEnd: s.window.end, startsAtBoundary: s.window.startsAtBoundary } : {}),
       score: s.score,
       bm25: s.bm25,
       weight: s.weight,
@@ -907,14 +967,16 @@ class SearchIndex {
       }
     }
 
-    const { out, chars, chapterRank } = fillFromScored(fused, o);
+    const { out, chars, chapterRank } = fillFromScored(fused, o, query);
     const hits = out.map((s) => ({
       id: s.doc.id,
       chapter: s.doc.chapter,
       para: s.doc.para,
       text: s.doc.text,
+      version: createHash('sha256').update(s.originalText ?? s.doc.text, 'utf16le').digest('hex'),
       chars: s.doc.text.length,
       truncated: Boolean(s.truncated),
+      ...(s.window ? { windowStart: s.window.start, windowEnd: s.window.end, startsAtBoundary: s.window.startsAtBoundary } : {}),
       score: s.score,
       bm25: s.bm25,
       rrf: s.rrf,

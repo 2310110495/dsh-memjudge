@@ -6,14 +6,17 @@ import { apply } from '../src/index.mjs';
 const text = '😀钟摆停止';
 const ix = () => index([{ id: 'm1', text, kind: 'event', source: { chapter: 1, para: 1 }, createdAt: Date.now(), lastAccessed: Date.now() }]);
 
-test('sync, async and expanded recall preserve surrogate pairs and prefixes', async () => {
+test('sync, async and expanded recall preserve surrogate pairs and evidence windows', async () => {
   for (const method of ['search', 'searchAsync', 'searchExpanded']) {
     const idx = ix();
     const opts = { expandFn: async q => ({ expanded: true, queries: [q, '停止'], ms: 0 }) };
-    for (const [budget, expected, truncated] of [[1, '', true], [2, '😀', true], [3, '😀钟', true], [text.length, text, false]]) {
+    for (const [budget, expected, truncated] of [[1, '', true], [2, '钟摆', true], [3, '钟摆停', true], [text.length, text, false]]) {
       const result = await idx[method]('钟摆', { ...opts, maxChars: budget });
       assert.equal(result.hits.length, 1, `${method} budget=${budget}`);
       assert.equal(result.hits[0].text, expected);
+      assert.ok(text.includes(result.hits[0].text));
+      assert.ok(result.hits[0].text.length <= budget);
+      assert.equal(result.hits[0].text.isWellFormed(), true);
       assert.equal(result.hits[0].truncated, truncated);
       assert.equal(result.chars, expected.length);
       assert.equal(result.hits[0].chars, expected.length);

@@ -99,7 +99,7 @@ export function createService(ctx, deps = {}) {
     },
 
     /**
-     * 按自然语言问题检索，返回**精简**结果（不含工具层的 render、耗时与冲突自述行）。
+     * 按自然语言问题检索，返回精简结果及冲突提示。
      *
      * 与 memjudge_recall 走同一条链：给了 deps.recall 时由宿主插件注入，参数口径一致
      * （budget 1..2000、topChapters 1..4）。区别只有一处：这里**不刷新访问时间**，
@@ -129,6 +129,7 @@ export function createService(ctx, deps = {}) {
         reason: String(found?.reason ?? ''),
         detail: String(found?.detail ?? ''),
         chars: Number(found?.chars) || 0,
+        conflictLine: String(found?.conflictLine ?? ''),
         hits: (Array.isArray(found?.hits) ? found.hits : []).map((h) => ({
           id: String(h?.id ?? ''),
           chapter: Number(h?.chapter) || 0,
@@ -136,7 +137,9 @@ export function createService(ctx, deps = {}) {
           chars: Number(h?.chars) || 0,
           score: Number(h?.score) || 0,
           text: String(h?.text ?? ''),
+          version: String(h?.version ?? ''),
           truncated: h?.truncated === true,
+          ...(Number.isInteger(h?.windowStart) ? { windowStart: h.windowStart, windowEnd: h.windowEnd, startsAtBoundary: h.startsAtBoundary === true } : {}),
         })),
       };
     },

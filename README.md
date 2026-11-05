@@ -6,9 +6,12 @@
 
 - `memjudge_remember` 保存记忆，支持类别、来源和重要度；相同正文按存储逻辑去重。
 - `memjudge_recall` 按查询检索，返回命中标识和正文片段；预算截断的命中标记 `truncated`。默认命中会刷新访问状态。
-- `memjudge_read` 按记忆 ID 分页读取原文，不刷新访问时间或计数；分页偏移按 UTF-16 码元计算，截断时避免拆开有效代理对。跨页读取不提供快照保证。
+- `memjudge_remember` 写入回执的 `version` 是完整原文的 UTF-16LE SHA-256；用返回的 `id` 和 `version` 可从首次回查起检查正文是否变化，重复写入同一正文返回相同版本。
+- `memjudge_read` 按记忆 ID 分页读取原文，不刷新访问时间或计数；分页偏移按 UTF-16 码元计算，截断时避免拆开有效代理对。每页传入同一 `version` 可检测正文变更；跨页读取不提供快照保证。
 - `memjudge_forget` 删除记忆；`memjudge_conflicts`、`memjudge_conflicts_v1`、`memjudge_conflicts_v2` 提供不同的冲突检查入口；`memjudge_stats` 返回统计信息。冲突候选需要结合原文判断，不等于自动确定真实的新旧结论。
 - 本地事实索引从记忆正文派生；召回、事实和冲突判断各有边界，未命中或拒答结果不应视为对现实事实的证明。
+
+冲突候选的每条 `evidence` 含 `memoryId`、`version`、`start`、`end` 和 `positions`；`positions` 标识来源，`start`、`end` 是正文中的 UTF-16 左闭右开偏移。回查时以 `memoryId`、`version` 和 `offset=start` 调用 `memjudge_read`，此后沿用相同版本及每页的 `nextOffset`，直至覆盖 `end`；末页只取到 `end` 为止，再拼接各页。若提示 `stale version`，应重新扫描冲突；内容变更后恢复为相同内容时，内容指纹不会体现中间变化。扫描和返回预算可能使长句或候选缺席，需检查 `scanIncomplete`、`reason` 和 `outputTruncated`。
 
 ## 配置与实验
 

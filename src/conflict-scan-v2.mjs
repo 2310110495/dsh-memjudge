@@ -1,5 +1,6 @@
 import { openConflictSnapshot, createFixedReader } from './conflict-snapshot.mjs';
 import { norm } from './judge.mjs';
+import { createHash } from 'node:crypto';
 
 const DEFAULTS = { sentences: 10000, sentenceBytes: 16384, quantities: 10000,
   comparisons: 100000, entries: 20000, conflicts: 1000, resultBytes: 65536 };
@@ -124,6 +125,7 @@ export function scanConflictReaderV2(reader, budget) {
       if (typeof mem.id !== 'string' || typeof mem.text !== 'string' || !Array.isArray(mem.occurrences)) {
         reason = 'invalidRecord'; break;
       }
+      const version = createHash('sha256').update(mem.text, 'utf16le').digest('hex');
       const groups = new Map(), unknown = [];
       for (const pos of mem.occurrences) {
         if (!pos || typeof pos !== 'object' || (pos.document_id != null && typeof pos.document_id !== 'string')) {
@@ -154,7 +156,7 @@ export function scanConflictReaderV2(reader, budget) {
             const byUnit = documents.get(doc);
             if (!byUnit.has(q.unit)) byUnit.set(q.unit, []);
             const prior = byUnit.get(q.unit);
-            const entry = { value: q.value, memoryId: mem.id, text: sent,
+            const entry = { value: q.value, memoryId: mem.id, version, text: sent,
               start: sentenceStart, end: sentenceEnd, positions };
             for (const old of prior) {
               if (comparisons >= budget.comparisons) { reason = 'comparisons'; break outer; }

@@ -390,11 +390,10 @@ export function hasChatKey() { return chatKey() !== ''; }
 export function hasEmbedKey() { return embedKey() !== ''; }
 export function hasRerankKey() { return rerankKey() !== ''; }
 
-/** 掩码：只露前 4 后 4，长度也不透露真实位数。 */
+/** 掩码：非空密钥统一显示固定值，不暴露内容或长度。 */
 export function maskKey(k = llmKey()) {
   if (!k) return '';
-  if (k.length <= 10) return '*'.repeat(k.length);
-  return `${k.slice(0, 4)}${'*'.repeat(8)}${k.slice(-4)}`;
+  return '********';
 }
 
 /** 密钥来源，用于面板区分「自己的」和「环境里别人的」。缺省组 = chat（旧调用语义）。 */
