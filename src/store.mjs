@@ -418,6 +418,26 @@ const SEGMENTS_DDL = `CREATE TABLE IF NOT EXISTS segments (
   bits BLOB NOT NULL
 ) WITHOUT ROWID;`;
 
+// Compare complete SQL tokens, preserving quoted literals and rejecting unknown syntax.
+function segmentSchemaTokens(sql) {
+  if (typeof sql !== 'string') return null;
+  const tokens = [];
+  const token = /\s+|[A-Za-z_][A-Za-z_0-9]*|'(?:''|[^'])*'|[(),]/gy;
+  let pos = 0;
+  while (pos < sql.length) {
+    token.lastIndex = pos;
+    const match = token.exec(sql);
+    if (!match) return null;
+    pos = token.lastIndex;
+    if (!/^\s+$/.test(match[0])) tokens.push(match[0][0] === "'" ? match[0] : match[0].toLowerCase());
+  }
+  return JSON.stringify(tokens);
+}
+const SEGMENT_SCHEMAS = new Set([
+  'CREATE TABLE segments (ord INTEGER PRIMARY KEY, bits BLOB NOT NULL) WITHOUT ROWID',
+  "CREATE TABLE segments (ord INTEGER PRIMARY KEY, seg_count INTEGER NOT NULL, covered TEXT NOT NULL DEFAULT '') WITHOUT ROWID",
+].map(segmentSchemaTokens));
+
 // ── 覆盖位图编解码 ────────────────────────────────────────────────────────
 // 布局：[uint16 大端段数][ceil(n/8) 字节位图，第 i 段 = 第 i>>3 字节的第 i&7 位]。
 // 位图被外力截短时缺位一律算「未覆盖」（宁可报脏也不静默忽略，与 v2 语义一致）。
@@ -638,25 +658,45 @@ export function open(dbPath = ':memory:', opts = {}) {
   function scanConflictsV2(options = {}) {
     if (scanningConflicts || db.isTransaction) throw new Error('conflict scan requires an idle connection');
     scanningConflicts = true;
-    let started = false, failure;
+    let beginAttempted = false, failure, failed = false, result;
     try {
       const normalized = normalizeConflictScanOptions(options);
+      assertOpen();
       if (db.isTransaction) throw new Error('conflict scan requires an idle connection');
+      beginAttempted = true;
       db.exec('BEGIN DEFERRED');
-      started = true;
-      return scanConflictConnectionV2(db, normalized);
+      if (!db.isTransaction) throw new Error('conflict scan begin did not start a transaction');
+      result = scanConflictConnectionV2(db, normalized);
     } catch (error) {
+      failed = true;
       failure = error;
-      throw error;
-    } finally {
-      try {
-        if (started) db.exec('ROLLBACK');
-      } catch (cleanup) {
-        if (failure !== undefined) throw new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure });
-        throw cleanup;
-      } finally {
-        scanningConflicts = false;
+    }
+    try {
+      if (beginAttempted) {
+        let active;
+        try { active = db.isTransaction; }
+        catch (cleanup) {
+          const cause = failed ? new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure }) : cleanup;
+          throw failStore(cause);
+        }
+        if (active) {
+          try { db.exec('ROLLBACK'); }
+          catch (cleanup) {
+            const cause = failed ? new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure }) : cleanup;
+            throw failStore(cause);
+          }
+        }
+        try {
+          if (db.isTransaction) throw new Error('conflict scan cleanup left an active transaction');
+        } catch (cleanup) {
+          const cause = failed ? new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure }) : cleanup;
+          throw failStore(cause);
+        }
       }
+      if (failed) throw failure;
+      return result;
+    } finally {
+      scanningConflicts = false;
     }
   }
   const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
@@ -694,6 +734,11 @@ export function open(dbPath = ':memory:', opts = {}) {
     }
   }
   if (objects.length) {
+    // Persistent facts are not removed by the current forget transaction.
+    // Reject every shape until deletion and migration can share that invariant.
+    if (objects.some(o => o.type === 'table' && o.name === 'facts')) {
+      throw new Error(`unrecognized ${fromVersion ? 'versioned' : 'unversioned'} database: persisted facts require forget-safe migration`);
+    }
     const expected = [
       ['id', 'TEXT', 0, null, 1], ['text', 'TEXT', 1, null, 0],
       ['text_hash', 'TEXT', 1, null, 0], ['created_at', 'INTEGER', 1, null, 0],
@@ -746,7 +791,10 @@ export function open(dbPath = ':memory:', opts = {}) {
   // 结构：byOrd（ord → Fact[]，供 factsOf/dump）与 slot（attr → [{ord,fact}]，
   // 供 (entity, attr) 存在性查询）。句子指针留在 fact 上，grounding 时回
   // memories.text 切片，不需要在库里再抄一份原文。
-  const memFacts = { byOrd: new Map(), slot: new Map(), total: 0 };
+  let memFacts = { byOrd: new Map(), slot: new Map(), total: 0 };
+  let factsRevision = 0;
+  let hybridRequest = 0;
+  let hybridPublishing = false;
   function addMemFact(ord, f, target = memFacts) {
     const vtype = VTYPE[f.valueType ?? 'text'] ?? VTYPE.text;
     const fact = {
@@ -769,7 +817,7 @@ export function open(dbPath = ':memory:', opts = {}) {
     slot.push({ ord, fact });
   }
   function buildFactsFor(ord, text, target = memFacts) {
-    const facts = extractL1(text);
+    const facts = (opts.extractL1 ?? extractL1)(text);
     for (const f of facts) addMemFact(ord, f, target);
     return facts.length;
   }
@@ -787,6 +835,7 @@ export function open(dbPath = ':memory:', opts = {}) {
     const before = version();
     let owned = false;
     let failure;
+    let failed = false;
     let snapshot;
     try {
       db.exec('BEGIN DEFERRED');
@@ -829,13 +878,14 @@ export function open(dbPath = ':memory:', opts = {}) {
       }
       snapshot = { rows, facts, dataVersion: before };
     } catch (error) {
+      failed = true;
       failure = error;
     }
     // BEGIN may have taken effect even when its wrapper throws.
     if (owned || db.isTransaction) {
       try { db.exec('ROLLBACK'); }
       catch (cleanup) {
-        const cause = failure !== undefined
+        const cause = failed
           ? new AggregateError([failure, cleanup], 'content snapshot and cleanup failed', { cause: failure })
           : cleanup;
         throw failStore(cause);
@@ -843,12 +893,12 @@ export function open(dbPath = ':memory:', opts = {}) {
     }
     if (db.isTransaction) {
       const cleanup = new Error('content snapshot cleanup left an active transaction');
-      const cause = failure !== undefined
+      const cause = failed
         ? new AggregateError([failure, cleanup], 'content snapshot and cleanup failed', { cause: failure })
         : cleanup;
       throw failStore(cause);
     }
-    if (failure !== undefined) throw failure;
+    if (failed) throw failure;
     if (version() !== before) throw new Error('content snapshot changed during read');
     return snapshot;
   }
@@ -858,9 +908,8 @@ export function open(dbPath = ':memory:', opts = {}) {
     const next = { byOrd: new Map(), slot: new Map(), total: 0 };
     const rows = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
     for (const m of rows) buildFactsFor(m.ord, m.text, next);
-    memFacts.byOrd = next.byOrd;
-    memFacts.slot = next.slot;
-    memFacts.total = next.total;
+    memFacts = next;
+    factsRevision++;
     const ms = Date.now() - t0;
     const info = { facts: memFacts.total, memories: rows.length, ms, reason };
     // 重建耗时是 captain 要看的数字：磁盘库默认打一行到 stderr；
@@ -903,6 +952,10 @@ export function open(dbPath = ':memory:', opts = {}) {
   // Only the documented v2 layout has a known conversion for coverage state.
   const segInfo = db.prepare('PRAGMA table_xinfo(segments)').all();
   const segCols = segInfo.map((c) => c.name);
+  const segmentObject = objects.find(o => o.type === 'table' && o.name === 'segments');
+  if (segmentObject && !SEGMENT_SCHEMAS.has(segmentSchemaTokens(segmentObject.sql))) {
+    throw new Error('segments migration: unrecognized layout');
+  }
   let rebuiltSegs = false;
   if (fromVersion >= 2 && !objects.some(o => o.type === 'table' && o.name === 'segments')) {
     throw new Error('segments migration: missing historical table');
@@ -924,6 +977,9 @@ export function open(dbPath = ':memory:', opts = {}) {
           row.seg_count > BITS_MAX_SEGMENTS || row.covered_type !== 'text' || row.text_type !== 'text' ||
           splitSegments(row.text).length !== row.seg_count) {
         throw new Error('segments migration: invalid row or segment count');
+      }
+      if (/[^01]/.test(row.covered) || row.covered.length > row.seg_count) {
+        throw new Error('segments migration: anomalous covered string');
       }
       return [row.ord, packCovered(row.seg_count, row.covered)];
     });
@@ -961,17 +1017,117 @@ export function open(dbPath = ':memory:', opts = {}) {
    * 启动路径永远走同步规则版（43ms、不等网络），这个入口给「显式刷新」用。
    */
   async function rebuildFactsHybrid(opts = {}) {
-    const { extractL1Hybrid } = await import('./extract.mjs');
-    const rows = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
-    const r = await extractL1Hybrid(rows.map((x) => ({ text: x.text })), opts);
-    if (r.source !== 'llm') return { facts: memFacts.total, memories: rows.length, source: r.source };
-    memFacts.byOrd.clear();
-    memFacts.slot.clear();
-    memFacts.total = 0;
-    rows.forEach((row, i) => {
-      for (const f of r.perEntry[i] || []) addMemFact(row.ord, f);
-    });
-    return { facts: memFacts.total, memories: rows.length, source: 'llm' };
+    assertOpen();
+    if (db.isTransaction) throw new Error('hybrid rebuild requires an idle connection');
+    const request = ++hybridRequest;
+    const dataVersion = db.prepare('PRAGMA data_version').get().data_version;
+    const changes = db.prepare('SELECT total_changes() AS n').get().n;
+    const revision = factsRevision;
+    const rows = db.prepare('SELECT rowid AS ord, id, text FROM memories ORDER BY created_at, id').all();
+    const extract = opts.extractHybrid ?? (await import('./extract.mjs')).extractL1Hybrid;
+    const r = await extract(rows.map((x) => ({ text: x.text })), opts);
+    assertOpen();
+    const next = { byOrd: new Map(), slot: new Map(), total: 0 };
+    const source = r?.source;
+    if (!['llm', 'rules', 'rules-fallback'].includes(source)) {
+      throw new Error('hybrid rebuild invalid extraction result');
+    }
+    if (source === 'llm') {
+      // Bound synchronous snapshot work; reject the whole result rather than publish a prefix.
+      const maxEntries = 100000, maxFactsPerEntry = 10000, maxFactsTotal = 100000;
+      const perEntry = r.perEntry;
+      if (!Array.isArray(perEntry)) throw new Error('hybrid rebuild invalid extraction result');
+      const entryCount = perEntry.length;
+      if (!Number.isSafeInteger(entryCount) || entryCount < 0 ||
+          entryCount > maxEntries || entryCount !== rows.length) {
+        throw new Error('hybrid rebuild invalid extraction result');
+      }
+      let factsTotal = 0;
+      for (let i = 0; i < entryCount; i++) {
+        const row = rows[i];
+        const entry = perEntry[i];
+        if (!Array.isArray(entry)) throw new Error('hybrid rebuild invalid extraction result');
+        const length = entry.length;
+        if (!Number.isSafeInteger(length) || length < 0 || length > maxFactsPerEntry ||
+            length > maxFactsTotal - factsTotal) {
+          throw new Error('hybrid rebuild invalid extraction result: fact budget exceeded or invalid length');
+        }
+        factsTotal += length;
+        for (let j = 0; j < length; j++) {
+        const raw = entry[j];
+        if (!raw || typeof raw !== 'object') throw new Error('hybrid rebuild invalid extraction result');
+        const f = { attr: raw.attr, value: raw.value, entity: raw.entity, valueType: raw.valueType,
+          at: raw.at, sentOff: raw.sentOff, sentLen: raw.sentLen, sent: raw.sent };
+        if (!f || typeof f !== 'object' || typeof f.attr !== 'string' || !f.attr.trim() ||
+            typeof f.value !== 'string' || !f.value.trim() ||
+            (f.entity != null && typeof f.entity !== 'string') ||
+            (f.valueType != null && (typeof f.valueType !== 'string' || !Object.hasOwn(VTYPE, f.valueType))) ||
+            ['at', 'sentOff', 'sentLen'].some(k => f[k] != null && (!Number.isSafeInteger(f[k]) || f[k] < 0)) ||
+            (f.at ?? 0) > row.text.length || (f.sentOff ?? f.at ?? 0) > row.text.length ||
+            (f.sentLen ?? 0) > row.text.length - (f.sentOff ?? f.at ?? 0) ||
+            (f.sent != null && (typeof f.sent !== 'string' ||
+              row.text.slice(f.sentOff ?? f.at ?? 0, (f.sentOff ?? f.at ?? 0) + (f.sentLen ?? 0)) !== f.sent))) {
+          throw new Error('hybrid rebuild invalid extraction result');
+        }
+        addMemFact(row.ord, f, next);
+        }
+      }
+    }
+    assertOpen();
+    if (db.isTransaction) throw new Error('hybrid rebuild requires an idle connection');
+    let locked = false;
+    let failure;
+    let failed = false;
+    const previous = memFacts;
+    let published = false;
+    hybridPublishing = true;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      locked = true;
+      if (request !== hybridRequest || revision !== factsRevision ||
+          changes !== db.prepare('SELECT total_changes() AS n').get().n ||
+          dataVersion !== db.prepare('PRAGMA data_version').get().data_version) {
+        throw new Error('hybrid rebuild snapshot stale');
+      }
+      const current = db.prepare('SELECT rowid AS ord, id, text FROM memories ORDER BY created_at, id').all();
+      if (current.length !== rows.length || current.some((row, i) =>
+        row.ord !== rows[i].ord || row.id !== rows[i].id || row.text !== rows[i].text)) {
+        throw new Error('hybrid rebuild snapshot stale');
+      }
+      if (source === 'llm') {
+        memFacts = next;
+        published = true;
+      }
+    } catch (error) {
+      failed = true;
+      failure = error;
+    }
+    try {
+    if (locked || db.isTransaction) {
+      try { db.exec('ROLLBACK'); }
+      catch (cleanup) {
+        const cause = failed
+          ? new AggregateError([failure, cleanup], 'hybrid rebuild and cleanup failed', { cause: failure })
+          : cleanup;
+        throw failStore(cause);
+      }
+    }
+    if (db.isTransaction) {
+      const cleanup = new Error('hybrid rebuild cleanup left an active transaction');
+      const cause = failed
+        ? new AggregateError([failure, cleanup], 'hybrid rebuild and cleanup failed', { cause: failure })
+        : cleanup;
+      throw failStore(cause);
+    }
+    if (failed) throw failure;
+    if (published) factsRevision++;
+    return { facts: memFacts.total, memories: rows.length, source };
+    } catch (error) {
+      if (published) memFacts = previous;
+      throw error;
+    } finally {
+      hybridPublishing = false;
+    }
   }
 
   // 库级字符预算（memento 语义）：maxChars > 0 时超限抛 BUDGET_EXCEEDED，不截断。
@@ -1019,10 +1175,11 @@ export function open(dbPath = ':memory:', opts = {}) {
       FROM memories WHERE kind = ? ORDER BY created_at ASC, id ASC LIMIT ?`),
   };
 
-  let closed = false;
+  let closeState = 'OPEN';
   const assertOpen = () => {
-    if (closed) throw new Error('store 已关闭');
+    if (closeState !== 'OPEN') throw new Error('store 已关闭或关闭状态未知');
     if (storeFault) throw storeFault;
+    if (hybridPublishing) throw new Error('hybrid rebuild publication in progress');
   };
 
   function factsOf(id) {
@@ -1119,6 +1276,7 @@ export function open(dbPath = ':memory:', opts = {}) {
   function dropFactsOf(id) {
     const row = stmt.rowidOf.get(id);
     if (!row) return 0;
+    factsRevision++;
     const list = memFacts.byOrd.get(row.ord) || [];
     for (const f of list) {
       const slot = memFacts.slot.get(f.attr);
@@ -1143,8 +1301,12 @@ export function open(dbPath = ':memory:', opts = {}) {
    *   人 / 约无论传什么都被钳回 1（见 normalizeTier）。
    * @returns {{id:string, inserted:boolean, factCount:number, kind:string, tier:number}}
    */
+  let putting = false;
   function put(input = {}) {
     assertOpen();
+    putting = true;
+    try {
+    if (db.isTransaction) throw new Error('put requires an idle connection');
     const text = input.text;
     if (typeof text !== 'string' || text.length === 0) {
       throw new TypeError('put: text 必须是非空字符串');
@@ -1161,8 +1323,10 @@ export function open(dbPath = ':memory:', opts = {}) {
     // 否则一次不关心 tier 的重写就会把 nightly 算出来的层级静默抹掉。
     const tierGiven = input.tier != null && input.tier !== '' && Number.isFinite(Number(input.tier));
     const tier = tierGiven ? normalizeTier(input.tier, kind) : defaultTier(kind);
-    db.exec('BEGIN IMMEDIATE');
+    let committing = false;
     try {
+    db.exec('BEGIN IMMEDIATE');
+    if (!db.isTransaction) throw new Error('put begin did not start a transaction');
     const hit = stmt.byHash.get(hash);
     if (hit) {
       // 哈希相同但正文不同 → 撞了，宁可炸也不写坏数据
@@ -1180,7 +1344,9 @@ export function open(dbPath = ':memory:', opts = {}) {
       }
       if (input.recordDuplicateOccurrence !== false) stmt.insOccurrence.run(hit.id, source, documentId, chapter, para);
       const factCount = factsOf(hit.id).length;
+      committing = true;
       db.exec('COMMIT');
+      if (db.isTransaction) throw new Error('put commit left an active transaction');
       return {
         id: hit.id,
         inserted: false,
@@ -1211,13 +1377,30 @@ export function open(dbPath = ':memory:', opts = {}) {
       // 整条的存储开销——落盘的只有段数与覆盖位图（BLOB，8 段/字节）。
       const segs = splitSegments(text);
       stmt.insSeg.run(ord, packCovered(segs.length));
-      const factCount = buildFactsFor(ord, text);
+      const nextFacts = {
+        byOrd: new Map([...memFacts.byOrd].map(([key, list]) => [key, list.slice()])),
+        slot: new Map([...memFacts.slot].map(([key, list]) => [key, list.slice()])),
+        total: memFacts.total,
+      };
+      const factCount = buildFactsFor(ord, text, nextFacts);
+      committing = true;
       db.exec('COMMIT');
+      if (db.isTransaction) throw new Error('put commit left an active transaction');
+      memFacts = nextFacts;
+      factsRevision++;
       return { id, inserted: true, factCount, segmentCount: segs.length, kind, tier };
     } catch (err) {
-      db.exec('ROLLBACK');
-      rebuildFacts('put rollback');
+      if (!db.isTransaction) {
+        if (committing) throw failStore(err);
+        throw err;
+      }
+      try { db.exec('ROLLBACK'); }
+      catch (cleanup) { throw failStore(new AggregateError([err, cleanup], 'put and cleanup failed', { cause: err })); }
+      if (db.isTransaction) throw failStore(new AggregateError([err, new Error('put cleanup left an active transaction')], 'put and cleanup failed', { cause: err }));
       throw err;
+    }
+    } finally {
+      putting = false;
     }
   }
 
@@ -1439,9 +1622,17 @@ export function open(dbPath = ':memory:', opts = {}) {
   }
 
   function close() {
-    if (closed) return;
-    closed = true;
-    db.close();
+    if (hybridPublishing) throw new Error('hybrid rebuild publication in progress');
+    if (closeState === 'CLOSED') return;
+    if (closeState === 'CLOSING') throw new Error('store close already in progress');
+    closeState = 'CLOSING';
+    try {
+      db.close();
+      closeState = 'CLOSED';
+    } catch (error) {
+      closeState = 'UNCERTAIN';
+      throw error;
+    }
   }
 
   /** 回收插入过程留下的空闲页。体积验收前调一次，字节数是压缩后口径 */
@@ -1576,8 +1767,17 @@ export function open(dbPath = ':memory:', opts = {}) {
     raw: () => db,
   };
   for (const [name, fn] of Object.entries(api)) {
-    if (typeof fn === 'function' && name !== 'close' && name !== 'raw') {
-      api[name] = (...args) => { assertOpen(); return fn(...args); };
+    if (typeof fn === 'function') {
+      api[name] = (...args) => {
+        if (putting) {
+          const error = new Error('put operation in progress');
+          if (name === 'rebuildFactsHybrid') return Promise.reject(error);
+          throw error;
+        }
+        if (name === 'rebuildFactsHybrid') return fn(...args);
+        if (name !== 'close' && name !== 'raw') assertOpen();
+        return fn(...args);
+      };
     }
   }
   db.exec('COMMIT');

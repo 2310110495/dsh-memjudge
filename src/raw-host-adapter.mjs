@@ -137,15 +137,18 @@ export function installRawHostAdapter(ctx, input) {
   if(typeof ctx.inject!=='function') throw Error('raw-host-inject-required');
   let disposed=false, previousClosed=Promise.resolve();
   const workers=new Set();
-  const injection=ctx.inject(['sessions','sessionPersistence'], child=>{
+  let firstCleanupError, cleanupFailures=0;
+  let injection;
+  try{injection=ctx.inject(['sessions','sessionPersistence'], child=>{
     const backend=child.sessionPersistence;
     policy.assertBackend(backend);
     const predecessor=previousClosed;
-    let release,lease,repo;
-    previousClosed=new Promise(resolve=>release=resolve);
-    let active=true,timer=null;
+    let release,rejectRelease,lease,repo,predecessorFailure,predecessorFailed=false;
+    previousClosed=new Promise((resolve,reject)=>{release=resolve;rejectRelease=reject;});
+    previousClosed.catch(()=>{});
+    let active=true,timer=null,handleCloseFailed=false,handleCloseError;
     const diagnostics=new Set();
-    const diagnose=error=>{const message=String(error.message).slice(0,160);if(diagnostics.size<16&&!diagnostics.has(message)){diagnostics.add(message);console.error('[memjudge raw archive]',message);}};
+    const diagnose=error=>{let message;try{message=String(error?.message ?? error).slice(0,160);}catch{message='unprintable error';}if(diagnostics.size<16&&!diagnostics.has(message)){diagnostics.add(message);console.error('[memjudge raw archive]',message);}};
     const abort=new AbortController();
     const check=header=>{if(disposed||!active||child.sessionPersistence?.identity!==backend.identity)throw Error('raw-stale-epoch');policy.assertBackend(backend);if(header)policy.authorize(header);};
     const scan=async()=>{
@@ -153,7 +156,7 @@ export function installRawHostAdapter(ctx, input) {
       const listed=await backend.list({signal:abort.signal});
       for(const entry of listed){
         check();
-        let handle, horizon=null, events, provenance, unknown=false, cloneFailed=false, publishing=false;
+        let handle, horizon=null, events, provenance, unknown=false, cloneFailed=false, publishing=false,firstCloseFailed=false,firstCloseError;
         const variants=[], untrusted=new Set();
         const preserve=()=>{publishing=true;for(const event of [...events,...variants]){check(entry.header);const result=repo.ingestHostEvent({fullSessionId:entry.header.id,event,source:provenance,untrustedIdentity:untrusted.has(event)});if(result.classification==='pending')throw Error('raw-preservation-pending');}};
         try{
@@ -218,7 +221,7 @@ export function installRawHostAdapter(ctx, input) {
           const after=await backend.stat(entry.header.id,{signal:abort.signal});
           check(handle.header);
           if(!after||after.revision!==entry.revision||!same(after.header,entry.header)||handle.inheritedEventCount!==inherited)throw Error('raw-revision-changed');
-          await handle.close();handle=null;
+          try{await handle.close();}catch(error){firstCloseFailed=true;firstCloseError=error;throw error;}handle=null;
           check(entry.header);
           preserve();
           if(unknown)repo.recordHostDirty({fullSessionId:entry.header.id,nextSeq:H,reason:'unsupported-identity'});
@@ -232,33 +235,73 @@ export function installRawHostAdapter(ctx, input) {
           // Read instability does not erase already authorized opaque evidence.
           // Publication failures are never retried through a fallback branch.
           if(unknown&&!publishing){check(entry.header);preserve();}
-          const reason=['raw-unresolved-scope','raw-invalid-session-header','raw-sequence-gap','raw-prefix-changed','raw-revision-changed','raw-header-changed'].includes(error.message)?error.message:'source-unavailable';
+          let message;try{message=error?.message;}catch{}
+          const reason=['raw-unresolved-scope','raw-invalid-session-header','raw-sequence-gap','raw-prefix-changed','raw-revision-changed','raw-header-changed'].includes(message)?message:'source-unavailable';
           repo.recordHostDirty({fullSessionId:typeof entry.header?.id==='string'?entry.header.id:'',nextSeq:horizon,reason});
           diagnose(error);
-        }finally{if(handle){try{await handle.close();}catch{check();}}}
+        }finally{if(handle){try{await handle.close();}catch(error){handleCloseFailed=true;handleCloseError=firstCloseFailed?[firstCloseError,error]:[error];throw error;}}}
       }
     };
-    let pending=Promise.resolve(),closing=false;
-    const tick=()=>{pending=(async()=>{try{await scan();}catch(error){if(active&&!disposed)diagnose(error);}finally{if(active&&!disposed){timer=setTimeout(tick,policy.intervalMs);timer.unref?.();}}})();};
+    let pending=Promise.resolve(),closing;
+    const tick=()=>{pending=(async()=>{try{await scan();}catch(error){if(active&&!disposed)diagnose(error);}finally{if(active&&!disposed&&!handleCloseFailed){timer=setTimeout(tick,policy.intervalMs);timer.unref?.();}}})();};
     const cleanup=()=>{
-      if(closing)return;
-      closing=true;active=false;abort.abort();clearTimeout(timer);workers.delete(cleanup);
+      if(closing)return closing;
+      let resolveClosing,rejectClosing;
+      closing=new Promise((resolve,reject)=>{resolveClosing=resolve;rejectClosing=reject;});
+      active=false;
+      const errors=[];
+      try{abort.abort();}catch(error){errors.push(error);}
+      try{clearTimeout(timer);}catch(error){errors.push(error);}
       // Outstanding reads must settle and close before releasing ownership.
-      return pending.finally(()=>{try{repo?.close();}finally{try{lease?.close();}finally{release();}}});
+      (async()=>{
+        try{await pending;}catch(error){errors.push(error);}
+        if(handleCloseFailed)errors.push(...handleCloseError);
+        try{await repo?.close();}catch(error){errors.push(error);}
+        if(!errors.length&&!predecessorFailed){try{await lease?.close();}catch(error){errors.push(error);}}
+        if(errors.length||predecessorFailed){
+          const failure=errors.length ? new AggregateError(errors,'raw worker cleanup failed') : predecessorFailure;
+          rejectRelease(failure);
+          throw failure;
+        }
+        release();
+      })().then(resolveClosing,rejectClosing);
+      closing.then(()=>workers.delete(cleanup),error=>{
+        workers.delete(cleanup);
+        if(cleanupFailures++===0)firstCleanupError=error;
+      });
+      return closing;
     };
     workers.add(cleanup);
     pending=(async()=>{
-      await predecessor;
+      try{await predecessor;}catch(error){predecessorFailed=true;predecessorFailure=error;return;}
       if(!active||disposed)return;
       try{
         check();lease=openNamespace({...policy,writable:true});
         repo=new RawRepository(path.join(policy.directory,'raw.sqlite'),lease);
         await scan();
       }catch(error){if(active&&!disposed)diagnose(error);}
-      finally{if(repo&&active&&!disposed){timer=setTimeout(tick,policy.intervalMs);timer.unref?.();}}
+      finally{if(repo&&active&&!disposed&&!handleCloseFailed){timer=setTimeout(tick,policy.intervalMs);timer.unref?.();}}
     })();
-    child.effect(()=>cleanup);
+    try{child.effect(()=>cleanup);}catch(error){cleanup().catch(()=>{});throw error;}
     return cleanup;
-  });
-  return ()=>{disposed=true;policy.revoke();for(const stop of workers)stop();if(typeof injection==='function')injection();else injection?.dispose?.();};
+  });}catch(error){disposed=true;try{policy.revoke();}catch{}for(const stop of workers)stop().catch(()=>{});throw error;}
+  let stopping;
+  return ()=>{
+    if(stopping)return stopping;
+    let resolveStopping,rejectStopping;
+    stopping=new Promise((resolve,reject)=>{resolveStopping=resolve;rejectStopping=reject;});
+    disposed=true;
+    const results=[];
+    if(cleanupFailures)results.push(Promise.reject(firstCleanupError));
+    const collect=fn=>{try{const result=fn();if(result!==stopping)results.push(Promise.resolve(result));}catch(error){results.push(Promise.reject(error));}};
+    collect(()=>policy.revoke());
+    for(const stop of workers)collect(stop);
+    collect(()=>typeof injection==='function'?injection():injection?.dispose?.());
+    Promise.allSettled(results).then(settled=>{
+      const errors=settled.filter(result=>result.status==='rejected').map(result=>result.reason);
+      if(errors.length)rejectStopping(new AggregateError(errors,'raw host cleanup failed'));
+      else resolveStopping();
+    },rejectStopping);
+    return stopping;
+  };
 }

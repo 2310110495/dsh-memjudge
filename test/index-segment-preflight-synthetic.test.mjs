@@ -101,6 +101,21 @@ test('canonical indices and v2 segments migrate and reopen', () => fixture(db =>
   }
   assert.equal(db.prepare("SELECT tbl_name FROM sqlite_master WHERE name='ux_memories_hash'").get().tbl_name, 'memories');
 }));
+for (const version of [2, 7]) {
+  for (const check of ['CHECK(1)', "CHECK(length('CHECK ( 1 )') > 0)"]) {
+    test(`v${version} disguised ${check} is rejected unchanged`, () => fixture(db => {
+      db.exec('DROP TABLE segments');
+      if (version === 2) {
+        db.exec(`CREATE TABLE segments (ord INTEGER PRIMARY KEY, seg_count INTEGER NOT NULL, covered TEXT NOT NULL DEFAULT '' ${check}) WITHOUT ROWID;
+          INSERT INTO segments VALUES (17,1,'1'); UPDATE meta SET v='2' WHERE k='schema_version'`);
+      } else {
+        db.exec(`CREATE TABLE segments (ord INTEGER PRIMARY KEY, bits BLOB NOT NULL ${check}) WITHOUT ROWID;
+          INSERT INTO segments VALUES (17,x'000101')`);
+      }
+      rejectsPreserving(db, /segments migration: unrecognized layout/);
+    }));
+  }
+}
 test('missing historical indexes are recreated', () => fixture(db => {
   v2(db);
   db.exec('DROP INDEX ux_memories_hash; DROP INDEX ux_memory_occurrences_position');

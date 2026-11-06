@@ -57,6 +57,10 @@ import {
 import { installMemjudgeRpc } from './rpc.mjs';
 import { createService, SERVICE_NAME } from './service.mjs';
 import { createContentSnapshotView } from './content-snapshot-view.mjs';
+import { createDisposal, initializeWithDisposal } from './disposal.mjs';
+import { startupDependencies } from './startup-dependencies.mjs';
+import { expand } from './query-expand.mjs';
+import { select } from './llm-select.mjs';
 
 /** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
 export const name = 'memjudge';
@@ -121,7 +125,7 @@ export const TOOL_NAMES = Object.freeze([
  *  只 +16KB（188416 B），128 维要 +31KB 顶穿 199680 的验收线——所以默认压在 64。
  *  必须是函数：面板改了 dims 之后同一个进程里要立刻按新维度读向量块，
  *  否则 allVectors 会拿旧维度的块当有效数据。 */
-const vecDims = () => embedDims();
+
 
 export const DEFAULTS = Object.freeze({
   /** 空串 = <DSH_HOME|~/.dsh>/memjudge/memjudge.db。绝不写用户主 profile 之外的位置。 */
@@ -341,7 +345,19 @@ export function isHardDeny(verdict, query, body) {
  * @param {object} ctx cordis Context（需已注入 tools 与 systemPrompt）
  * @param {object} [config] 见 DEFAULTS
  */
-export function apply(ctx, config, { storeFactory = openStore } = {}) {
+export function apply(ctx, config, dependencies = {}) {
+  const deps = startupDependencies({
+    storeFactory: openStore,
+    maxChars: configuredMaxChars,
+    storageLimitBytes: configuredStorageLimitBytes,
+    installRpc: installMemjudgeRpc,
+    autoCapture: resolveAutoCapture,
+    defaultDbPath,
+    configReport,
+    embedDims,
+    expand,
+    select,
+  }, dependencies);
   const cfg = resolveConfig(config);
   const snapshotRecallEnabled = cfg.experimentalSnapshotRecall;
   const vectorEnabled = () => !snapshotRecallEnabled && cfg.vector;
@@ -351,7 +367,8 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
     decayFloor: cfg.decayFloor,
   };
   const now = cfg.now ?? (() => Date.now());
-  const dbPath = cfg.dbPath || defaultDbPath();
+  const dbPath = cfg.dbPath || deps.defaultDbPath();
+  const vecDims = () => deps.embedDims();
   let index = null;
   let indexDirty = true;
   let injectCache = null;
@@ -374,23 +391,22 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
   const assertHealthy = () => { if (fault) throw fault; };
   // 两个上限都来自用户配置层（env > config.json > 默认 2MB / 0）：
   // storageLimitBytes 只决定 stats() 的「上限/是否超预算」，maxChars 才是写入闸门。
-  const store = storeFactory(dbPath, {
+  const store = deps.storeFactory(dbPath, {
     now,
-    maxChars: configuredMaxChars(),
-    storageLimitBytes: configuredStorageLimitBytes(),
+    maxChars: deps.maxChars(),
+    storageLimitBytes: deps.storageLimitBytes(),
     onFault: (cause) => enterFault(cause),
   });
 
-  /** @type {Array<() => void>} 所有注册的 disposer，逆序调用一次 */
-  const disposers = [];
-  const track = (disposer) => {
-    if (typeof disposer === 'function') disposers.push(disposer);
-    return disposer;
-  };
+  const { track, dispose } = createDisposal({
+    close: () => store.close(),
+    clear: () => { index = null; injectCache = null; },
+  });
 
+  return initializeWithDisposal(ctx, dispose, () => {
   // 宿主 RPC 通道：给 browser 半侧（client.js 的设置页「记忆库」面板）提供只读数据。
   // 无 Connection RPC 时静默空函数，不影响其它功能。
-  track(installMemjudgeRpc(ctx, { dbPath }));
+  track(deps.installRpc(ctx, { dbPath }));
   // Explicit trusted startup configuration; never derived from tool/RPC input.
   if (config?.rawArchive?.enabled === true) track(installRawHostAdapter(ctx, config.rawArchive));
 
@@ -662,7 +678,7 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
   //
   // 守卫的必要性：test/plugin.test.mjs 的 MockContext 只有 tools / systemPrompt / effect，
   // 没有 on。不判就整条 apply 抛错，既有 5 条工具用例全崩。
-  const autoCfg = resolveAutoConfig(resolveAutoCapture(config && typeof config === 'object' ? config : {}));
+  const autoCfg = resolveAutoConfig(deps.autoCapture(config && typeof config === 'object' ? config : {}));
   // config.autoCapture === false 是硬开关：即使 env 把它翻回 true 也不采集。
   const autoEnabled = autoCfg.enabled !== false && !(config && config.autoCapture === false);
   // 配额状态机在 apply 里建一次、handler 复用。每次重建等于单会话/单轮上限从未生效。
@@ -943,11 +959,11 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
     const ix = view ?? getIndex();
     const generation = contentGeneration;
     const found = view ? ix.search(query, { maxChars: budget, topChapters, now: now() }) : cfg.expand
-      ? await ix.searchExpanded(query, { maxChars: budget, topChapters, now: now() })
+      ? await ix.searchExpanded(query, { maxChars: budget, topChapters, now: now(), expandFn: deps.expand })
       : (cfg.llmSelect || (vectorEnabled() && ix.hasVectors))
         ? await ix.searchAsync(query, {
           maxChars: budget, topChapters, now: now(),
-          dims: vecDims(), cacheDir: cfg.vectorCacheDir, llmSelect: cfg.llmSelect,
+          dims: vecDims(), cacheDir: cfg.vectorCacheDir, llmSelect: cfg.llmSelect, selectFn: deps.select,
         })
         : ix.search(query, { maxChars: budget, topChapters, now: now() });
     assertHealthy();
@@ -1476,6 +1492,7 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
       // （要按章合并且文本），tier 提案要逐条的行（含 kind/tier/lastAccessed/accessCount），
       // 所以第二份输入单独传。两边都只是报告，真正落库在 scripts/nightly.mjs。
       const tidy = sleepPhase(chapterRows(), { tierRows: store.dump() });
+      const report = deps.configReport();
       const out = {
         memories: base.memories,
         facts: base.facts,
@@ -1497,14 +1514,14 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
           + ` / ${tidy.relations.length} 条共现关系`
           + (tidy.errors.length ? ` / ${tidy.errors.length} 阶段失败` : ''),
         modules: (() => {
-          const r = configReport();
+          const r = report;
           const f = r.flags;
           return `jieba ${f.jieba ? 'ON' : 'OFF'} / 向量 ${f.vector ? 'ON' : 'OFF'}`
             + ` / rerank ${f.rerank ? 'ON' : 'OFF'} / 扩展 ${f.expand ? 'ON' : 'OFF'}`
             + ` / 选段 ${f.llmSelect ? 'ON' : 'OFF'} / LLM提取 ${f.llmExtract ? 'ON' : 'OFF'}`;
         })(),
-        keyConfigured: configReport().hasKey,
-        keySource: configReport().keySource,
+        keyConfigured: report.hasKey,
+        keySource: report.keySource,
         panelPath: path.join(STATE_DIR, 'panel.html'),
         // wiki 投影是懒编的：体检会顺手把它建起来（只花内存，不写库、不动注入面）。
         wiki: (() => {
@@ -1556,26 +1573,8 @@ export function apply(ctx, config, { storeFactory = openStore } = {}) {
 
   // -------------------------------------------------------------- 卸载
 
-  const dispose = () => {
-    for (const disposer of disposers.splice(0).reverse()) {
-      try {
-        disposer();
-      } catch {
-        // 宿主销毁 ctx 时可能已经回收过同一个 effect，重复调用按幂等处理。
-      }
-    }
-    index = null;
-    injectCache = null;
-    try {
-      store.close();
-    } catch {
-      // 已关闭
-    }
-  };
-
-  ctx.effect(() => dispose);
-
   return { dispose, dbPath, config: cfg };
+  });
 }
 
 export default {

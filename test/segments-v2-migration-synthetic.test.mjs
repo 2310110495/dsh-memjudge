@@ -37,7 +37,7 @@ function fixture(fn) {
       VALUES (17,'a','甲乙，丙丁，戊己','a',1,1,'event',3), (41,'b','天地，玄黄，宇宙','b',2,2,'event',3)`);
     store.raw().exec(`DROP TABLE segments;
       CREATE TABLE segments (ord INTEGER PRIMARY KEY, seg_count INTEGER NOT NULL, covered TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
-      INSERT INTO segments VALUES (17,3,'111'),(41,3,'1x'); UPDATE meta SET v='2' WHERE k='schema_version'`);
+      INSERT INTO segments VALUES (17,3,'111'),(41,3,'1'); UPDATE meta SET v='2' WHERE k='schema_version'`);
     store.close();
     fn(current);
   } finally { current.close(); current = undefined; injectFault = false; }
@@ -78,6 +78,27 @@ test('write fault after dropping old table rolls back', () => fixture(db => {
   assert.equal(db.isTransaction, false);
 }));
 
+for (const value of ['1x', '1010', '1\u0000', '１１', ' 1', '1\n']) {
+  test(`anomalous covered ${JSON.stringify(value)} rolls back byte-for-byte`, () => fixture(db => {
+    db.prepare('UPDATE segments SET covered=? WHERE ord=41').run(value);
+    const before = db.prepare('SELECT hex(CAST(covered AS BLOB)) AS bytes FROM segments WHERE ord=41').get().bytes;
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name='segments'").get().sql;
+    assert.throws(() => open(':memory:'), /anomalous covered string/);
+    assert.equal(db.prepare('SELECT hex(CAST(covered AS BLOB)) AS bytes FROM segments WHERE ord=41').get().bytes, before);
+    assert.equal(db.prepare("SELECT sql FROM sqlite_master WHERE name='segments'").get().sql, schema);
+    assert.equal(db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '2');
+    assert.equal(db.isTransaction, false);
+  }));
+}
+test('empty historical coverage remains compatible across reopen', () => fixture(db => {
+  db.exec("UPDATE segments SET covered='' WHERE ord=41");
+  for (let i = 0; i < 2; i++) {
+    const store = open(':memory:');
+    try { assert.deepEqual(store.segmentsOf('b').map(x => x.covered), [0, 0, 0]); }
+    finally { store.close(); }
+  }
+}));
+
 const factsDDL = `CREATE TABLE facts (
   memory_id INTEGER NOT NULL,
   entity TEXT,
@@ -88,7 +109,7 @@ const factsDDL = `CREATE TABLE facts (
   kind TEXT NOT NULL,
   at INTEGER NOT NULL
 )`;
-function historical(version, run, facts = factsDDL) {
+function historical(version, run, facts = null) {
   current = new RealDatabase(':memory:');
   try {
     current.exec(`CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -99,10 +120,10 @@ function historical(version, run, facts = factsDDL) {
       CREATE UNIQUE INDEX ux_memories_hash ON memories(text_hash);
       INSERT INTO memories (rowid,id,text,text_hash,created_at,last_accessed) VALUES (17,'a','甲乙，丙丁，戊己','hash',1,1);
       ${version === 2 ? "CREATE TABLE segments (ord INTEGER PRIMARY KEY, seg_count INTEGER NOT NULL, covered TEXT NOT NULL DEFAULT '') WITHOUT ROWID; INSERT INTO segments VALUES (17,3,'101');" : "CREATE TABLE segments (ord INTEGER PRIMARY KEY, bits BLOB NOT NULL) WITHOUT ROWID; INSERT INTO segments VALUES (17,x'000305');"}
-      ${facts};
+      ${facts ? `${facts};
       INSERT INTO facts(rowid,memory_id,entity,attr,key,value,unit,kind,at) VALUES
         (9,17,NULL,'depth','d','001',NULL,'value',3),
-        (37,17,x'00ff','attr','k',x'4100','unit','id',4)`);
+        (37,17,x'00ff','attr','k',x'4100','unit','id',4);` : ''}`);
     run(current);
   } finally { current.close(); current = undefined; injectFault = false; }
 }
@@ -111,21 +132,29 @@ function factsSnapshot(db) {
     attr, key, hex(value) v, typeof(value) vt, unit, kind, at, typeof(at) att FROM facts ORDER BY rowid`).all().map(x => ({...x}));
 }
 for (const version of [2, 3]) {
-  test(`historical v${version} facts and coverage survive migration and reopen`, () => historical(version, db => {
-    const before = factsSnapshot(db);
-    const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE name='facts'").get().sql;
-    const root = db.prepare("SELECT rootpage FROM sqlite_master WHERE name='facts'").get().rootpage;
+  test(`historical v${version} without facts migrates coverage and reopens`, () => historical(version, db => {
     for (let i = 0; i < 2; i++) {
       const store = open(':memory:');
       try {
         assert.equal(db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '7');
         assert.deepEqual(store.segmentsOf('a').map(x => x.covered), [1, 0, 1]);
-        assert.deepEqual(factsSnapshot(db), before);
-        assert.equal(db.prepare("SELECT sql FROM sqlite_master WHERE name='facts'").get().sql, ddl);
-        assert.equal(db.prepare("SELECT rootpage FROM sqlite_master WHERE name='facts'").get().rootpage, root);
       } finally { store.close(); }
     }
   }));
+  test(`historical v${version} facts block migration without mutation`, () => historical(version, db => {
+    const before = factsSnapshot(db);
+    const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE name='facts'").get().sql;
+    const root = db.prepare("SELECT rootpage FROM sqlite_master WHERE name='facts'").get().rootpage;
+    const snapshot = metaSnapshot(db);
+    for (let i = 0; i < 2; i++) {
+      assert.throws(() => open(':memory:'), /persisted facts require forget-safe migration/);
+      assert.deepEqual(factsSnapshot(db), before);
+      assert.equal(db.prepare("SELECT sql FROM sqlite_master WHERE name='facts'").get().sql, ddl);
+      assert.equal(db.prepare("SELECT rootpage FROM sqlite_master WHERE name='facts'").get().rootpage, root);
+      assert.deepEqual(metaSnapshot(db), snapshot);
+      assert.equal(db.isTransaction, false);
+    }
+  }, factsDDL));
 }
 for (const [name, change] of [
   ['extra index', 'CREATE INDEX facts_extra ON facts(value)'],
@@ -134,25 +163,25 @@ for (const [name, change] of [
 ]) test(`historical facts reject ${name} without mutation`, () => historical(2, db => {
   db.exec(change);
   const before = factsSnapshot(db);
-  assert.throws(() => open(':memory:'), /unrecognized/);
+  assert.throws(() => open(':memory:'), /persisted facts require forget-safe migration/);
   assert.deepEqual(factsSnapshot(db), before);
   assert.equal(db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '2');
   assert.equal(db.isTransaction, false);
-}));
+}, factsDDL));
 for (const [name, ddl] of [
   ['extra constraint', factsDDL.replace('value TEXT NOT NULL', 'value TEXT NOT NULL CHECK(length(value)>0)')],
   ['extra column', factsDDL.replace('at INTEGER NOT NULL', 'at INTEGER NOT NULL, other TEXT')],
 ]) test(`historical facts reject ${name}`, () => historical(2, db => {
   const before = factsSnapshot(db);
-  assert.throws(() => open(':memory:'), /unrecognized historical facts table/);
+  assert.throws(() => open(':memory:'), /persisted facts require forget-safe migration/);
   assert.deepEqual(factsSnapshot(db), before);
   assert.equal(db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '2');
 }, ddl));
-test('historical facts remain unchanged after segment migration fault', () => historical(2, db => {
-  const before = factsSnapshot(db);
+test('historical segments remain unchanged after migration fault', () => historical(2, db => {
+  const before = metaSnapshot(db);
   injectFault = true;
   assert.throws(() => open(':memory:'), /synthetic fault/);
-  assert.deepEqual(factsSnapshot(db), before);
+  assert.deepEqual(metaSnapshot(db), before);
   assert.equal(db.prepare('SELECT covered FROM segments').get().covered, '101');
   assert.equal(db.prepare("SELECT v FROM meta WHERE k='schema_version'").get().v, '2');
   assert.equal(db.isTransaction, false);
@@ -203,6 +232,6 @@ test('meta migration fault restores metadata and old table', () => historical(2,
 test('unversioned historical facts are conservatively rejected', () => historical(2, db => {
   db.exec("DELETE FROM meta WHERE k='schema_version'");
   const before = factsSnapshot(db);
-  assert.throws(() => open(':memory:'), /unrecognized unversioned database/);
+  assert.throws(() => open(':memory:'), /unrecognized unversioned database: persisted facts require forget-safe migration/);
   assert.deepEqual(factsSnapshot(db), before);
-}));
+}, factsDDL));
