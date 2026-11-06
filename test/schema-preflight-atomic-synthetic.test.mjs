@@ -6,6 +6,51 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { open } from '../src/store.mjs';
 
+function versionWriteSnapshot(db) {
+  const schema = db.prepare('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name').all();
+  const tables = new Set(schema.filter(row => row.type === 'table').map(row => row.name));
+  const rows = table => tables.has(table) ? db.prepare(`SELECT rowid,* FROM ${table} ORDER BY rowid`).all().map(row => ({ ...row })) : null;
+  return { schema: schema.map(row => ({ ...row })), meta: rows('meta'), memories: rows('memories'), occurrences: rows('memory_occurrences'), segments: tables.has('segments') ? db.prepare('SELECT * FROM segments ORDER BY ord').all().map(row => ({ ...row })) : null };
+}
+
+for (const [branch, sql] of [
+  ['update', 'UPDATE meta SET v = ? WHERE k = ?'],
+  ['insert', 'INSERT INTO meta (k, v) VALUES (?, ?)'],
+]) {
+  test(`schema version ${branch} execution rolls back and releases the lock`, () => fixture(file => {
+    if (branch === 'update') {
+      seed(file);
+      inspect(file, db => db.exec("DROP TABLE segments; CREATE TABLE segments (ord INTEGER PRIMARY KEY, seg_count INTEGER NOT NULL, covered TEXT NOT NULL DEFAULT '') WITHOUT ROWID; INSERT INTO segments SELECT rowid,1,'1' FROM memories; UPDATE meta SET v='2' WHERE k='schema_version'; INSERT INTO meta VALUES ('other','keep'); INSERT INTO memory_occurrences (memory_id,source,document_id,chapter,para) VALUES ('id','update sentinel','update doc',4,5)"));
+    } else {
+      inspect(file, db => db.exec("CREATE TABLE memories (id TEXT PRIMARY KEY, text TEXT NOT NULL, text_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_accessed INTEGER NOT NULL, access_count INTEGER NOT NULL DEFAULT 0, importance REAL NOT NULL DEFAULT 0, supersedes TEXT, source TEXT); INSERT INTO memories (rowid,id,text,text_hash,created_at,last_accessed,source) VALUES (17,'a','one','hash',1,1,'synthetic'); CREATE TABLE memory_occurrences (memory_id TEXT NOT NULL, source TEXT, document_id TEXT, chapter INTEGER, para INTEGER); INSERT INTO memory_occurrences VALUES ('a','insert sentinel','insert doc',6,7)"));
+    }
+    const before = inspect(file, versionWriteSnapshot);
+    const original = DatabaseSync.prototype.prepare;
+    let executed = 0;
+    DatabaseSync.prototype.prepare = function (text) {
+      const statement = original.call(this, text);
+      if (text !== sql) return statement;
+      return new Proxy(statement, { get(target, key) {
+        if (key === 'run') return (...args) => {
+          const result = target.run(...args);
+          assert.equal(result.changes, 1);
+          executed++;
+          throw new Error(`synthetic ${branch} after execution`);
+        };
+        const value = target[key];
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    try { assert.throws(() => open(file), new RegExp(`synthetic ${branch} after execution`)); }
+    finally { DatabaseSync.prototype.prepare = original; }
+    assert.equal(executed, 1);
+    inspect(file, db => {
+      assert.deepEqual(versionWriteSnapshot(db), before);
+      db.exec('BEGIN IMMEDIATE; ROLLBACK');
+    });
+  }));
+}
+
 test('sqlite-prefixed user object is not hidden by LIKE wildcard', () => fixture(file => {
   seed(file);
   inspect(file, db => db.exec("CREATE TABLE sqliteXuser (v TEXT); INSERT INTO sqliteXuser VALUES ('keep')"));
