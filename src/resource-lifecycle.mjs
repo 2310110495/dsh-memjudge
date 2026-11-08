@@ -25,10 +25,10 @@ function reentrantError() {
 export function createResourceScope() {
   const disposers = [];
   const identity = { dependencies: new Set() };
-  let closing;
+  let closing, started = false;
   return {
     defer(dispose) {
-      if (closing) throw new Error('Resource scope is closing or closed');
+      if (started) throw new Error('Resource scope is closing or closed');
       if (typeof dispose !== 'function') throw new TypeError('dispose must be a function');
       disposers.push(dispose);
     },
@@ -47,23 +47,29 @@ export function createResourceScope() {
         caller.scope.dependencies.add(identity);
       }
       if (closing) return closing;
+      started = true;
       closing = Promise.resolve().then(async () => {
-        const errors = [];
+        const errors = [], failed = [];
         while (disposers.length) {
+          const dispose = disposers.pop();
           const frame = { scope: identity, parent: disposerContext.getStore(), active: true };
           try {
-            await disposerContext.run(frame, disposers.pop());
+            await disposerContext.run(frame, dispose);
           } catch (error) {
             errors.push(error);
+            failed.unshift(dispose);
           } finally {
             frame.active = false;
             identity.dependencies.clear();
           }
         }
-        identity.closed = true;
+        disposers.push(...failed);
         if (errors.length) throw new AggregateError(errors, 'Resource cleanup failed');
+        identity.closed = true;
       });
-      return closing;
+      const attempt = closing;
+      attempt.catch(() => { if (closing === attempt) closing = undefined; });
+      return attempt;
     },
   };
 }

@@ -240,7 +240,7 @@ export class RawRepository {
     this.#db.exec('PRAGMA user_version=2; COMMIT');
     } catch (e) { this.#db.close(); throw e; }
   }
-  close() { this.#db.close(); }
+  close() { if (this.#db) { this.#db.close(); this.#db = null; } }
   ingest(input) { return this.#ingest(input); }
   #ingest({ fullSessionId, event, evidence = null, source = null, untrustedIdentity = false }, preservation = null) {
     this.#lease.assertWritable();

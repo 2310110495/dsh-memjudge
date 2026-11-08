@@ -8,9 +8,7 @@ function chapterOf(memory) {
   const parsed = source && typeof source === 'object'
     ? { chapter: Number(source.chapter) || 0, para: Number(source.para) || 0 }
     : { chapter: 0, para: 0 };
-  if (parsed.chapter || parsed.para) return parsed;
-  const match = /^mem-c(\d+)-p(\d+)-/.exec(String(memory.id ?? ''));
-  return match ? { chapter: Number(match[1]) || 0, para: Number(match[2]) || 0 } : parsed;
+  return parsed;
 }
 
 // This detached view does not include occurrence records.

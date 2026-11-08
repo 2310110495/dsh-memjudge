@@ -539,6 +539,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_occurrences_position ON memory_occur
    coalesce(document_id, ''), chapter IS NULL, coalesce(chapter, 0), para IS NULL, coalesce(para, 0));
 CREATE TRIGGER IF NOT EXISTS memory_occurrences_delete AFTER DELETE ON memories BEGIN
   DELETE FROM memory_occurrences WHERE memory_id = OLD.id;
+  DELETE FROM segments WHERE ord = OLD.rowid;
 END;
 -- 向量：只在开启融合检索时写。**整库压成一行 BLOB**，不逐条建行。
 -- 逐行存 294 × (8B id + 64B int8) 实测要 +40960 B（SQLite 页与行头把 19KB 撑成 40KB），
@@ -777,9 +778,11 @@ export function open(dbPath = ':memory:', opts = {}) {
     if (trigger) {
       const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(trigger.name)?.sql;
       const canonical = 'CREATE TRIGGER memory_occurrences_delete AFTER DELETE ON memories BEGIN DELETE FROM memory_occurrences WHERE memory_id = OLD.id; END';
-      if (sql?.replace(/\s+/g, ' ').trim() !== canonical) throw new Error('unrecognized database trigger');
+      const current = canonical.replace(' END', ' DELETE FROM segments WHERE ord = OLD.rowid; END');
+      if (![canonical, current].includes(sql?.replace(/\s+/g, ' ').trim())) throw new Error('unrecognized database trigger');
     }
   }
+  db.exec('DROP TRIGGER IF EXISTS memory_occurrences_delete');
   db.exec(DDL);
   db.exec(`
     INSERT INTO memory_occurrences (memory_id, source)
@@ -795,6 +798,61 @@ export function open(dbPath = ':memory:', opts = {}) {
   let factsRevision = 0;
   let hybridRequest = 0;
   let hybridPublishing = false;
+  let derivedStamp = null;
+  let derivedTexts = new Map();
+  const databaseEpoch = () => `${db.prepare('PRAGMA data_version').get().data_version}:${db.prepare('SELECT total_changes() AS n').get().n}`;
+  let derivedEpoch;
+  function contentVersion() {
+    assertOpen();
+    if (db.isTransaction) throw new Error('content version requires an idle connection');
+    const before = db.prepare('PRAGMA data_version').get().data_version;
+    const result = JSON.stringify([
+      db.prepare('SELECT rowid, id, text, source, kind, tier, importance, supersedes, created_at FROM memories ORDER BY rowid').all(),
+      db.prepare('SELECT * FROM memory_occurrences ORDER BY rowid').all(),
+    ]);
+    if (before !== db.prepare('PRAGMA data_version').get().data_version) throw new Error('content version changed during read');
+    return result;
+  }
+  function ensureFresh() {
+    if (db.isTransaction) throw new Error('derived read requires an idle connection');
+    const stamp = contentVersion();
+    if (stamp === derivedStamp && databaseEpoch() === derivedEpoch) return;
+    const next = { byOrd: new Map(), slot: new Map(), total: 0 };
+    let rows;
+    let committing = false;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      // Pin the source rows before repairing coverage derived from raw SQL edits.
+      const current = JSON.stringify([
+        db.prepare('SELECT rowid, id, text, source, kind, tier, importance, supersedes, created_at FROM memories ORDER BY rowid').all(),
+        db.prepare('SELECT * FROM memory_occurrences ORDER BY rowid').all(),
+      ]);
+      if (current !== stamp) throw new Error('derived snapshot stale');
+      rows = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY rowid').all();
+      for (const row of rows) buildFactsFor(row.ord, row.text, next);
+      db.exec('DELETE FROM segments WHERE ord NOT IN (SELECT rowid FROM memories)');
+      const replace = db.prepare('INSERT OR REPLACE INTO segments (ord, bits) VALUES (?, ?)');
+      const has = db.prepare('SELECT 1 FROM segments WHERE ord = ?');
+      for (const row of rows) {
+        if (derivedTexts.get(row.ord) !== row.text || !has.get(row.ord)) replace.run(row.ord, packCovered(splitSegments(row.text).length));
+      }
+      committing = true;
+      db.exec('COMMIT');
+      if (db.isTransaction) throw new Error('derived refresh commit left an active transaction');
+    } catch (error) {
+      if (db.isTransaction) {
+        try { db.exec('ROLLBACK'); }
+        catch (cleanup) { throw failStore(new AggregateError([error, cleanup], 'derived refresh and rollback failed')); }
+      }
+      if (committing) throw failStore(error);
+      throw error;
+    }
+    memFacts = next;
+    derivedTexts = new Map(rows.map(row => [row.ord, row.text]));
+    derivedStamp = stamp;
+    derivedEpoch = databaseEpoch();
+    factsRevision++;
+  }
   function addMemFact(ord, f, target = memFacts) {
     const vtype = VTYPE[f.valueType ?? 'text'] ?? VTYPE.text;
     const fact = {
@@ -1189,6 +1247,43 @@ export function open(dbPath = ':memory:', opts = {}) {
     if (!row) return [];
     const list = memFacts.byOrd.get(row.ord) || [];
     return list.slice().sort((a, b) => a.at - b.at);
+  }
+
+  function forget({ ids = [], source, dryRun = false } = {}) {
+    assertOpen();
+    if (db.isTransaction) throw new Error('forget requires an idle connection');
+    if (source !== undefined && (typeof source !== 'string' || !source.length)) throw new TypeError('forget source must be nonempty');
+    let committing = false;
+    const forgotten = [], retained = [];
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      const targets = source === undefined ? [...new Set(ids.map(String))]
+        : db.prepare('SELECT DISTINCT memory_id AS id FROM memory_occurrences WHERE source = ?').all(source).map(r => r.id);
+      for (const id of targets) {
+        if (source !== undefined) {
+          db.prepare('DELETE FROM memory_occurrences WHERE memory_id = ? AND source = ?').run(id, source);
+          const remaining = db.prepare('SELECT source FROM memory_occurrences WHERE memory_id = ? ORDER BY rowid LIMIT 1').get(id);
+          if (remaining) {
+            db.prepare('UPDATE memories SET source = ? WHERE id = ?').run(remaining.source, id);
+            retained.push(id);
+            continue;
+          }
+        }
+        if (db.prepare('DELETE FROM memories WHERE id = ?').run(id).changes) forgotten.push(id);
+      }
+      committing = !dryRun;
+      db.exec(dryRun ? 'ROLLBACK' : 'COMMIT');
+      if (db.isTransaction) throw new Error('forget cleanup left an active transaction');
+    } catch (error) {
+      if (db.isTransaction) {
+        try { db.exec('ROLLBACK'); }
+        catch (cleanup) { throw failStore(new AggregateError([error, cleanup], 'forget transaction and rollback failed')); }
+      }
+      if (committing || db.isTransaction) throw failStore(error);
+      throw error;
+    }
+    if (!dryRun) ensureFresh();
+    return { forgotten, retained, count: forgotten.length, dryRun };
   }
 
   // ── 向量表（融合检索用；不参与 put 事务，由上层异步补） ──────────────────
@@ -1724,6 +1819,8 @@ export function open(dbPath = ':memory:', opts = {}) {
   const api = {
     path: file,
     put,
+    forget,
+    contentVersion,
     get,
     list,
     bySourcePrefix,
@@ -1775,12 +1872,18 @@ export function open(dbPath = ':memory:', opts = {}) {
           throw error;
         }
         if (name === 'rebuildFactsHybrid') return fn(...args);
-        if (name !== 'close' && name !== 'raw') assertOpen();
+        if (name !== 'close' && name !== 'raw') {
+          assertOpen();
+          ensureFresh();
+        }
         return fn(...args);
       };
     }
   }
   db.exec('COMMIT');
+  derivedStamp = contentVersion();
+  derivedEpoch = databaseEpoch();
+  derivedTexts = new Map(db.prepare('SELECT rowid AS ord, text FROM memories').all().map(row => [row.ord, row.text]));
   return api;
   } catch (err) {
     // Initialization can fail with or without an active transaction.

@@ -271,9 +271,7 @@ function decodeSource(source) {
  */
 function chapterOf(memory) {
   const src = decodeSource(memory?.source);
-  if (src.chapter || src.para) return src;
-  const m = /^mem-c(\d+)-p(\d+)-/.exec(String(memory?.id ?? ''));
-  return m ? { chapter: Number(m[1]) || 0, para: Number(m[2]) || 0 } : src;
+  return src;
 }
 
 /** 注入索引里的来源标签：章号优先，显式来源次之，两者都没有才算手动写入。 */
@@ -376,10 +374,12 @@ export function apply(ctx, config, dependencies = {}) {
   let epoch = 0;
   let contentGeneration = 0;
   let autoCaptureCorpus = null;
+  let wiki = null;
   const invalidate = () => {
     indexDirty = true;
     injectCache = null;
     autoCaptureCorpus = null;
+    wiki = null;
   };
   const enterFault = (cause) => {
     if (fault) return fault;
@@ -388,7 +388,16 @@ export function apply(ctx, config, dependencies = {}) {
     fault = new Error(`memjudge instance fault (epoch ${epoch})`, { cause });
     return fault;
   };
-  const assertHealthy = () => { if (fault) throw fault; };
+  let observedContent;
+  const assertHealthy = () => {
+    if (fault) throw fault;
+    const current = store.contentVersion();
+    if (observedContent !== undefined && current !== observedContent) {
+      contentGeneration += 1;
+      invalidate();
+    }
+    observedContent = current;
+  };
   // 两个上限都来自用户配置层（env > config.json > 默认 2MB / 0）：
   // storageLimitBytes 只决定 stats() 的「上限/是否超预算」，maxChars 才是写入闸门。
   const store = deps.storeFactory(dbPath, {
@@ -566,7 +575,6 @@ export function apply(ctx, config, dependencies = {}) {
   const WIKI_META_DIGEST = 'raw_digest';
 
   /** 内存投影。null = 本进程还没编过（≠「库里没有 wiki」）。 */
-  let wiki = null;
   let stmtMetaGet = null;
   let stmtMetaPut = null;
 
@@ -663,6 +671,7 @@ export function apply(ctx, config, dependencies = {}) {
 
   /** 只读投影入口：没编过就按需编一次（不落盘）。T8-2/T8-4 从这里取投影。 */
   const getWiki = () => {
+    assertHealthy();
     if (wiki) return wiki;
     try {
       return refreshWiki(false);
@@ -735,6 +744,7 @@ export function apply(ctx, config, dependencies = {}) {
 
   /** G5 候选语料：懒取一次，写库路径已通过 invalidate() 清空。 */
   const autoCorpus = () => {
+    assertHealthy();
     if (autoCaptureCorpus === null) autoCaptureCorpus = store.dump().map((m) => m.text);
     return autoCaptureCorpus;
   };
@@ -953,6 +963,7 @@ export function apply(ctx, config, dependencies = {}) {
       : null;
     const finish = (result) => {
       assertHealthy();
+      if (generation !== contentGeneration) throw new Error('memjudge recall stale: content changed');
       if (view) { view.assertCurrent(); recallViews.set(result, view); }
       return result;
     };
@@ -1093,13 +1104,13 @@ export function apply(ctx, config, dependencies = {}) {
                 chars: { type: 'integer' },
                 score: { type: 'number' },
                 text: { type: 'string' },
-                 version: { type: 'string' },
+                version: { type: 'string' },
                 truncated: { type: 'boolean' },
                 windowStart: { type: 'integer' },
                 windowEnd: { type: 'integer' },
                 startsAtBoundary: { type: 'boolean' },
               },
-              required: ['id', 'chapter', 'para', 'chars', 'score', 'text'],
+              required: ['id', 'chapter', 'para', 'chars', 'score', 'text', 'version', 'truncated'],
             },
           },
         },
@@ -1184,6 +1195,7 @@ export function apply(ctx, config, dependencies = {}) {
       additionalProperties: false,
       properties: {
         id: { type: 'string', description: '要删除的记忆 id。' },
+        source: { type: 'string', description: '精确删除该已知来源的全部位置；保留其他来源。优先于 id/query。' },
         query: { type: 'string', description: '按检索命中批量删除。与 id 同时给时以 id 优先。' },
         limit: { type: 'integer', description: 'query 模式最多删几条，1..100。默认 10。' },
         dryRun: { type: 'boolean', description: '只列出将删除的 id，不落库。' },
@@ -1210,6 +1222,12 @@ export function apply(ctx, config, dependencies = {}) {
     async execute(args) {
       const dryRun = args?.dryRun === true;
       assertHealthy();
+      if (args?.source !== undefined) {
+        const result = store.forget({ source: args.source, dryRun });
+        assertHealthy();
+        if (!dryRun) { invalidate(); touchWiki(); }
+        return { forgotten: result.forgotten, count: result.count, dryRun };
+      }
       const ids = [];
       if (args?.id) {
         ids.push(String(args.id));
@@ -1221,37 +1239,9 @@ export function apply(ctx, config, dependencies = {}) {
       if (!ids.length) return { forgotten: [], count: 0, dryRun };
       if (dryRun) return { forgotten: ids, count: ids.length, dryRun: true };
 
-      // 事务期间保留派生 facts，成功提交后从数据库重建。
-      const db = store.raw();
-      const delSeg = db.prepare('DELETE FROM segments WHERE ord = (SELECT rowid FROM memories WHERE id = ?)');
-      const delMem = db.prepare('DELETE FROM memories WHERE id = ?');
-      const removed = [];
-      try { db.exec('BEGIN'); } catch (err) {
-        if (db.isTransaction) throw enterFault(err);
-        throw err;
-      }
-      let committing = false;
-      try {
-        for (const id of ids) {
-          delSeg.run(id);
-          if (delMem.run(id).changes > 0) removed.push(id);
-        }
-        committing = true;
-        db.exec('COMMIT');
-        if (removed.length) contentGeneration += 1;
-      } catch (err) {
-        let failure = err;
-        if (db.isTransaction) {
-          try { db.exec('ROLLBACK'); } catch (cleanup) {
-            failure = new AggregateError([err, cleanup], 'forget transaction and rollback failed');
-            throw enterFault(failure);
-          }
-        }
-        if (committing) throw enterFault(failure);
-        throw failure;
-      }
+      const removed = store.forget({ ids }).forgotten;
+      assertHealthy();
       invalidate();
-      try { store.rebuildFacts('forget'); } catch (err) { throw enterFault(err); }
       // 删除同样改变 raw：投影必须跟着重建，否则 wiki 里会留着已经忘掉的块。
       touchWiki();
       return { forgotten: removed, count: removed.length, dryRun: false };

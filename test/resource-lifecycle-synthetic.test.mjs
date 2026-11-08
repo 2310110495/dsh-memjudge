@@ -30,8 +30,9 @@ test('cleanup keeps all failures and continues including thrown undefined', asyn
   const closing = scope.close();
   await assert.rejects(closing, e => e instanceof AggregateError && e.errors.length === 2 && e.errors[0] === error && e.errors[1] === undefined);
   assert.deepEqual(events, [3, 2, 1]);
-  assert.strictEqual(scope.close(), closing);
-  await assert.rejects(scope.close(), AggregateError);
+  const retry = scope.close();
+  assert.notStrictEqual(retry, closing);
+  await assert.rejects(retry, AggregateError);
 });
 
 test('returning or awaiting reentrant close fails and remaining cleanup runs', { timeout: 1000 }, async () => {
@@ -44,7 +45,9 @@ test('returning or awaiting reentrant close fails and remaining cleanup runs', {
     assert.strictEqual(scope.close(), closing);
     await assert.rejects(closing, error => error instanceof AggregateError && error.errors.length === 1 && error.errors[0].code === 'ERR_RESOURCE_SCOPE_REENTRANT_CLOSE');
     assert.deepEqual(events, ['remaining']);
-    assert.strictEqual(scope.close(), closing);
+    const retry = scope.close();
+    assert.notStrictEqual(retry, closing);
+    await assert.rejects(retry, AggregateError);
   }
 });
 
@@ -115,7 +118,9 @@ test('independently started two and three scope cycles settle and run remaining 
     };
     assert.ok(results.some(result => hasError(result.reason, error => error?.code === 'ERR_RESOURCE_SCOPE_REENTRANT_CLOSE')));
     assert.ok(results.some(result => hasError(result.reason, error => error === failure)));
-    scopes.forEach((scope, index) => assert.strictEqual(scope.close(), closings[index]));
+    scopes.forEach((scope, index) => {
+      assert.notStrictEqual(scope.close(), closings[index]);
+    });
   }
 });
 
@@ -163,7 +168,7 @@ test('unawaited close is conservatively treated as a dependency until disposer e
   await Promise.resolve();
   release();
   await closing;
-  await assert.rejects(b.close(), error => error.errors[0].code === 'ERR_RESOURCE_SCOPE_REENTRANT_CLOSE');
+  await b.close();
 });
 
 test('regression detached active branches synchronously reject unawaited self and ancestor close', { timeout: 1000 }, async () => {

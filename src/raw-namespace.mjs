@@ -92,14 +92,21 @@ export function openNamespace({ directory, registryRoot, sourceRoot, instanceId,
     },
     close() {
       if (released) return;
-      released = true;
       if (descriptor !== undefined) {
+        let missing=false;
         try {
           const current = fs.statSync(lock), owned = fs.fstatSync(descriptor);
-          if (current.ino === owned.ino && current.dev === owned.dev && fs.readFileSync(lock, 'utf8') === token) fs.unlinkSync(lock);
-        } catch (e) { if (e.code !== 'ENOENT') throw e; }
-        finally { fs.closeSync(descriptor); }
+          if (current.ino !== owned.ino || current.dev !== owned.dev || fs.readFileSync(lock, 'utf8') !== token) throw Error('namespace-lease-lost');
+          fs.unlinkSync(lock);
+        } catch (e) {
+          if (e.code === 'ENOENT') missing=true;
+          else throw e;
+        }
+        if(!missing){try{fs.lstatSync(lock);}catch(e){if(e.code==='ENOENT')missing=true;else throw e;}if(!missing)throw Error('namespace-lease-lost');}
+        fs.closeSync(descriptor);
+        descriptor = undefined;
       }
+      released = true;
     },
   });
 }
