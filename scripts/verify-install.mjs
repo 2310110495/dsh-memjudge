@@ -17,14 +17,7 @@
 //   node scripts/verify-install.mjs --json             # 同上，附带机读 JSON
 //   node scripts/verify-install.mjs --install <dir>     # 指定装机目录
 //   node scripts/verify-install.mjs --db <file>         # 指定库文件
-//   node scripts/verify-install.mjs --capability        # 转去跑 12 项能力验收（较重）
-//   node scripts/verify-install.mjs --mock / --keep / --profile <dir> / --report-only / --json
-//                                                      # 这些参数一律转给能力验收脚本
-//
-// 「12 项能力验收」（装到隔离 profile、灌 20 章语料、跑幻觉题与冲突题）在
-// `scripts/verify-capability.mjs`；本文件只负责轻量的装机一致性，几十毫秒跑完。
 
-import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,7 +26,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.resolve(HERE, '..');
-const CAPABILITY = path.join(HERE, 'verify-capability.mjs');
 
 const argv = process.argv.slice(2);
 const has = (name) => argv.includes(name);
@@ -41,25 +33,6 @@ const opt = (name, fallback) => {
   const i = argv.indexOf(name);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback;
 };
-
-/** 只有这些参数才代表「要跑能力验收」；`--json` 两种模式都认，不是开关。 */
-const CAPABILITY_FLAGS = ['--capability', '--mock', '--keep', '--profile', '--report-only'];
-
-/* ---------------------------------------------------------------- 转发能力验收 */
-
-const wantsCapability = argv.some((a) =>
-  CAPABILITY_FLAGS.some((f) => a === f || a.startsWith(f + '=')),
-);
-if (wantsCapability) {
-  if (!fs.existsSync(CAPABILITY)) {
-    console.error(`FAIL capability: 能力验收脚本不存在：${CAPABILITY}`);
-    process.exit(1);
-  }
-  // 深跑：装到隔离 profile、灌 20 章语料、跑幻觉/冲突题。`--capability` 自己不是它的参数。
-  const passthrough = argv.filter((a) => a !== '--capability');
-  const r = spawnSync(process.execPath, [CAPABILITY, ...passthrough], { stdio: 'inherit' });
-  process.exit(typeof r.status === 'number' ? r.status : 1);
-}
 
 /* ---------------------------------------------------------------- 三项装机校验 */
 

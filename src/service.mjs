@@ -129,7 +129,6 @@ export function createService(ctx, deps = {}) {
         reason: String(found?.reason ?? ''),
         detail: String(found?.detail ?? ''),
         chars: Number(found?.chars) || 0,
-        conflictLine: String(found?.conflictLine ?? ''),
         hits: (Array.isArray(found?.hits) ? found.hits : []).map((h) => ({
           id: String(h?.id ?? ''),
           chapter: Number(h?.chapter) || 0,
@@ -137,8 +136,8 @@ export function createService(ctx, deps = {}) {
           chars: Number(h?.chars) || 0,
           score: Number(h?.score) || 0,
           text: String(h?.text ?? ''),
-          version: String(h?.version ?? ''),
           truncated: h?.truncated === true,
+          ...(typeof h?.version === 'string' && h.version.length > 0 ? { version: h.version } : {}),
           ...(Number.isInteger(h?.windowStart) ? { windowStart: h.windowStart, windowEnd: h.windowEnd, startsAtBoundary: h.startsAtBoundary === true } : {}),
         })),
       };

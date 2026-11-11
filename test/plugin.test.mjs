@@ -28,8 +28,7 @@ import {
   resolveConfig,
   defaultDbPath,
 } from '../src/index.mjs';
-import { chapters } from '../../mem-eval/corpus/novel.mjs';
-import { recall as recallQuestions } from '../../mem-eval/corpus/quiz.mjs';
+import { chapters, recall as recallQuestions } from './fixtures-corpus.mjs';
 
 const DAY = 86400000;
 const T0 = Date.UTC(2026, 9, 27, 0, 0, 0); // 假时钟起点，与 SPEC P1 一致

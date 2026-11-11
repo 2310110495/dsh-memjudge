@@ -25,7 +25,13 @@ import {
   rawDigest,
   conflictJudgments,
 } from '../src/layer.mjs';
-import { scoreConflict } from '../../mem-eval/harness/score.mjs';
+
+function scoreConflict(line, { kw = [] } = {}) {
+  const s = String(line ?? '');
+  const judgedConflict = /不一致|矛盾|冲突|前后不同|更正|修正|改口|两处不同/.test(s);
+  const newSide = kw[1] ? s.includes(kw[1]) : false;
+  return { judgedConflict, newSide };
+}
 
 const DAY = 86400000;
 let passed = 0;

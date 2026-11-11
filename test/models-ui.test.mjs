@@ -35,9 +35,20 @@ async function harness(cfg = config(), responder) {
     if (typeof n.type==='function') return expand(n.type(n.props));
     return {...n, props:{...n.props, children:expand(n.props.children)}};
   }
+  // 面板改用同源 Fetch 路由后，唯一的下行口是全局 fetch：
+  // 这里按 /api/memjudge.<endpoint> 解析端点，把 responder 的返回包当成 JSON 响应体。
+  const fetch = async (url, opts) => {
+    const endpoint = String(url).replace(/^.*\/api\/memjudge\./, '');
+    const payload = opts && opts.body ? JSON.parse(opts.body) : {};
+    try {
+      return { ok: true, status: 200, json: async () => await rpc(endpoint, payload) };
+    } catch (err) {
+      return { ok: false, status: 500, json: async () => ({ ok: false, error: { code: 'call', message: String(err && err.message ? err.message : err) } }) };
+    }
+  };
   vm.runInNewContext(source, {window:{__ModuleLoader__:{load({factory}){exported=factory(()=>react);}}},
-    document:{getElementById(){return true;}}, console:{log(){}}, setTimeout(){return 1;},clearTimeout(){}});
-  const rpc = async (_, name, payload) => {
+    document:{getElementById(){return true;}}, console:{log(){}}, setTimeout(){return 1;},clearTimeout(){}, fetch});
+  const rpc = async (name, payload) => {
     calls.push({name,payload:JSON.parse(JSON.stringify(payload))});
     const r=responder && await responder(name,payload,cfg); if(r!==undefined) return r;
     if(name==='status') return {ok:true,value:{config:structuredClone(cfg),stats:{}}};
@@ -55,7 +66,7 @@ async function harness(cfg = config(), responder) {
   };
   exported.apply({connection:{rpc:{call:rpc}},effect(fn,label){if(label.includes('settings section'))fn();},
     slots:{inject(_,fn){return fn();},register(_,render){panel=render();}}});
-  async function flush(){ for(let i=0;i<12;i++){if(i===0||dirty){dirty=false;cursor=0;tree=expand(panel);const pending=effects;effects=[];pending.forEach(f=>f());} await Promise.resolve();} }
+  async function flush(){ for(let i=0;i<40;i++){if(i===0||dirty){dirty=false;cursor=0;tree=expand(panel);const pending=effects;effects=[];pending.forEach(f=>f());} await Promise.resolve();} }
   function all(pred,n=tree){if(Array.isArray(n))return n.flatMap(x=>all(pred,x));if(!n||typeof n!=='object')return [];return [...(pred(n)?[n]:[]),...all(pred,n.props.children)];}
   function text(n=tree){if(Array.isArray(n))return n.map(text).join('');if(n==null||typeof n==='boolean')return '';return typeof n==='object'?text(n.props.children):String(n);}
   function one(pred){const ns=all(pred);assert.equal(ns.length,1,'expected one element');return ns[0];}

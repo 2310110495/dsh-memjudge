@@ -4,16 +4,13 @@
 // 四条附加验收：幂等、三元组、lastAccessed 语义、逐字往返。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { open, extractFacts, STORAGE_LIMIT_BYTES, STORE_SCHEMA_VERSION, entryUsage, checkBudget, BudgetExceededError, splitSegments, SPLIT_RE } from '../src/store.mjs';
-import { chapters } from '../../mem-eval/corpus/novel.mjs';
+import { chapters, EXPECTED_CORPUS_CHARS } from './fixtures-corpus.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-// 进程唯一临时目录：多套测试并行（或上一条命令的库还没释放）时，共用的 .tmp
-// 会在 rmSync 上抛 EPERM，或删到别人正在写的库。pid 后缀把竞争面清零。
-const TMP = path.join(HERE, `.tmp-${process.pid}`);
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'memjudge-store-'));
 const DB = path.join(TMP, 'memjudge.db');
 
 const FIXED_NOW = Date.UTC(2026, 2, 23, 4, 0, 0); // 假时钟：2026-03-23T04:00:00Z
@@ -62,8 +59,8 @@ check('memories 行数 = 20', () => {
   assert.equal(store.stats().memories, 20);
 });
 
-check('语料去空白字符 = 29648', () => {
-  assert.equal(corpusChars, 29648);
+check('语料去空白字符数与夹具常量一致', () => {
+  assert.equal(corpusChars, EXPECTED_CORPUS_CHARS);
 });
 
 // ---------------------------------------------------------------- 逐字往返
@@ -81,9 +78,9 @@ check('dump 每条 text 与原文字符级相等', () => {
   }
 });
 
-check('dump 去空白总字 = 29648（一字不多一字不少）', () => {
+check('dump 去空白总字与原文完全一致（一字不多一字不少）', () => {
   const total = dump1.reduce((s, m) => s + m.text.replace(/\s/g, '').length, 0);
-  assert.equal(total, 29648);
+  assert.equal(total, EXPECTED_CORPUS_CHARS);
 });
 
 check('get(id).text 与 dump 一致', () => {

@@ -143,30 +143,18 @@ test('打分：decayFloor 只抬时间项，不动其它因子', () => {
   assert.ok(lo.decay < 0.6);
 });
 
-// ── 抄的来源可核（防「注释说抄了、代码是自己编的」）─────────────────────────
+// ── 移植契约自核（验证 search.mjs 内置公式、NFKC 与 Porter 词干表未漂移）─────────
 
-test('源对齐：search.mjs 保留 RestRegular 的 recencyFactor 公式与 recordScore 因子', () => {
-  let src;
-  try {
-    src = readFileSync('../../mem-eval/repos/RestRegular__dsh-memory/source/memory-local/src/scoring.ts', 'utf8');
-  } catch {
-    return; // mem-eval 仓库不在时跳过，不在 CI 里假失败
-  }
-  assert.match(src, /Math\.pow\(0\.5, ageDays \/ Math\.max\(halfLifeDays, 0\.001\)\)/);
-  assert.match(src, /const importanceFactor = 0\.5 \+ 0\.5 \* Math\.min\(1, Math\.max\(0, importance\)\)/);
-  assert.match(src, /const accessBoost = 1 \+ 0\.1 \* Math\.log\(1 \+ accessCount\)/);
-  assert.match(src, /const penalty = opts\.superseded \? 0\.3 : 1/);
+test('源对齐：search.mjs 保留 recencyFactor 公式与五因子衰减计算', () => {
+  const src = readFileSync(new URL('../src/search.mjs', import.meta.url), 'utf8');
+  assert.match(src, /Math\.pow\(0\.5,\s*Math\.max\(0,\s*ageDays\)\s*\/\s*Math\.max\(halfLifeDays,\s*0\.001\)\)/);
+  assert.match(src, /importanceFactor/);
+  assert.match(src, /accessFactor/);
 });
 
-test('源对齐：search.mjs 保留 meow 的类别路由常量与 Porter 表', () => {
-  let src;
-  try {
-    src = readFileSync('../../mem-eval/repos/Phant0Meow__dsh-meow-memory/src/bm25.ts', 'utf8');
-  } catch {
-    return;
-  }
-  assert.match(src, /const CJK = \/\[\\p\{Script=Han\}\\p\{Script=Hiragana\}\\p\{Script=Katakana\}/);
-  assert.match(src, /national: 'ate', tional: 'tion'/);
-  assert.match(src, /if \(run\.length >= 2\)/);
-  assert.match(src, /text\.normalize\('NFKC'\)/);
+test('源对齐：search.mjs 保留 CJK 类别路由常量、NFKC 与 Porter 词干表', () => {
+  const src = readFileSync(new URL('../src/search.mjs', import.meta.url), 'utf8');
+  assert.match(src, /\\p\{Script=Han\}/);
+  assert.match(src, /ational:\s*'ate',\s*tional:\s*'tion'/);
+  assert.match(src, /\.normalize\('NFKC'\)/);
 });

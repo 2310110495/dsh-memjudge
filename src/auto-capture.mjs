@@ -489,6 +489,35 @@ export function formatSource(sessionId, turn) {
 }
 
 /**
+ * 生成 assistant 侧 source：`auto:chat:asst#<base64url(sessionId)>:t<turn>:s<step>[.<part>]`。
+ *
+ * 为什么另起前缀而不是复用 `auto:chat:v2#`：user 与 assistant 两条通路的闸门、配额、
+ * 章号都不同，来源串是它们在库里唯一的可区分身份。面板、去重、审计都要能一眼分开。
+ * 严格校验（与 formatSource 同样的三种抛错）由调用方捕获：这条路径挂在 session/event 的
+ * 同步回调上，抛错虽被宿主 per-listener containment 吞掉，但仍必须自己兜住。
+ *
+ * T90 的可寻址段号 `part`（省略 = 旧格式，语义不变）：
+ *   `p<k>` 第 k 个语义段（k 从 1 起，按原文顺序）；`r` 本轮工作状态摘要；`f` 本轮动作清单。
+ * 为什么挂在 step 后面而不是 turn 后面：一轮有 50–100 步，段号只有落在具体的
+ * `step` 上才能唯一定位「这段文字来自哪一步之后」；只写 `t7:p3` 在两轮同号段时无法区分。
+ * 后缀用 `.` 分隔而不是 `:`，是因为 `:` 已经被 turn/step 占满，且旧正则的
+ * `auto:chat:asst#<b64>:t1:s1:x` 这类畸形输入必须继续判死（`x` 不是合法 part）。
+ */
+export const ASSISTANT_PART_RE = /^(?:p[1-9][0-9]*|r|f)$/;
+
+export function formatAssistantSource(sessionId, turn, step, part) {
+  if (typeof sessionId !== 'string' || !sessionId.trim() || !sessionId.isWellFormed()) {
+    throw new TypeError('invalid-session-id');
+  }
+  if (!Number.isSafeInteger(turn) || turn < 0) throw new RangeError('invalid-turn');
+  if (!Number.isSafeInteger(step) || step < 0) throw new RangeError('invalid-step');
+  const base = `auto:chat:asst#${Buffer.from(sessionId, 'utf8').toString('base64url')}:t${turn}:s${step}`;
+  if (part === undefined || part === null || part === '') return base;
+  if (typeof part !== 'string' || !ASSISTANT_PART_RE.test(part)) throw new RangeError('invalid-part');
+  return `${base}.${part}`;
+}
+
+/**
  * 反向解析。给 dump 与面板来源显示用。
  * @param {unknown} source
  * @returns {{auto: true, sessTok: string, turn: number}|null} 非 auto 标记返回 null
@@ -496,6 +525,24 @@ export function formatSource(sessionId, turn) {
 export function parseSource(source) {
   if (typeof source !== 'string') return null;
   try {
+    // assistant 分支先试：前缀更长，且与 v2 分支不共享任何捕获组。
+    // 段号后缀可选：无后缀时返回结构与 T87 完全一致（既有 deepEqual 断言靠这条维持）。
+    const asst = /^auto:chat:asst#([A-Za-z0-9_-]+):t(0|[1-9][0-9]*):s(0|[1-9][0-9]*)(?:\.((?:p[1-9][0-9]*)|r|f))?$/.exec(source);
+    if (asst && asst[0] === source) {
+      const bytes = Buffer.from(asst[1], 'base64url');
+      if (bytes.toString('base64url') !== asst[1]) return null;
+      const sessionId = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      const turn = Number(asst[2]);
+      const step = Number(asst[3]);
+      const part = asst[4] ?? null;
+      if (formatAssistantSource(sessionId, turn, step, part ?? undefined) !== source) return null;
+      const parsed = { auto: true, version: 3, role: 'assistant', sessionId, turn, step, source };
+      if (part !== null) {
+        parsed.part = part;
+        parsed.segment = part.startsWith('p') ? Number(part.slice(1)) : null;
+      }
+      return parsed;
+    }
     const v2 = /^auto:chat:v2#([A-Za-z0-9_-]+):t(0|[1-9][0-9]*)$/.exec(source);
     if (v2 && v2[0] === source) {
       const bytes = Buffer.from(v2[1], 'base64url');

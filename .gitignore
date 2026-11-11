@@ -1,17 +1,15 @@
 node_modules/
-# 交接用的临时基线，不属于交付物
-.baseline-before-v2.md
-# t16 审计脚手架与 t18 诊断脚本，产物在 reports/
-.audit-tencent/
-.t8/
-# 测试临时库：按 pid 隔离后仍不该入库
-test/.tmp*
 *.tgz
 .env.local
+*.sh
+.git-push*
+*.db
+*.db-*
+test/.tmp*
+.vec-cache/
 .llm-cache.json
-
-# 向量缓存（可重建，不入库）
-.vec-cache/
-.probe-*.mjs
-.vec-cache/
+.baseline-before-v2.md
+.audit-tencent/
 .t8/
+.probe-*.mjs
+

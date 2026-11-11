@@ -7,7 +7,7 @@ import {
 } from '../src/judge.mjs';
 import {
   chapters, recall, synthesis, hallucination, conflict,
-} from '../../mem-eval/corpus/quiz.mjs';
+} from './fixtures-corpus.mjs';
 
 const DAY = 86400000;
 const store = buildStore(chapters.map((c) => ({ n: c.n, text: c.text })));

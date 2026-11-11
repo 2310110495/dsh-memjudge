@@ -1,10 +1,9 @@
 // memjudge 检索层自检 —— 92 题 recall + 全维度断言（t11 验证命令）
 // 运行：node memjudge-plugin/test/search.test.mjs
 //
-// 语料只读引用 mem-eval/corpus（P3 只读），本文件不写任何东西。
+// 内联自包含语料（./fixtures-corpus.mjs），本文件不写任何磁盘文件。
 
-import { chapters } from '../../mem-eval/corpus/novel.mjs';
-import { recall } from '../../mem-eval/corpus/quiz.mjs';
+import { chapters, recall } from './fixtures-corpus.mjs';
 import { rankWeight, decayFactor, MEMORY_SCHEMA_VERSION } from '../src/schema.mjs';
 import { tokenize, index, search, score, finalScore, SEARCH_DEFAULTS } from '../src/search.mjs';
 

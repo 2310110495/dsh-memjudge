@@ -3,8 +3,9 @@
  *
  * 在「系统设置」左侧栏注册一个「记忆库」入口（与通用设置/模型/插件管理同级）；
  * 另在对话右侧栏（sidebar.right）注册同名 tab，正文复用同一个面板组件。
- * 数据走 DSH 宿主 RPC：ctx.connection.rpc.call('/memjudge', <endpoint>)，
- * 对应 host 半侧 src/rpc.mjs 注册的通道。
+ * 数据走宿主同源 Fetch 路由：POST /api/memjudge.<endpoint>，
+ * 对应 host 半侧 src/rpc.mjs 用 ctx.connection.fetch.register 注册的 exact 路由。
+ * 同源请求自动带浏览器会话 cookie，不再需要旧式通道调用与 loopback 标记。
  *
  * 视觉与信息架构见 docs/panel-spec.md（A 概览 / B 增强能力与密钥 / C 记忆条目 /
  * D 冲突候选 / E 页脚）。颜色只用宿主令牌 var(--dsw-alias-*)，代码里没有一个 hex
@@ -23,7 +24,8 @@ window.__ModuleLoader__.load({
     var react = require('react');
     const { useState, useEffect, useCallback, useRef } = react;
 
-    const CHANNEL = '/memjudge';
+    // host 侧 src/rpc.mjs 为每条端点注册 /api/memjudge.<endpoint> 的 exact 路由。
+    const RPC_PATH_PREFIX = '/api/memjudge.';
 
     // ------------------------------------------------------------ 令牌（§1）
 
@@ -1840,22 +1842,20 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------ apply
 
     function apply(ctx) {
-      // host 侧 src/rpc.mjs 以 { authority: 'loopback' } 注册通道，浏览器侧连接必须自报
-      // loopback 才被放行。必须在任何 rpc 调用之前完成；严格模式下 defineProperty 可能
-      // 失败（对象被冻结），退回直接赋值。
-      if (ctx && ctx.connection) {
+      // 同源 Fetch 路由：cookie 自动携带，不需要再给 connection 打 loopback 标记。
+      const rpcCall = async (endpoint, payload) => {
+        const url = RPC_PATH_PREFIX + endpoint;
         try {
-          Object.defineProperty(ctx.connection, 'isLoopback', { value: true, writable: true, configurable: true });
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload ?? {}),
+          });
+          if (!response.ok) throw new Error(`transport failure for ${url}: HTTP ${response.status}`);
+          return await response.json();
         } catch (e) {
-          try { ctx.connection.isLoopback = true; } catch (e2) { /* 无法打标，rpc 会由宿主拒绝 */ }
-        }
-      }
-      const rpcCall = (endpoint, payload) => {
-        try {
-          return ctx.connection.rpc.call(CHANNEL, endpoint, payload, undefined);
-        } catch (e) {
-          console.log('[memjudge] rpc 调用失败', CHANNEL, endpoint);
-          return Promise.resolve({ ok: false, error: { code: 'call', message: String(e && e.message ? e.message : e) } });
+          console.log('[memjudge] rpc 调用失败', url, endpoint);
+          return { ok: false, error: { code: 'call', message: String(e && e.message ? e.message : e) } };
         }
       };
       ctx.effect(() => {

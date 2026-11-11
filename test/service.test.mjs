@@ -12,9 +12,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
 
 import { open } from '../src/store.mjs';
 import {
@@ -22,12 +22,8 @@ import {
 } from '../src/service.mjs';
 import { apply, TOOL_NAMES } from '../src/index.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const TMP = path.join(HERE, `.tmp-service-${process.pid}`);
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'memjudge-service-'));
 const T0 = Date.UTC(2026, 9, 27);
-
-fs.rmSync(TMP, { recursive: true, force: true });
-fs.mkdirSync(TMP, { recursive: true });
 
 test.after(() => {
   try {

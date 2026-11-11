@@ -1,9 +1,11 @@
 // memjudge 宿主 RPC：给 browser 半侧（client）提供库体/记忆/冲突的只读数据。
 //
-// 为什么走 RPC 而不是 HTTP 服务：DSH 的 host↔browser 通信有现成契约——
-// host 端 ctx.connection.rpc.handle(channel, handler, {authority:'loopback'})，
-// browser 端 ctx.connection.rpc.call(channel, endpoint, payload)。照抄 dsh-pocket
-// 的通道（频道名惯例 `/dsh-<包名>`），不另起端口、不暴露 200KB 库。
+// 为什么走 Fetch 路由而不是另起端口：DSH 0.2.x 的 host↔browser 通信契约是
+// host 端 ctx.connection.fetch.register({path, methods, requestBody, fetch}) 注册
+// exact 路由（path 必须以 /api/ 开头），browser 端同源 fetch(path, {method:'POST'})。
+// 旧式前缀 RPC 通道对第三方插件已不可用：它内部要取 owner.webServer，而插件 ctx
+// 没有 webServer 注入，注册会抛错 → 前缀路由从未挂上 → webserver 对所有前缀请求回 405。
+// 本文件不暴露 200KB 库内容，只给设置页面板发聚合视图。
 //
 // 本文件不删记忆：删除入口只有对话里的 memjudge_forget 工具，RPC 侧永不提供。
 // 允许写的只有三样：密钥（saveKey/clearKey，按组）、五个模块开关（saveConfig）、
@@ -146,6 +148,40 @@ function validateSettings(settings) {
 
 /** testKey 的超时：面板上点一下不该把宿主进程挂住。 */
 const TEST_KEY_TIMEOUT_MS = 8000;
+
+/**
+ * 面板可用的端点。一条端点对应一条 exact Fetch 路由，集合与 handler 的 switch 一一对应。
+ * 顺序稳定：测试与「恰好 N 条」的断言都依赖它。
+ */
+const RPC_ENDPOINTS = [
+  'status',
+  'memories',
+  'conflicts',
+  'saveKey',
+  'clearKey',
+  'saveConfig',
+  'saveSettings',
+  'testKey',
+];
+
+/**
+ * 路由前缀。连接层的 assertFetchRoute 要求路径以 /api 开头，且每一段匹配
+ * [A-Za-z0-9_$.-]+，所以端点用点号拼成 /api/memjudge.<endpoint>（与内置
+ * dsh-client-ui-deliverables 的 /api/present.host 同形）。
+ */
+const FETCH_ROUTE_PREFIX = '/api/memjudge.';
+
+/**
+ * 同一宿主 ctx 生命周期内只注册一次。连接层的 fetchRoutes 是全局 Map，
+ * 对同一 path 重复注册会抛 already registered；插件被重复 apply 时不能让
+ * 第二次注册把面板整条打死。
+ */
+const REGISTERED_PATHS = new WeakMap();
+
+/** 统一返回包 -> Response。host 侧形状（{ok,value} / {ok,error}）逐字节不变。 */
+function jsonResponse(value) {
+  return Response.json(value);
+}
 
 
 function ok(value) {
@@ -364,6 +400,9 @@ async function testKey(group, key) {
           if (!complete) { body = ''; cancel(reader); }
           try { reader.releaseLock(); } catch { /* Pending reads can retain the lock. */ }
         }
+      } else if (!res.body && typeof res.text === 'function') {
+        const text = await res.text();
+        if (typeof text === 'string' && Buffer.byteLength(text, 'utf8') <= 1024 * 1024) body = text;
       }
       checkDeadline();
       return { res, body, latencyMs };
@@ -415,7 +454,8 @@ async function testKey(group, key) {
 }
 
 /**
- * 注册 /memjudge RPC 通道。返回 disposer；无 Connection RPC 时静默返回空函数，
+ * 注册 /api/memjudge.* 的 exact Fetch 路由（每条端点一条）。
+ * 返回 disposer；宿主没有 Connection Fetch 注册能力时静默返回空函数，
  * 面板会显示「宿主未提供 RPC」而不是把整个插件搞崩。
  * @param {object} ctx  DSH 宿主 apply 上下文
  * @param {object} opts { dbPath }
@@ -530,9 +570,49 @@ export function installMemjudgeRpc(ctx, opts = {}) {
 
   const conn = (ctx?.get && ctx.get('connection'))
     || (() => { try { return ctx?.connection; } catch { return null; } })();
-  if (!conn?.rpc?.handle) {
-    console.log('[memjudge] 宿主无 Connection RPC，设置页面板不可用');
+  // 能力探测：新版连接层是 fetch.register（exact 路由），旧式前缀通道对插件不可用。
+  if (typeof conn?.fetch?.register !== 'function') {
+    console.log('[memjudge] 宿主无 Connection Fetch 路由，设置页面板不可用');
     return () => {};
   }
-  return conn.rpc.handle('/memjudge', handler, { authority: 'loopback' });
+
+  const ownerKey = ctx && typeof ctx === 'object' ? ctx : null;
+  const seen = ownerKey ? (REGISTERED_PATHS.get(ownerKey) ?? new Set()) : new Set();
+  if (ownerKey) REGISTERED_PATHS.set(ownerKey, seen);
+
+  const disposers = [];
+  for (const endpoint of RPC_ENDPOINTS) {
+    const path = `${FETCH_ROUTE_PREFIX}${endpoint}`;
+    if (seen.has(path)) continue;
+    try {
+      const dispose = conn.fetch.register({
+        path,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          // body 由连接层按 requestBody:'buffered' 预读，空体退化成 {} 与旧调用行为一致。
+          const payload = await request.json().catch(() => ({}));
+          return jsonResponse(await handler(endpoint, payload ?? {}));
+        },
+      });
+      seen.add(path);
+      disposers.push(() => {
+        seen.delete(path);
+        if (typeof dispose === 'function') dispose();
+      });
+    } catch (err) {
+      // 单条失败不阻断其余端点：面板少一块数据比整个设置页挂掉好排查。
+      console.log('[memjudge] Fetch 路由注册失败', path, err?.message ?? String(err));
+    }
+  }
+
+  if (disposers.length === 0) return () => {};
+  // 逆序释放：后注册的先拆，与 ctx.effect 的栈式约定一致。
+  return () => {
+    for (let i = disposers.length - 1; i >= 0; i--) {
+      try {
+        disposers[i]();
+      } catch { /* 单条释放失败不影响其余 */ }
+    }
+  };
 }

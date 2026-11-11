@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { open } from '../src/store.mjs';
 import { installMemjudgeRpc } from '../src/rpc.mjs';
+import { stubConnection } from './rpc-fetch-stub.mjs';
 
 test('memories RPC preserves UTF-16 pairs at the preview boundary', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'memjudge-rpc-preview-'));
@@ -21,10 +22,9 @@ test('memories RPC preserves UTF-16 pairs at the preview boundary', async () => 
     const ids = texts.map(text => store.put({ text }).id);
     store.close();
     let handler;
-    installMemjudgeRpc({ connection: { rpc: { handle(channel, fn) {
-      assert.equal(channel, '/memjudge');
-      handler = fn;
-    } } } }, { dbPath });
+    const stub = stubConnection();
+    installMemjudgeRpc({ connection: stub.connection }, { dbPath });
+    handler = stub.call;
     const result = await handler('memories', { limit: 120 });
     assert.equal(result.ok, true);
     assert.equal(result.value.total, texts.length);

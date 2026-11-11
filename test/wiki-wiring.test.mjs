@@ -85,14 +85,15 @@ test('wiki 接线：写入即产出内存投影，落盘只多 wiki_version 与 
     const bytes = Buffer.byteLength(meta.get('wiki_version'), 'utf8') + Buffer.byteLength(meta.get('raw_digest'), 'utf8');
     assert.ok(bytes < 200, `两个键合计 ${bytes} 字节，超出 200`);
 
-    const planned = new Set(['schema_version', 'wiki_version', 'raw_digest']);
+    const planned = new Set(['schema_version', 'wiki_version', 'raw_digest', 'occurrences_v1_migrated']);
     const extra = [...meta.keys()].filter((k) => !planned.has(k));
     assert.deepEqual(extra, [], `meta 出现计划外的键：${extra.join(',')}`);
 
     // 投影不落盘：没有 wiki / page / fts 表，memories 里也没有多出来的行。
     assert.deepEqual(tables.filter((t) => /wiki|page|fts/i.test(t)), [], `出现投影表：${tables.join(',')}`);
-    assert.equal(meta.size, planned.size, 'meta 只该有 schema_version + 计划内的两个键');
+    assert.equal(meta.size, planned.size, 'meta 只该有 schema_version + occurrences 迁移标记 + 计划内的两个键');
   } finally {
+    inst.dispose();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -114,8 +115,8 @@ test('wiki 接线：raw 未变的重复写入不重编（digest 命中跳过）'
 
     assert.equal(after.compiles, before.compiles, '同一条幂等重写不该再编一次');
     assert.equal(after.skipped, before.skipped + 1, '应记一次 digest 命中跳过');
-    inst.dispose();
   } finally {
+    inst.dispose();
     rmSync(dir, { recursive: true, force: true });
   }
 });

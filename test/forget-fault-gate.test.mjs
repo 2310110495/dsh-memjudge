@@ -30,12 +30,13 @@ for (const mode of ['begin', 'begin-after', 'commit-before', 'commit-after', 'ro
           db = this;
           if (mode.startsWith('rollback')) return { run() { throw new Error('delete-primary'); } };
         }
-        if (mode === 'rebuild' && sql === 'SELECT rowid AS ord, text FROM memories ORDER BY created_at, id') throw new Error('rebuild-primary');
+        if (mode === 'rebuild' && sql === 'SELECT rowid AS ord, text FROM memories ORDER BY rowid') throw new Error('rebuild-primary');
         return stmt;
       };
       DatabaseSync.prototype.exec = function(sql) {
-        if (sql === 'BEGIN' && mode === 'begin') throw new Error('begin-primary');
-        if (sql === 'BEGIN' && mode === 'begin-after') { originalExec.call(this, sql); throw new Error('begin-primary'); }
+        db ??= this;
+        if (sql === 'BEGIN IMMEDIATE' && mode === 'begin') throw new Error('begin-primary');
+        if (sql === 'BEGIN IMMEDIATE' && mode === 'begin-after') { originalExec.call(this, sql); throw new Error('begin-primary'); }
         if (sql === 'COMMIT' && mode === 'commit-before') throw new Error('commit-primary');
         if (sql === 'COMMIT' && mode === 'commit-after') { originalExec.call(this, sql); throw new Error('commit-primary'); }
         if (sql === 'ROLLBACK' && mode === 'rollback-before') throw new Error('rollback-cleanup');
@@ -48,7 +49,7 @@ for (const mode of ['begin', 'begin-after', 'commit-before', 'commit-after', 'ro
       assert.ok(error);
       DatabaseSync.prototype.exec = originalExec;
       DatabaseSync.prototype.prepare = originalPrepare;
-      if (mode === 'begin') {
+      if (mode === 'begin' || mode === 'begin-after') {
         assert.equal(service.stats().facts, initialFacts);
         assert.match(error.message, /begin-primary/);
         assert.match(inject(), /白鲸号/);
@@ -70,7 +71,7 @@ for (const mode of ['begin', 'begin-after', 'commit-before', 'commit-after', 'ro
         } else assert.match(cause.message, /primary/);
         assert.throws(inject, /instance fault/);
         await assert.rejects(tools.get('memjudge_forget').execute({ query: '白鲸号', dryRun: true }), /instance fault/);
-        assert.equal(db.isTransaction, mode === 'rollback-before' || mode === 'begin-after');
+        assert.equal(db.isTransaction, mode === 'rollback-before');
         assert.equal(db.prepare('SELECT count(*) AS n FROM memories').get().n, mode === 'commit-after' || mode === 'rebuild' ? 0 : 1);
       }
     } finally {

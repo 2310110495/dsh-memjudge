@@ -1,4 +1,4 @@
-// memjudge — DSH 记忆插件外壳：apply(ctx) + 5 个工具 + 1 个注入 section。
+// memjudge — DSH 记忆插件外壳：apply(ctx) + 7 个工具 + 1 个注入 section。
 //
 // 三条宿主实测约束决定了这里的形状（mem-eval/reports/host-verify.txt）：
 //
@@ -17,7 +17,6 @@
 // 零运行时依赖：只用 node:sqlite / node:fs / node:path，可直接
 // `dsh plugin --profile <p> add file:<本目录>` 安装，不需要 peerDependencies。
 
-import { installRawHostAdapter } from './raw-host-adapter.mjs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -25,9 +24,9 @@ import { createHash } from 'node:crypto';
 import { open as openStore, normalizeKind, MEMORY_KINDS } from './store.mjs';
 import { SearchIndex } from './search.mjs';
 import { embed as embedVec, vecStats } from './vector.mjs';
-import { gate, resolveConflict, documentConflicts } from './judge.mjs';
-import { attributeValues } from './attribute-evidence.mjs';
+import { gate, resolveConflict } from './judge.mjs';
 import {
+  conflictJudgments,
   renderRecall,
   sleepPhase,
   // wiki 编译层（T8-1）：投影只在内存，落盘只有 meta 两个键。
@@ -50,15 +49,30 @@ import {
   // 采集判定内核（纯函数，fail-open）：本文件只做「读 decision → 写库」的旁路。
   createQuota,
   extractCandidates,
+  formatAssistantSource,
   formatSource,
   isAutoSource,
   resolveAutoConfig,
 } from './auto-capture.mjs';
+import {
+  // assistant 侧独立闸门（T87）：与 user 通路不共享任何阈值常量。
+  extractAssistantCandidates,
+  // T90：轮级分段采集。一段文本 → 段 + 工作状态 + 动作清单。
+  inspectAssistantMessage,
+  planAssistantCapture,
+  resolveAssistantConfig,
+} from './auto-capture-assistant.mjs';
+import { createTurnBuffer } from './auto-capture-turn.mjs';
 import { installMemjudgeRpc } from './rpc.mjs';
+import {
+  // 采集侧 kind 判定（T89）：把「用户是谁」和「约定了什么」从 event 里分出来。
+  // 判据全部在 kind-classify.mjs 里，本文件只做映射、配额与去重。
+  autoKindSource,
+  classifyCaptureKind,
+  createKindQuota,
+  sameFactSlot,
+} from './kind-classify.mjs';
 import { createService, SERVICE_NAME } from './service.mjs';
-import { createContentSnapshotView } from './content-snapshot-view.mjs';
-import { createDisposal, initializeWithDisposal } from './disposal.mjs';
-import { startupDependencies } from './startup-dependencies.mjs';
 import { expand } from './query-expand.mjs';
 import { select } from './llm-select.mjs';
 
@@ -114,9 +128,8 @@ export const TOOL_NAMES = Object.freeze([
   'memjudge_recall',
   'memjudge_read',
   'memjudge_forget',
+  'memjudge_demote',
   'memjudge_conflicts',
-  'memjudge_conflicts_v1',
-  'memjudge_conflicts_v2',
   'memjudge_stats',
 ]);
 
@@ -179,12 +192,9 @@ function clampNum(value, lo, hi, fallback) {
  */
 export function resolveConfig(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
-  const experimentalSnapshotRecall = Object.hasOwn(src, 'experimentalSnapshotRecall') ? src.experimentalSnapshotRecall : false;
-  if (typeof experimentalSnapshotRecall !== 'boolean') throw new TypeError('invalid experimentalSnapshotRecall');
   const vector = src.vector === undefined ? DEFAULTS.vector : src.vector === true;
   const expand = src.expand === undefined ? DEFAULTS.expand : src.expand === true;
   const llmSelect = src.llmSelect === undefined ? DEFAULTS.llmSelect : src.llmSelect === true;
-  if (experimentalSnapshotRecall && (vector || expand || llmSelect)) throw new TypeError('experimentalSnapshotRecall requires vector, expand and llmSelect disabled');
   const experimentalInjectMode = Object.hasOwn(src, 'experimentalInjectMode') ? src.experimentalInjectMode : DEFAULTS.experimentalInjectMode;
   if (!['legacy', 'daily'].includes(experimentalInjectMode)) throw new TypeError('invalid experimentalInjectMode');
   const experimentalInjectHalfLifeDays = Object.hasOwn(src, 'experimentalInjectHalfLifeDays') ? src.experimentalInjectHalfLifeDays : DEFAULTS.experimentalInjectHalfLifeDays;
@@ -217,7 +227,6 @@ export function resolveConfig(raw) {
     decayFloor: clampNum(src.decayFloor, 0, 1, DEFAULTS.decayFloor),
     touchOnRecall: src.touchOnRecall !== false,
     injectLimit: clampInt(src.injectLimit, 1, 50, DEFAULTS.injectLimit),
-    experimentalSnapshotRecall,
     vector,
     expand,
     llmSelect,
@@ -261,6 +270,8 @@ function decodeSource(source) {
   return { chapter: 0, para: 0 };
 }
 
+const ID_SOURCE = /^mem-c(\d+)-p(\d+)-/;
+
 /**
  * 章/段号的权威读法：先看 source 列里的 JSON，其次看 id 前缀
  * （makeId 生成 `mem-c<章>-p<段>-<hash>`）。
@@ -271,7 +282,13 @@ function decodeSource(source) {
  */
 function chapterOf(memory) {
   const src = decodeSource(memory?.source);
-  return src;
+  // 只在完全拿不到章号时兜底：source 列有合法 JSON（哪怕只给了段号）就以它为准。
+  if (src.chapter !== 0 || src.para !== 0) return src;
+  // source 不是 encodeSource 的 JSON（显式来源串把这一列让出去了）时，章号只剩 id 里那份。
+  // 数值不限位数：makeId 的 padStart 只是补齐，三位章号会原样写成 100。
+  const m = ID_SOURCE.exec(String(memory?.id ?? ''));
+  if (!m) return src;
+  return { chapter: Number(m[1]) || 0, para: Number(m[2]) || 0 };
 }
 
 /** 注入索引里的来源标签：章号优先，显式来源次之，两者都没有才算手动写入。 */
@@ -344,7 +361,7 @@ export function isHardDeny(verdict, query, body) {
  * @param {object} [config] 见 DEFAULTS
  */
 export function apply(ctx, config, dependencies = {}) {
-  const deps = startupDependencies({
+  const deps = {
     storeFactory: openStore,
     maxChars: configuredMaxChars,
     storageLimitBytes: configuredStorageLimitBytes,
@@ -355,10 +372,10 @@ export function apply(ctx, config, dependencies = {}) {
     embedDims,
     expand,
     select,
-  }, dependencies);
+    ...(dependencies && typeof dependencies === 'object' ? dependencies : {}),
+  };
   const cfg = resolveConfig(config);
-  const snapshotRecallEnabled = cfg.experimentalSnapshotRecall;
-  const vectorEnabled = () => !snapshotRecallEnabled && cfg.vector;
+  const vectorEnabled = () => cfg.vector;
   // Capture decay settings at mount: rebuilding an index must not change its policy.
   const decayOptions = {
     halfLifeDays: cfg.decayMode === 'uniform' ? cfg.halfLifeDays : null,
@@ -379,7 +396,6 @@ export function apply(ctx, config, dependencies = {}) {
     indexDirty = true;
     injectCache = null;
     autoCaptureCorpus = null;
-    wiki = null;
   };
   const enterFault = (cause) => {
     if (fault) return fault;
@@ -407,17 +423,29 @@ export function apply(ctx, config, dependencies = {}) {
     onFault: (cause) => enterFault(cause),
   });
 
-  const { track, dispose } = createDisposal({
-    close: () => store.close(),
-    clear: () => { index = null; injectCache = null; },
-  });
+  const disposers = [];
+  let disposed = false;
+  const track = (disposer) => {
+    if (typeof disposer === 'function') disposers.push(disposer);
+    return disposer;
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    for (let i = disposers.length - 1; i >= 0; i -= 1) {
+      try { disposers[i](); } catch { /* 单个 disposer 失败不阻断后续释放与关库 */ }
+    }
+    disposers.length = 0;
+    index = null;
+    injectCache = null;
+    wiki = null;
+    store.close();
+  };
 
-  return initializeWithDisposal(ctx, dispose, () => {
+  try {
   // 宿主 RPC 通道：给 browser 半侧（client.js 的设置页「记忆库」面板）提供只读数据。
   // 无 Connection RPC 时静默空函数，不影响其它功能。
   track(deps.installRpc(ctx, { dbPath }));
-  // Explicit trusted startup configuration; never derived from tool/RPC input.
-  if (config?.rawArchive?.enabled === true) track(installRawHostAdapter(ctx, config.rawArchive));
 
   const getIndex = () => {
     assertHealthy();
@@ -691,7 +719,10 @@ export function apply(ctx, config, dependencies = {}) {
   // config.autoCapture === false 是硬开关：即使 env 把它翻回 true 也不采集。
   const autoEnabled = autoCfg.enabled !== false && !(config && config.autoCapture === false);
   // 配额状态机在 apply 里建一次、handler 复用。每次重建等于单会话/单轮上限从未生效。
-  const autoQuota = createQuota(autoCfg);
+  const autoQuota = createQuota({ ...autoCfg, now });
+  // person/promise 的独立配额（T89）：1 条/轮、10 条/会话，与 event 的 2/40 互不挤占。
+  // 名字里的「kind」指记忆三分，不是文件类型；event 通路完全不经过这一份状态机。
+  const autoKindQuota = createKindQuota({ perTurnLimit: 1, sessionLimit: 10 });
   /** 自动章号起点：1-899 留给显式导入的语料，900+ 归自动条目（spec §4.3）。 */
   const AUTO_CHAPTER_START = 900;
   /** meta 里存「下一个可用自动章号」的键（与 wiki_version/raw_digest 同级，不建新表）。 */
@@ -703,16 +734,16 @@ export function apply(ctx, config, dependencies = {}) {
    * 领一个章号。号在事务里领，读-改-写之间不 await，避免并发同号。
    * meta 写失败时退回起点号：宁可多会话共章，也不让采集整条断掉。
    */
-  const claimAutoChapter = () => {
+  const claimChapter = (metaKey) => {
     const db = store.raw();
     let began = false;
     try {
       db.exec('BEGIN');
       began = true;
-      const row = db.prepare('SELECT v FROM meta WHERE k = ?').get(AUTO_META_CHAPTER);
+      const row = db.prepare('SELECT v FROM meta WHERE k = ?').get(metaKey);
       const prev = Number.parseInt(row ? String(row.v) : '', 10);
       const chapter = Number.isFinite(prev) && prev >= AUTO_CHAPTER_START ? prev : AUTO_CHAPTER_START;
-      db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run(AUTO_META_CHAPTER, String(chapter + 1));
+      db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run(metaKey, String(chapter + 1));
       db.exec('COMMIT');
       return chapter;
     } catch (err) {
@@ -727,6 +758,8 @@ export function apply(ctx, config, dependencies = {}) {
       return AUTO_CHAPTER_START;
     }
   };
+
+  const claimAutoChapter = () => claimChapter(AUTO_META_CHAPTER);
 
   /** 取（必要时分配）会话的章号与下一个段号。 */
   const autoSeqFor = (sessionId) => {
@@ -747,6 +780,118 @@ export function apply(ctx, config, dependencies = {}) {
     assertHealthy();
     if (autoCaptureCorpus === null) autoCaptureCorpus = store.dump().map((m) => m.text);
     return autoCaptureCorpus;
+  };
+
+  // ── 自动记忆（T87）：session/event 采集 assistant 侧结论 ─────────────────────
+  // 为什么不是 agent/pre-step：它在 step 开始**之前**调用（agent-loop/lib/index.js:742），
+  // 那一刻 assistant 还没开始生成，钩子天然只看得到刚发出的 user 消息——这才是「记忆里
+  // 只有我说的话」的机制根因，不只是 CAPTURE_KINDS 的白名单。
+  // 宿主把最终消息写进会话日志后同步广播 session/event（session/lib/index.js commit()
+  // L1589-1601），assistant/message 的 data 形如 { turn, step, message, usage?, stream }，
+  // message.content 是块数组（text / reasoning / tool-call，见 dsh-llm assembler.js）。
+  // 判定内核在 src/auto-capture-assistant.mjs，这里同样只做旁路。
+  const autoAsstCfg = resolveAssistantConfig(config && typeof config === 'object' ? config : {});
+  const autoAsstEnabled = autoAsstCfg.enabled !== false && !(config && config.autoCapture === false);
+  // assistant 独立配额：与 user 的 2 条/轮、40 条/会话分开计数，两边互不挤占。
+  const autoAsstQuota = createQuota({ ...autoAsstCfg, now });
+  // 章号：与 user 通路共用同一个自增序列，但**每条发言各领一个新章**。
+  // 起初想让两条通路各用一条序列，实测立刻撞号：两个 meta 键的初值都是 900，
+  // 首轮 user 拿 900、首轮 assistant 也拿 900，章级聚合照样把双方拼成一份文档。
+  // 共用单序列是唯一能保证「两条通路永不同章」又能保持号单调的方案；代价是号增长快一倍。
+  const autoAsstSeqs = new Map();
+
+  /** 取（必要时分配）assistant 通路的章号与下一个段号。 */
+  const autoAsstSeqFor = (sessionId) => {
+    const key = sessionId.trim();
+    const hit = autoAsstSeqs.get(key);
+    if (hit) return hit;
+    const entry = { chapter: claimAutoChapter(), para: 0 };
+    if (autoAsstSeqs.size >= 256) {
+      const oldest = autoAsstSeqs.keys().next();
+      if (!oldest.done) autoAsstSeqs.delete(oldest.value);
+    }
+    autoAsstSeqs.set(key, entry);
+    return entry;
+  };
+
+  // ── 轮级累积（T90）─────────────────────────────────────────────────────
+  // 为什么必须累积到一轮：宿主每发一条 assistant/message 就是一个 **step**（一次工具循环
+  // 算一步）。实测一个真实回合有 50–100 步，每步正文平均 8.5 字，39/41 步不足 50 字。
+  // 任何「按消息判 200 字下限」的闸门都只会看到碎片，于是 129 条库里只剩 1 条助手记忆。
+  // 一轮累积起来中位 2535 字（max 7912，23/25 轮 ≥200 字），才是可切段落库的单位。
+  const autoAsstTurn = createTurnBuffer({ flushAtChars: autoAsstCfg.turnFlushChars });
+  const shortId = (id) => String(id ?? '').slice(0, 8) || 'unknown';
+  let autoAsstArmed = false;
+
+  /**
+   * 一段累积文本 → 分段落库。两条路径共用：阈值软冲（长轮次中途）与 turn/end 硬冲。
+   * @returns {number} 实际写入条数
+   */
+  const flushAssistantTurn = (batch) => {
+    if (!batch || typeof batch.text !== 'string' || batch.text.trim() === '') return 0;
+    let plan;
+    try {
+      plan = planAssistantCapture(batch.text, {
+        ...autoAsstCfg,
+        existing: autoCorpus(),
+        sessionId: batch.sessionId,
+        turn: batch.turn,
+      });
+    } catch (err) {
+      console.warn('[memjudge] assistant-capture plan 失败：', err && err.message);
+      return 0;
+    }
+
+    if (!plan || !Array.isArray(plan.candidates) || plan.candidates.length === 0) {
+      // 全被闸门拦下也必须留痕：没有这行，线上永远看不出「为什么这条没进库」。
+      console.warn(
+        `[memjudge] assistant-capture skip: session=${shortId(batch.sessionId)} t${batch.turn} s${batch.step}`
+        + ` chars=${plan?.weight ?? 0} reasons=${JSON.stringify(plan?.reasons ?? {})}`,
+      );
+      return 0;
+    }
+
+    let wrote = 0;
+    for (const candidate of plan.candidates) {
+      // 配额在候选循环里判：候选已按价值排好序（状态摘要 → 高分段 → 动作清单），
+      // 被拦即停，不会把低价值的尾部塞进去。
+      if (typeof autoAsstQuota.admit === 'function') {
+        const gate = autoAsstQuota.admit(batch.sessionId, batch.turn);
+        if (!gate?.ok) break;
+      }
+      let source;
+      try {
+        source = formatAssistantSource(batch.sessionId, batch.turn, batch.step, candidate.part);
+      } catch {
+        continue;
+      }
+      const seq = autoAsstSeqFor(batch.sessionId);
+      seq.para += 1;
+      try {
+        const result = store.put({
+          text: candidate.text,
+          importance: candidate.importance,
+          chapter: seq.chapter,
+          para: seq.para,
+          source,
+          recordDuplicateOccurrence: false,
+        });
+        if (result && result.inserted) { wrote += 1; contentGeneration += 1; }
+      } catch (err) {
+        console.warn('[memjudge] assistant-capture 写入跳过：', err && err.message);
+      }
+    }
+
+    if (wrote > 0) {
+      invalidate();
+      touchWiki();
+    }
+    console.warn(
+      `[memjudge] assistant-capture flush: session=${shortId(batch.sessionId)} t${batch.turn} s${batch.step}`
+      + ` chars=${plan.weight} segs=${plan.segments.length} cand=${plan.candidates.length} wrote=${wrote}`
+      + ` reasons=${JSON.stringify(plan.reasons)}`,
+    );
+    return wrote;
   };
 
   if (typeof ctx.on === 'function') {
@@ -781,9 +926,20 @@ export function apply(ctx, config, dependencies = {}) {
           onInvalidText: () => console.warn('[memjudge] auto-capture skipped: unpaired-surrogate'),
         });
         if (candidates.length === 0) return decision;
-
         let wrote = 0;
         for (const candidate of candidates) {
+          // T89：先判 kind，再决定这条走哪条闸门。判据全在 kind-classify.mjs，
+          // role 固定 'user'：assistant 的发言永远不可能是「用户是谁」。
+          const verdict = classifyCaptureKind(candidate.text, { role: 'user' });
+          const kind = verdict.kind;
+          if (kind !== 'event') {
+            // 独立配额：超了就不写。person/promise 占的是注入面里永久的固定席位
+            // （人 800 / 约 600 字符），宁可这轮少记一条，也不要挤掉一条真有用的。
+            const __adm = autoKindQuota.admit(sessionId, turn);
+            if (!__adm.ok) continue;
+            // 同实体（我）+ 同属性 + 同取值 = 同一条事实，不重复落库。
+            if (store.byKind(kind, 500).some((row) => sameFactSlot(row.text, candidate.text))) continue;
+          }
           const seq = autoSeqFor(sessionId);
           seq.para += 1;
           try {
@@ -792,7 +948,10 @@ export function apply(ctx, config, dependencies = {}) {
               importance: candidate.importance,
               chapter: seq.chapter,
               para: seq.para,
-              source,
+              kind,
+              // 自动写入的 person/promise 带 `|k:<kind>` 尾标：整批回滚/审计靠它，
+              // bySourcePrefix 的 v2 前缀匹配不受尾标影响。
+              source: autoKindSource(source, kind),
               recordDuplicateOccurrence: false,
             });
             if (result && result.inserted) { wrote += 1; contentGeneration += 1; }
@@ -812,6 +971,58 @@ export function apply(ctx, config, dependencies = {}) {
       // 任何情况下都返回 decision 本体：不修改、不替换、不返回 undefined。
       return decision;
     }, { prepend: true });
+
+    // ── assistant 侧采集（T87）─────────────────────────────────────────────
+    // session/event 是纯 emit 的观察型钩子：不能改事件，但可以在监听器里写记忆。
+    // 宿主对每个监听器做了 containment（单个抛错被吞、不毁会话），本函数仍然自己
+    // 兜住全部异常——采集出问题只允许留下一条 warn，绝不允许变成用户看得见的错误。
+    // ── assistant 侧采集（T87 / T90 轮级）─────────────────────────────────
+    // session/event 是纯 emit 的观察型钩子：不能改事件，但可以在监听器里写记忆。
+    // 宿主对每个监听器做了 containment（单个抛错被吞、不毁会话），本函数仍然自己
+    // 兜住全部异常——采集出问题只允许留下一条 warn，绝不允许变成用户看得见的错误。
+    //
+    // 只订阅两种事件：
+    //   assistant/message → 只累积，不判闸（单步正文太短，判了必死）；
+    //   turn/end          → 一轮结束，drain 出整轮文本再交给 planAssistantCapture 切段。
+    ctx.on('session/event', (session, event) => {
+      if (!autoAsstEnabled) return;
+      try {
+        if (!event || typeof event.type !== 'string') return;
+        const sessionId = session?.id;
+        if (typeof sessionId !== 'string' || sessionId.trim() === '') return;
+        const data = event.data;
+        const turn = data?.turn;
+        if (!Number.isSafeInteger(turn) || turn < 0) return;
+
+        if (event.type === 'turn/end') {
+          const batch = autoAsstTurn.drain(sessionId, turn);
+          if (batch) flushAssistantTurn(batch);
+          return;
+        }
+        if (event.type !== 'assistant/message') return;
+
+        const message = data && data.message;
+        if (!message || message.role !== 'assistant') return;
+
+        // A1/A2 复用 assistantVerdict 的同一份实现（role + source.kind 白名单 + 只留 text 块）。
+        const view = inspectAssistantMessage(message);
+        if (view.problem !== null) return;
+
+        const step = Number.isSafeInteger(data?.step) && data.step >= 0 ? data.step : 0;
+        const pushed = autoAsstTurn.push(sessionId, turn, step, view.text);
+
+        // 首次真正收到消息时打一条 arm 日志：这条是「监听器到底有没有挂上真实宿主」的
+        // 唯一可观测证据。假 ctx 测试证明不了这一点，只有宿主日志里有它才算数。
+        if (!autoAsstArmed) {
+          autoAsstArmed = true;
+          console.warn(`[memjudge] assistant-capture armed: session=${shortId(sessionId)} flushAt=${autoAsstTurn.flushAtChars}`);
+        }
+
+        if (pushed.flush) flushAssistantTurn(pushed.flush);
+      } catch (e) {
+        console.warn('[memjudge] assistant-capture 跳过：', e && e.message);
+      }
+    });
   }
 
   const textBlock = (text) => [{ type: 'text', text }];
@@ -944,11 +1155,6 @@ export function apply(ctx, config, dependencies = {}) {
    * @param {{query?:string, budget?:number, topChapters?:number}} args 与工具入参同形
    * @param {{touch?: boolean}} [runOpts] touch=false 时不刷新 lastAccessed（服务契约用）
    */
-  const recallViews = new WeakMap();
-  const validateRecall = (result) => {
-    assertHealthy();
-    recallViews.get(result)?.assertCurrent();
-  };
   const runRecall = async (args, runOpts = {}) => {
     const query = String(args?.query ?? '').trim();
     if (!query) throw new Error('memjudge_recall: query 不能为空');
@@ -958,18 +1164,14 @@ export function apply(ctx, config, dependencies = {}) {
     // 融合检索开启且向量就绪时走异步双路；查询扩展开启时走多子查询；否则维持纯 BM25
     // 同步路径（行为一字不变）。三条路径共用同一个 fillFromScored，装填语义不变。
     assertHealthy();
-    const view = snapshotRecallEnabled
-      ? createContentSnapshotView(store, () => contentGeneration, { search: { ...decayOptions, maxChars: cfg.injectBudget } })
-      : null;
     const finish = (result) => {
       assertHealthy();
       if (generation !== contentGeneration) throw new Error('memjudge recall stale: content changed');
-      if (view) { view.assertCurrent(); recallViews.set(result, view); }
       return result;
     };
-    const ix = view ?? getIndex();
+    const ix = getIndex();
     const generation = contentGeneration;
-    const found = view ? ix.search(query, { maxChars: budget, topChapters, now: now() }) : cfg.expand
+    const found = cfg.expand
       ? await ix.searchExpanded(query, { maxChars: budget, topChapters, now: now(), expandFn: deps.expand })
       : (cfg.llmSelect || (vectorEnabled() && ix.hasVectors))
         ? await ix.searchAsync(query, {
@@ -985,21 +1187,16 @@ export function apply(ctx, config, dependencies = {}) {
 
     // 先裁剪再判断：在整章上跑 gate 判据恒真，裁到预算内才有区分力。
     const body = found.hits.map((h) => h.text).join('\n\n');
-    const values = attributeValues(query, found.hits);
-    const evidence = values === null ? null : values.length > 0;
-    if (evidence === false) {
-      return finish({ denied: true, reason: 'attribute-evidence-missing', detail: '交付片段中未找到足够的属性证据', chars: 0, elapsedMs: found.elapsedMs, hits: [] });
-    }
     // t15：属性缺席判据要 L1 的 (entity, attr) 集合；store 的 facts 就是 L1 产物。
-    const l1Facts = view ? view.allFacts() : store.allFacts();
-    const verdict = evidence === true ? { deny: false } : gate(query, body, { l1Facts });
+    const l1Facts = store.allFacts();
+    const verdict = gate(query, body, { l1Facts });
     // 硬拒必须在**全文口径**上复核：body 是裁剪后的检索结果，名词块覆盖率天然偏低，
     // 在它上面判「材料里没有这个说法」会把 R12「硫含量」、R45「待了多久」、
     // R78「邮件包编号」这类真问题误拒（body 口径 0.25–0.33，全文口径 0.33–0.56）。
     // body 只用于展示，不单独决定拒答。
     let finalVerdict = verdict;
     if (verdict.deny) {
-      const full = view ? view.fullText() : store.raw().prepare('SELECT text FROM memories').all().map((r) => r.text).join('\n');
+      const full = store.raw().prepare('SELECT text FROM memories').all().map((r) => r.text).join('\n');
       const fullVerdict = gate(query, full, { l1Facts });
       if (!isHardDeny(fullVerdict, query, full)) {
         finalVerdict = { ...fullVerdict, deny: false };
@@ -1022,9 +1219,7 @@ export function apply(ctx, config, dependencies = {}) {
     if (runOpts.touch !== false && cfg.touchOnRecall) {
       const at = now();
       try {
-        if (view) {
-          store.touchSnapshot(found.hits.map(hit => hit.id), at, view.version, () => contentGeneration);
-        } else for (const hit of found.hits) {
+        for (const hit of found.hits) {
           const row = store.updateAccess(hit.id, at);
           if (index && !indexDirty) {
             const doc = index.docs.find((item) => item.id === hit.id);
@@ -1045,11 +1240,15 @@ export function apply(ctx, config, dependencies = {}) {
       }
     }
 
+    // t18 冲突自述：命中段里同槽多值 + 原文含显式修订语时，前置一行修订结论。
+    // 无修订语时 judgments 为空，零字符开销，不污染普通题。
+    const judgments = conflictJudgments(query, found.hits, { l1Facts });
+
     return finish({
       denied: false,
       chars: found.chars,
       elapsedMs: found.elapsedMs,
-      conflictLine: values && values.length > 1 ? `本次交付片段中属性存在不同取值：${values.join('、')}；请结合原文核对。` : '',
+      conflictLine: judgments.length ? judgments[0].line : '',
       hits: found.hits.map((h) => ({
         id: h.id,
         chapter: h.chapter,
@@ -1118,8 +1317,7 @@ export function apply(ctx, config, dependencies = {}) {
       },
       render: (_args, value) => {
         if (value.denied) {
-          const label = value.reason === 'attribute-evidence-missing' ? '交付片段证据不足' : '没有记载';
-          return textBlock(`${label}（${value.reason}${value.detail ? `：${value.detail}` : ''}）`);
+          return textBlock(`没有记载（${value.reason}${value.detail ? `：${value.detail}` : ''}）`);
         }
         const lines = value.hits.map((h) => `[${h.id} ch${h.chapter}${h.truncated ? ` 截断 ${h.windowStart}:${h.windowEnd}` : ''} 版本 ${h.version}] ${h.text}`);
         const head = value.conflictLine ? `${value.conflictLine}\n\n` : '';
@@ -1129,9 +1327,7 @@ export function apply(ctx, config, dependencies = {}) {
     isConcurrencySafe: () => false,
     // 链本体在 runRecall（只读服务契约共用同一条链），这里只是入参透传。
     async execute(args) {
-      const result = await runRecall(args);
-      validateRecall(result);
-      return result;
+      return runRecall(args);
     },
   }));
 
@@ -1222,8 +1418,16 @@ export function apply(ctx, config, dependencies = {}) {
     async execute(args) {
       const dryRun = args?.dryRun === true;
       assertHealthy();
+      const runForget = (opts) => {
+        try {
+          return store.forget(opts);
+        } catch (err) {
+          if (fault) throw fault;
+          throw err;
+        }
+      };
       if (args?.source !== undefined) {
-        const result = store.forget({ source: args.source, dryRun });
+        const result = runForget({ source: args.source, dryRun });
         assertHealthy();
         if (!dryRun) { invalidate(); touchWiki(); }
         return { forgotten: result.forgotten, count: result.count, dryRun };
@@ -1239,7 +1443,7 @@ export function apply(ctx, config, dependencies = {}) {
       if (!ids.length) return { forgotten: [], count: 0, dryRun };
       if (dryRun) return { forgotten: ids, count: ids.length, dryRun: true };
 
-      const removed = store.forget({ ids }).forgotten;
+      const removed = runForget({ ids }).forgotten;
       assertHealthy();
       invalidate();
       // 删除同样改变 raw：投影必须跟着重建，否则 wiki 里会留着已经忘掉的块。
@@ -1249,10 +1453,71 @@ export function apply(ctx, config, dependencies = {}) {
   }));
 
   track(ctx.tools.register({
+    name: 'memjudge_demote',
+    description:
+      '把一条记忆从 person/promise 降级为 event：正文、来源、访问记录全部保留，只改分类与衰减层级。'
+      + '误判纠正用这个，不要用 memjudge_forget——删了正文就再也捞不回来。'
+      + '降级后该条从 Pinned（tier 1）落到 event 档（tier 3），可随 nightly 正常升降；'
+      + '召回仍能命中，只是不再常驻注入面的「人：/约：」两段。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: '要降级的记忆 id（memjudge_recall 返回的 id）。' },
+      },
+      required: ['id'],
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          found: { type: 'boolean' },
+          id: { type: 'string' },
+          changed: { type: 'boolean' },
+          kindBefore: { type: 'string' },
+          tierBefore: { type: 'integer' },
+          kind: { type: 'string' },
+          tier: { type: 'integer' },
+        },
+        required: ['found', 'id', 'changed', 'kindBefore', 'tierBefore', 'kind', 'tier'],
+      },
+      render: (_args, value) => textBlock(
+        !value.found
+          ? `没有找到 id=${value.id} 的记忆`
+          : value.changed
+            ? `已把 ${value.id} 从 ${value.kindBefore}（tier ${value.tierBefore}）降级为 ${value.kind}（tier ${value.tier}）`
+            : `${value.id} 已经是 ${value.kind}（tier ${value.tier}），无需改动`,
+      ),
+    },
+    isConcurrencySafe: () => false,
+    execute(args) {
+      assertHealthy();
+      const id = typeof args?.id === 'string' ? args.id.trim() : '';
+      if (!id) throw new Error('memjudge_demote: id 必须是非空字符串');
+      const result = store.setKind(id, 'event');
+      assertHealthy();
+      if (!result) return { found: false, id, changed: false, kindBefore: '', tierBefore: 0, kind: '', tier: 0 };
+      if (result.changed) {
+        invalidate();
+        // 分类变了，wiki 的块归属也跟着变：投影必须重建，否则「人：」段里会留着已降级的条目。
+        touchWiki();
+      }
+      return {
+        found: true,
+        id: result.id,
+        changed: result.changed,
+        kindBefore: result.kindBefore,
+        tierBefore: result.tierBefore,
+        kind: result.kind,
+        tier: result.tier,
+      };
+    },
+  }));
+
+  track(ctx.tools.register({
     name: 'memjudge_conflicts',
     description:
-      '旧版按章聚合，可能跨文档误报；按显式文档身份检测请用 memjudge_conflicts_v1。'
-      + '列出 memjudge 记忆里前后矛盾的数值：同一单位出现两个不同值，且两句共享同一个名词。'
+      '列出 memjudge 记忆里前后矛盾的数值：同一单位出现两个不同值，且两句共享同一个名词。'
       + '按章聚合后判断（同一份文档里前后说法不一致才算矛盾）。返回每组矛盾的取值序列与'
       + '按时间取的最新值。注意 current 是结构规则的结果：原文自带「已作废」「现予更正」这类'
       + '措辞时，最新值可能落在复述旧值的那一句上，此时以 evidence 里的原句为准。'
@@ -1316,90 +1581,6 @@ export function apply(ctx, config, dependencies = {}) {
         total: result.conflicts.length,
         supersededCount: result.superseded.length,
       };
-    },
-  }));
-
-  track(ctx.tools.register({
-    name: 'memjudge_conflicts_v1',
-    description: '按显式 documentId 检测数值矛盾候选；未知身份仅比较同一正文。不推断当前值。共享字面二字组是启发式，可能误报；最多比较10000对，按输入顺序扫描，后续内容可能遗漏。total 是已扫描发现的候选数量；totalExact 为 false 时它只是全量候选数量的下界，与输出数量或预算截断无关。',
-    parameters: { type: 'object', additionalProperties: false, properties: {
-      limit: { type: 'integer', description: '最多返回几组矛盾，1..50。默认 20。' },
-    } },
-    output: { schema: { type: 'object', additionalProperties: false, properties: {
-      conflicts: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
-        documentId: { type: ['string', 'null'] }, attr: { type: 'string' }, unit: { type: 'string' },
-        values: { type: 'array', items: { type: 'string' } },
-        evidence: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
-          value: { type: 'string' }, memoryId: { type: 'string' }, text: { type: 'string' },
-          positions: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
-            memoryId: { type: 'string' }, source: { type: ['string', 'null'] },
-            documentId: { type: ['string', 'null'] }, chapter: { type: ['integer', 'null'] }, para: { type: ['integer', 'null'] },
-          }, required: ['memoryId', 'source', 'documentId', 'chapter', 'para'] } },
-        }, required: ['value', 'memoryId', 'text', 'positions'] } },
-      }, required: ['documentId', 'attr', 'unit', 'values', 'evidence'] } },
-      total: { type: 'integer', description: '已扫描发现的候选数量；totalExact 为 false 时仅为下界。' },
-      totalExact: { type: 'boolean', description: '是否完成候选扫描；与输出数量或预算截断无关。' },
-      truncated: { type: 'boolean' }, limitTruncated: { type: 'boolean' }, budgetTruncated: { type: 'boolean' },
-      scanIncomplete: { type: 'boolean' }, comparisons: { type: 'integer' },
-    }, required: ['conflicts', 'total', 'totalExact', 'truncated', 'limitTruncated', 'budgetTruncated', 'scanIncomplete', 'comparisons'] }, render: (_args, value) => textBlock(JSON.stringify(value)) },
-    isConcurrencySafe: () => true,
-    async execute(args) {
-      const rows = store.dump().map(mem => ({ ...mem, occurrences: store.occurrencesV1(mem.id) }));
-      const scan = {};
-      const conflicts = documentConflicts(rows, { maxComparisons: 10000, scan });
-      const limit = clampInt(args?.limit, 1, 50, 20);
-      const result = { conflicts: [], total: conflicts.length, totalExact: !scan.incomplete, truncated: conflicts.length > limit || scan.incomplete,
-        limitTruncated: conflicts.length > limit, budgetTruncated: false,
-        scanIncomplete: scan.incomplete, comparisons: scan.comparisons };
-      const renderedBytes = value => Buffer.byteLength(JSON.stringify(textBlock(JSON.stringify(value))), 'utf8');
-      if (renderedBytes(result) > 65536) {
-        throw new Error('memjudge_conflicts_v1: fixed render envelope exceeds 65536 bytes');
-      }
-      for (const conflict of conflicts.slice(0, limit)) {
-        result.conflicts.push(conflict);
-        if (renderedBytes(result) > 65536) {
-          result.conflicts.pop();
-          result.budgetTruncated = true;
-          break;
-        }
-      }
-      result.truncated = result.limitTruncated || result.budgetTruncated || result.scanIncomplete;
-      return result;
-    },
-  }));
-
-  track(ctx.tools.register({
-    name: 'memjudge_conflicts_v2',
-    description: '有界扫描数量和共享二字组形成的冲突候选，非权威事实，不推断当前值；未知文档仅比较同一正文。scanIncomplete 表示扫描未完成，outputTruncated 表示输出裁剪；空结果并不证明全库没有冲突。total 是返回的候选组数，仅 totalExact 为真时代表完整总数。',
-    parameters: { type: 'object', additionalProperties: false, properties: {
-      limit: { type: 'integer', minimum: 1, maximum: 50, description: '扫描候选上限，默认20；达到上限可能使扫描不完整。' },
-    } },
-    output: { schema: { type: 'object', additionalProperties: false, properties: {
-      conflicts: { type: 'array', items: { type: 'object', properties: {
-        documentId: { type: ['string', 'null'] }, attr: { type: 'string' }, unit: { type: 'string' },
-        values: { type: 'array', items: { type: 'string' } }, evidence: { type: 'array', items: { type: 'object' } },
-      }, required: ['documentId', 'attr', 'unit', 'values', 'evidence'] } },
-      total: { type: 'integer' }, totalExact: { type: 'boolean' }, scanIncomplete: { type: 'boolean' },
-      reason: { type: ['string', 'null'] }, comparisons: { type: 'integer' }, outputTruncated: { type: 'boolean' },
-    }, required: ['conflicts', 'total', 'totalExact', 'scanIncomplete', 'reason', 'comparisons', 'outputTruncated'] },
-    render: (_args, value) => textBlock(JSON.stringify(value)) },
-    isConcurrencySafe: () => false,
-    async execute(args) {
-      if (args === undefined) args = {};
-      if (args === null || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(key => key !== 'limit')) throw new TypeError('invalid conflict scan arguments');
-      const limit = args.limit === undefined ? 20 : args.limit;
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new RangeError('invalid conflict scan limit');
-      const scanned = store.scanConflictsV2({ limits: { conflicts: limit } });
-      const result = { ...scanned, conflicts: [...scanned.conflicts] };
-      const size = () => Buffer.byteLength(JSON.stringify(textBlock(JSON.stringify(result))), 'utf8');
-      while (size() > 65536 && result.conflicts.length) {
-        result.conflicts.pop();
-        result.total = result.conflicts.length;
-        result.outputTruncated = true;
-        result.totalExact = false;
-      }
-      if (size() > 65536) throw new RangeError('conflict scan render envelope exceeds 65536 bytes');
-      return result;
     },
   }));
 
@@ -1541,7 +1722,6 @@ export function apply(ctx, config, dependencies = {}) {
       store,
       guard: assertHealthy,
       contentVersion: () => contentGeneration,
-      validateRecall,
       // 复用同一条召回链（runRecall），不另写一份；touch:false 保证「只读」名副其实——
       // 下游每轮观测都调一次的话，刷新访问时间会把衰减数据冲成噪声。
       recall: (query, opts) => runRecall(
@@ -1563,8 +1743,12 @@ export function apply(ctx, config, dependencies = {}) {
 
   // -------------------------------------------------------------- 卸载
 
+  ctx.effect(() => dispose);
   return { dispose, dbPath, config: cfg };
-  });
+  } catch (err) {
+    dispose();
+    throw err;
+  }
 }
 
 export default {

@@ -13,8 +13,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeId } from './schema.mjs';
 import { extractL1 } from './extract.mjs';
-import { normalizeConflictScanOptions, scanConflictConnectionV2 } from './conflict-scan-v2.mjs';
-
 import { hasUnpairedSurrogate } from './text-wellformed.mjs';
 
 export const STORE_SCHEMA_VERSION = 7;
@@ -79,6 +77,29 @@ export function normalizeTier(value, kind) {
   if (!Number.isFinite(n)) return defaultTier(k);
   if (k === 'person' || k === 'promise') return MEMORY_TIER_PINNED;
   return Math.min(MEMORY_TIER_MAX, Math.max(MEMORY_TIER_MIN, Math.trunc(n)));
+}
+
+/**
+ * 「有人想把 person/promise 写进非 1 档」的告警去重表。
+ *
+ * normalizeTier 已经把值钳回 1，但它钳得静默——一次手滑的 `put({kind:'person',tier:4})`
+ * 在调用方看来是成功的，实际 tier 被改写了。这里把「钳制发生过」这件事说出来：
+ * 按 kind+tier 组合每进程只 warn 一次，不给测试与长跑进程刷日志。
+ */
+const pinTierWarned = new Set();
+function warnPinnedTierClamp(kind, tier) {
+  const key = `${kind}:${String(tier)}`;
+  if (pinTierWarned.has(key)) return;
+  pinTierWarned.add(key);
+  console.warn(
+    `[memjudge] store.put: kind=${kind} 必须是 tier ${MEMORY_TIER_PINNED}（钉住），`
+    + `收到 tier=${String(tier)} 已钳回 ${MEMORY_TIER_PINNED}——身份与约定不允许进入淘汰区`,
+  );
+}
+
+/** 测试用：清空告警去重表，让同一组合能被再次观察到。 */
+export function resetPinTierWarnings() {
+  pinTierWarned.clear();
 }
 /**
  * LIKE 模式的字面量化：`%` `_` `\` 各自转义，配合 `ESCAPE '\'` 使用。
@@ -583,7 +604,6 @@ export function open(dbPath = ':memory:', opts = {}) {
 
   const db = new DatabaseSync(file);
   try {
-  let scanningConflicts = false;
   let readingInjectionSnapshot = false;
   let storeFault = null;
   function failStore(cause) {
@@ -655,140 +675,29 @@ export function open(dbPath = ':memory:', opts = {}) {
       readingInjectionSnapshot = false;
     }
   }
-  // Cooperative read-only scan: raw() still exposes the same connection to trusted code.
-  function scanConflictsV2(options = {}) {
-    if (scanningConflicts || db.isTransaction) throw new Error('conflict scan requires an idle connection');
-    scanningConflicts = true;
-    let beginAttempted = false, failure, failed = false, result;
-    try {
-      const normalized = normalizeConflictScanOptions(options);
-      assertOpen();
-      if (db.isTransaction) throw new Error('conflict scan requires an idle connection');
-      beginAttempted = true;
-      db.exec('BEGIN DEFERRED');
-      if (!db.isTransaction) throw new Error('conflict scan begin did not start a transaction');
-      result = scanConflictConnectionV2(db, normalized);
-    } catch (error) {
-      failed = true;
-      failure = error;
-    }
-    try {
-      if (beginAttempted) {
-        let active;
-        try { active = db.isTransaction; }
-        catch (cleanup) {
-          const cause = failed ? new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure }) : cleanup;
-          throw failStore(cause);
-        }
-        if (active) {
-          try { db.exec('ROLLBACK'); }
-          catch (cleanup) {
-            const cause = failed ? new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure }) : cleanup;
-            throw failStore(cause);
-          }
-        }
-        try {
-          if (db.isTransaction) throw new Error('conflict scan cleanup left an active transaction');
-        } catch (cleanup) {
-          const cause = failed ? new AggregateError([failure, cleanup], 'scan and transaction cleanup failed', { cause: failure }) : cleanup;
-          throw failStore(cause);
-        }
-      }
-      if (failed) throw failure;
-      return result;
-    } finally {
-      scanningConflicts = false;
-    }
-  }
   const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
 
-  // Preserve the existing journal mode: changing it is not transactional.
-  db.exec('BEGIN IMMEDIATE');
-  const objects = db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name").all();
-  const meta = objects.find(o => o.name === 'meta' && o.type === 'table');
-  let fromVersion = 0;
-  if (meta) {
-    // Only the historical/current table is understood; PRAGMA alone misses CHECK,
-    // conflict policies and other constraints hidden in the CREATE statement.
-    const canonicalMeta = 'createtablemeta(ktextprimarykey,vtextnotnull)';
-    if (meta.sql?.replace(/\s+/g, '').toLowerCase() !== canonicalMeta) {
-      throw new Error('unrecognized meta table');
-    }
-    const metaIndexes = db.prepare('PRAGMA index_list(meta)').all();
-    if (metaIndexes.length !== 1 || metaIndexes[0].name !== 'sqlite_autoindex_meta_1' ||
-        metaIndexes[0].unique !== 1 || metaIndexes[0].origin !== 'pk' || metaIndexes[0].partial !== 0) {
-      throw new Error('unrecognized meta indexes');
-    }
-    const metaIndexColumns = db.prepare('PRAGMA index_xinfo(sqlite_autoindex_meta_1)').all();
-    if (metaIndexColumns.length !== 2 || metaIndexColumns.some((column, i) =>
-      [column.seqno, column.cid, column.name, column.desc, column.coll, column.key].some((value, j) =>
-        value !== [[0, 0, 'k', 0, 'BINARY', 1], [1, -1, null, 0, 'BINARY', 0]][i][j]))) {
-      throw new Error('unrecognized meta index columns');
-    }
-    const rows = db.prepare("SELECT v FROM meta WHERE k = 'schema_version'").all();
-    if (rows.length > 1) throw new Error('invalid schema version');
-    if (rows.length) {
-      const value = rows[0].v;
-      if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('invalid schema version');
-      fromVersion = Number(value);
-      if (fromVersion > STORE_SCHEMA_VERSION) throw new Error('unsupported future schema version');
-    }
-  }
-  if (objects.length) {
-    // Persistent facts are not removed by the current forget transaction.
-    // Reject every shape until deletion and migration can share that invariant.
-    if (objects.some(o => o.type === 'table' && o.name === 'facts')) {
-      throw new Error(`unrecognized ${fromVersion ? 'versioned' : 'unversioned'} database: persisted facts require forget-safe migration`);
-    }
-    const expected = [
-      ['id', 'TEXT', 0, null, 1], ['text', 'TEXT', 1, null, 0],
-      ['text_hash', 'TEXT', 1, null, 0], ['created_at', 'INTEGER', 1, null, 0],
-      ['last_accessed', 'INTEGER', 1, null, 0], ['access_count', 'INTEGER', 1, '0', 0],
-      ['importance', 'REAL', 1, '0', 0], ['supersedes', 'TEXT', 0, null, 0],
-      ['source', 'TEXT', 0, null, 0],
-    ];
-    const columns = db.prepare('PRAGMA table_xinfo(memories)').all();
-    const extra = [['kind', 'TEXT', 1, "'event'", 0], ['tier', 'INTEGER', 1, '3', 0]];
-    const schema = [...expected, ...extra.slice(0, Math.max(0, columns.length - expected.length))];
-    const badMemory = columns.length < expected.length || columns.length > schema.length || columns.some((c, i) => c.hidden || [c.name, c.type, c.notnull, c.dflt_value, c.pk].some((v, j) => v !== schema[i][j]));
-    const allowed = new Set(fromVersion
-      ? ['table:meta', 'table:memories', 'table:memory_occurrences', 'table:segments', 'table:vector_blob', 'table:facts', 'index:ux_memories_hash', 'index:ux_memory_occurrences_position', 'trigger:memory_occurrences_delete']
-      : ['table:memories', 'table:memory_occurrences']);
-    if (badMemory || objects.some(o => !allowed.has(`${o.type}:${o.name}`))) throw new Error(`unrecognized ${fromVersion ? 'versioned' : 'unversioned'} database`);
-    const facts = objects.find(o => o.type === 'table' && o.name === 'facts');
-    if (facts) {
-      const normalize = sql => sql?.replace(/\s+/g, '').toLowerCase();
-      const historical = 'CREATE TABLE facts (memory_id INTEGER NOT NULL, entity TEXT, attr TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, unit TEXT, kind TEXT NOT NULL, at INTEGER NOT NULL)';
-      if (normalize(facts.sql) !== normalize(historical)) throw new Error('unrecognized versioned database: unrecognized historical facts table');
-    }
-    const indexDefinitions = {
-      ux_memories_hash: ['memories', 'CREATE UNIQUE INDEX ux_memories_hash ON memories(text_hash)'],
-      ux_memory_occurrences_position: ['memory_occurrences', "CREATE UNIQUE INDEX ux_memory_occurrences_position ON memory_occurrences (memory_id, source IS NULL, coalesce(source, ''), document_id IS NULL, coalesce(document_id, ''), chapter IS NULL, coalesce(chapter, 0), para IS NULL, coalesce(para, 0))"],
-    };
-    for (const index of objects.filter(o => o.type === 'index')) {
-      const [table, sql] = indexDefinitions[index.name];
-      if (index.tbl_name !== table || index.sql?.replace(/\s+/g, ' ').trim() !== sql) throw new Error('unrecognized database index');
-    }
-    if (objects.some(o => o.name === 'memory_occurrences' && o.type === 'table')) {
-      const occurrence = db.prepare('PRAGMA table_xinfo(memory_occurrences)').all();
-      const shape = [['memory_id', 'TEXT', 1], ['source', 'TEXT', 0], ['document_id', 'TEXT', 0], ['chapter', 'INTEGER', 0], ['para', 'INTEGER', 0]];
-      if (occurrence.length !== shape.length || occurrence.some((c, i) => c.hidden || c.pk || c.dflt_value !== null || [c.name, c.type, c.notnull].some((v, j) => v !== shape[i][j]))) throw new Error('unrecognized occurrence table');
-    }
-    const trigger = objects.find(o => o.type === 'trigger');
-    if (trigger) {
-      const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(trigger.name)?.sql;
-      const canonical = 'CREATE TRIGGER memory_occurrences_delete AFTER DELETE ON memories BEGIN DELETE FROM memory_occurrences WHERE memory_id = OLD.id; END';
-      const current = canonical.replace(' END', ' DELETE FROM segments WHERE ord = OLD.rowid; END');
-      if (![canonical, current].includes(sql?.replace(/\s+/g, ' ').trim())) throw new Error('unrecognized database trigger');
-    }
-  }
-  db.exec('DROP TRIGGER IF EXISTS memory_occurrences_delete');
+  if (!isMemory) db.exec('PRAGMA journal_mode = DELETE');
   db.exec(DDL);
-  db.exec(`
+  db.exec(`BEGIN IMMEDIATE;
+    DROP TRIGGER IF EXISTS memory_occurrences_delete;
+    CREATE TRIGGER memory_occurrences_delete AFTER DELETE ON memories BEGIN
+      DELETE FROM memory_occurrences WHERE memory_id = OLD.id;
+      DELETE FROM segments WHERE ord = OLD.rowid;
+    END;
     INSERT INTO memory_occurrences (memory_id, source)
       SELECT id, source FROM memories
       WHERE NOT EXISTS (SELECT 1 FROM meta WHERE k = 'occurrences_v1_migrated');
     INSERT OR IGNORE INTO meta (k, v) VALUES ('occurrences_v1_migrated', '1');`);
+  let fromVersion = 0;
+  const versionRow = db.prepare("SELECT v FROM meta WHERE k = 'schema_version'").get();
+  if (versionRow != null) {
+    const parsed = Number(versionRow.v);
+    if (Number.isSafeInteger(parsed) && parsed > 0) {
+      if (parsed > STORE_SCHEMA_VERSION) throw new Error('unsupported future schema version');
+      fromVersion = parsed;
+    }
+  }
 
   // ── facts 内存派生层（v5：不落盘） ────────────────────────────────────────
   // 结构：byOrd（ord → Fact[]，供 factsOf/dump）与 slot（attr → [{ord,fact}]，
@@ -802,14 +711,19 @@ export function open(dbPath = ':memory:', opts = {}) {
   let derivedTexts = new Map();
   const databaseEpoch = () => `${db.prepare('PRAGMA data_version').get().data_version}:${db.prepare('SELECT total_changes() AS n').get().n}`;
   let derivedEpoch;
+  const SNAPSHOT_MEMORIES_SQL = 'SELECT quote(rowid) AS r, id, text, source, kind, quote(tier) AS tier, quote(importance) AS imp, supersedes, quote(created_at) AS ca FROM memories ORDER BY rowid';
+  const SNAPSHOT_OCC_SQL = 'SELECT quote(rowid) AS r, memory_id, source, document_id, quote(chapter) AS ch, quote(para) AS pa FROM memory_occurrences ORDER BY rowid';
+  function readSnapshotStamp() {
+    return JSON.stringify([
+      db.prepare(SNAPSHOT_MEMORIES_SQL).all(),
+      db.prepare(SNAPSHOT_OCC_SQL).all(),
+    ]);
+  }
   function contentVersion() {
     assertOpen();
     if (db.isTransaction) throw new Error('content version requires an idle connection');
     const before = db.prepare('PRAGMA data_version').get().data_version;
-    const result = JSON.stringify([
-      db.prepare('SELECT rowid, id, text, source, kind, tier, importance, supersedes, created_at FROM memories ORDER BY rowid').all(),
-      db.prepare('SELECT * FROM memory_occurrences ORDER BY rowid').all(),
-    ]);
+    const result = readSnapshotStamp();
     if (before !== db.prepare('PRAGMA data_version').get().data_version) throw new Error('content version changed during read');
     return result;
   }
@@ -819,15 +733,11 @@ export function open(dbPath = ':memory:', opts = {}) {
     if (stamp === derivedStamp && databaseEpoch() === derivedEpoch) return;
     const next = { byOrd: new Map(), slot: new Map(), total: 0 };
     let rows;
+    let finalStamp = stamp;
     let committing = false;
     try {
       db.exec('BEGIN IMMEDIATE');
-      // Pin the source rows before repairing coverage derived from raw SQL edits.
-      const current = JSON.stringify([
-        db.prepare('SELECT rowid, id, text, source, kind, tier, importance, supersedes, created_at FROM memories ORDER BY rowid').all(),
-        db.prepare('SELECT * FROM memory_occurrences ORDER BY rowid').all(),
-      ]);
-      if (current !== stamp) throw new Error('derived snapshot stale');
+      finalStamp = readSnapshotStamp();
       rows = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY rowid').all();
       for (const row of rows) buildFactsFor(row.ord, row.text, next);
       db.exec('DELETE FROM segments WHERE ord NOT IN (SELECT rowid FROM memories)');
@@ -849,7 +759,7 @@ export function open(dbPath = ':memory:', opts = {}) {
     }
     memFacts = next;
     derivedTexts = new Map(rows.map(row => [row.ord, row.text]));
-    derivedStamp = stamp;
+    derivedStamp = finalStamp;
     derivedEpoch = databaseEpoch();
     factsRevision++;
   }
@@ -878,87 +788,6 @@ export function open(dbPath = ':memory:', opts = {}) {
     const facts = (opts.extractL1 ?? extractL1)(text);
     for (const f of facts) addMemFact(ord, f, target);
     return facts.length;
-  }
-  // Bounds cover values crossing into JS, not SQLite scanning/sorting or CPU/memory.
-  // extractL1 creates one complete array per row: its peak depends on maxFieldBytes.
-  function contentSnapshot(options = {}) {
-    assertOpen();
-    if (db.isTransaction) throw new Error('content snapshot requires an idle connection');
-    const { maxRows = 1000, maxFieldBytes = 65536, maxBytes = 1048576, maxFacts = 10000, maxExtractBytes = 1048576 } = options;
-    for (const [name, value, ceiling] of [['maxRows', maxRows, 100000], ['maxFieldBytes', maxFieldBytes, 1048576], ['maxBytes', maxBytes, 16777216], ['maxFacts', maxFacts, 100000], ['maxExtractBytes', maxExtractBytes, 16777216]]) {
-      if (!Number.isSafeInteger(value) || value < 0 || value > ceiling) throw new RangeError(`invalid ${name}`);
-    }
-    if (db.isTransaction) throw new Error('content snapshot requires an idle connection');
-    const version = () => db.prepare('PRAGMA data_version').get().data_version;
-    const before = version();
-    let owned = false;
-    let failure;
-    let failed = false;
-    let snapshot;
-    try {
-      db.exec('BEGIN DEFERRED');
-      owned = true;
-      const strings = ['id', 'text', 'text_hash', 'supersedes', 'source', 'kind'];
-      const nullable = new Set(['supersedes', 'source']);
-      const checks = strings.map(c => `((typeof(${c}) = 'text' AND length(CAST(${c} AS BLOB)) <= $field)${nullable.has(c) ? ` OR ${c} IS NULL` : ''})`).join(' AND ');
-      const numeric = ['created_at', 'last_accessed', 'access_count', 'importance', 'tier'].map(c => `(typeof(${c}) IN ('integer','real') AND ${c} BETWEEN -9007199254740991 AND 9007199254740991)`).join(' AND ');
-      const bytes = strings.map(c => `coalesce(length(CAST(${c} AS BLOB)), 0)`).join(' + ');
-      const fields = [...strings, 'created_at', 'last_accessed', 'access_count', 'importance', 'tier'];
-      const projection = fields.map(c => `CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN ${c} END AS ${c}`).join(', ');
-      const sql = `WITH measured AS (
-        SELECT rowid AS ord, ${fields.join(', ')}, ROW_NUMBER() OVER (ORDER BY created_at, id) AS rn,
-          (${checks} AND ${numeric} AND rowid BETWEEN 1 AND 9007199254740991) AS valid, (${bytes}) AS row_bytes
-        FROM memories
-      ), budgeted AS (
-        SELECT *, SUM(row_bytes) OVER (ORDER BY rn) AS total_bytes FROM measured
-      ) SELECT rn, valid, total_bytes, CASE WHEN valid AND rn <= $rows AND total_bytes <= $total THEN ord END AS ord, ${projection}
-        FROM budgeted WHERE rn <= $rows + 1 ORDER BY rn`;
-      const rows = [];
-      const facts = { byOrd: new Map(), slot: new Map(), total: 0 };
-      let decodedBytes = 0, extractBytes = 0;
-      for (const row of db.prepare(sql).iterate({ $rows: maxRows, $field: maxFieldBytes, $total: maxBytes })) {
-        if (row.rn > maxRows || !row.valid || row.total_bytes > maxBytes) throw new RangeError('content snapshot limit exceeded');
-        for (const field of strings) {
-          const value = row[field];
-          if (value === null && nullable.has(field)) continue;
-          if (typeof value !== 'string') throw new RangeError('content snapshot invalid field');
-          const size = Buffer.byteLength(value, 'utf8');
-          decodedBytes += size;
-          if (size > maxFieldBytes || decodedBytes > maxBytes) throw new RangeError('content snapshot limit exceeded');
-        }
-        extractBytes += Buffer.byteLength(row.text, 'utf8');
-        if (extractBytes > maxExtractBytes) throw new RangeError('content snapshot extraction limit exceeded');
-        const extracted = extractL1(row.text);
-        if (facts.total + extracted.length > maxFacts) throw new RangeError('content snapshot facts limit exceeded');
-        for (const fact of extracted) addMemFact(row.ord, fact, facts);
-        const { rn, valid, total_bytes, ...content } = row;
-        rows.push(content);
-      }
-      snapshot = { rows, facts, dataVersion: before };
-    } catch (error) {
-      failed = true;
-      failure = error;
-    }
-    // BEGIN may have taken effect even when its wrapper throws.
-    if (owned || db.isTransaction) {
-      try { db.exec('ROLLBACK'); }
-      catch (cleanup) {
-        const cause = failed
-          ? new AggregateError([failure, cleanup], 'content snapshot and cleanup failed', { cause: failure })
-          : cleanup;
-        throw failStore(cause);
-      }
-    }
-    if (db.isTransaction) {
-      const cleanup = new Error('content snapshot cleanup left an active transaction');
-      const cause = failed
-        ? new AggregateError([failure, cleanup], 'content snapshot and cleanup failed', { cause: failure })
-        : cleanup;
-      throw failStore(cause);
-    }
-    if (failed) throw failure;
-    if (version() !== before) throw new Error('content snapshot changed during read');
-    return snapshot;
   }
   /** 从 memories.text 全量重建内存 facts。返回 {facts, memories, ms} 以便打印耗时。 */
   function rebuildFacts(reason = 'startup') {
@@ -1007,54 +836,21 @@ export function open(dbPath = ':memory:', opts = {}) {
   db.exec(`UPDATE memories SET tier = ${MEMORY_TIER_MIN} WHERE tier < ${MEMORY_TIER_MIN}`);
 
   // ── 表结构自检：CREATE TABLE IF NOT EXISTS 不会纠偏已存在的同名表 ──────────
-  // Only the documented v2 layout has a known conversion for coverage state.
-  const segInfo = db.prepare('PRAGMA table_xinfo(segments)').all();
-  const segCols = segInfo.map((c) => c.name);
-  const segmentObject = objects.find(o => o.type === 'table' && o.name === 'segments');
-  if (segmentObject && !SEGMENT_SCHEMAS.has(segmentSchemaTokens(segmentObject.sql))) {
-    throw new Error('segments migration: unrecognized layout');
-  }
+  const segCols = db.prepare('PRAGMA table_info(segments)').all().map((c) => c.name);
   let rebuiltSegs = false;
-  if (fromVersion >= 2 && !objects.some(o => o.type === 'table' && o.name === 'segments')) {
-    throw new Error('segments migration: missing historical table');
-  }
-  if (segInfo.some(c => c.hidden)) throw new Error('segments migration: unrecognized layout');
-  if (segCols.join(',') === 'ord,seg_count,covered') {
-    const expected = [['INTEGER', 1, 1], ['INTEGER', 1, 0], ['TEXT', 1, 0]];
-    if (fromVersion !== 2 || segInfo.some((c, i) => c.type.toUpperCase() !== expected[i][0] || c.notnull !== expected[i][1] || c.pk !== expected[i][2])) {
-      throw new Error('segments migration: unrecognized v2 layout');
-    }
-    const rows = db.prepare(`SELECT s.ord, s.seg_count, s.covered, m.rowid AS memory_ord, m.text,
-      typeof(s.ord) AS ord_type, typeof(s.seg_count) AS count_type, typeof(s.covered) AS covered_type,
-      typeof(m.text) AS text_type FROM segments s LEFT JOIN memories m ON m.rowid = s.ord`).all();
-    const count = db.prepare('SELECT count(*) AS n FROM memories').get().n;
-    if (rows.length !== count) throw new Error('segments migration: missing or orphaned rows');
-    const converted = rows.map(row => {
-      if (row.ord_type !== 'integer' || !Number.isSafeInteger(row.ord) || row.memory_ord !== row.ord ||
-          row.count_type !== 'integer' || !Number.isSafeInteger(row.seg_count) || row.seg_count < 0 ||
-          row.seg_count > BITS_MAX_SEGMENTS || row.covered_type !== 'text' || row.text_type !== 'text' ||
-          splitSegments(row.text).length !== row.seg_count) {
-        throw new Error('segments migration: invalid row or segment count');
-      }
-      if (/[^01]/.test(row.covered) || row.covered.length > row.seg_count) {
-        throw new Error('segments migration: anomalous covered string');
-      }
-      return [row.ord, packCovered(row.seg_count, row.covered)];
-    });
+  if (segCols.length > 0 && (!segCols.includes('bits') || !segCols.includes('ord'))) {
     db.exec('DROP TABLE segments');
     db.exec(SEGMENTS_DDL);
-    const insert = db.prepare('INSERT INTO segments (ord, bits) VALUES (?, ?)');
-    for (const [ord, bits] of converted) insert.run(ord, bits);
     rebuiltSegs = true;
-  } else if (segCols.join(',') !== 'ord,bits') {
-    throw new Error('segments migration: unrecognized layout');
   }
   // v5：facts 不再落盘，老库的 facts/str_dict 一并清掉（数据可由原文重建，零损失）。
-  // Legacy tables are rejected by preflight instead of being dropped.
+  db.exec('DROP TABLE IF EXISTS facts');
+  db.exec('DROP INDEX IF EXISTS ux_facts_slot');
+  db.exec('DROP TABLE IF EXISTS str_dict');
+  db.exec('DROP TABLE IF EXISTS entity_dict');
+  db.exec('DROP TABLE IF EXISTS attr_dict');
 
   // ── schema v1/v2 → v3 迁移：段层形状演进 ────────────────────────────────
-  // v1 has no coverage state; v2 rows were converted above before this backfill.
-
   if (fromVersion < STORE_SCHEMA_VERSION || rebuiltSegs) {
     const mems = db.prepare('SELECT rowid AS ord, text FROM memories ORDER BY created_at, id').all();
     const insSegMig = db.prepare('INSERT OR IGNORE INTO segments (ord, bits) VALUES (?, ?)');
@@ -1063,10 +859,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       insSegMig.run(m.ord, packCovered(n));
     }
   }
-  const versionUpdate = db.prepare('UPDATE meta SET v = ? WHERE k = ?').run(String(STORE_SCHEMA_VERSION), 'schema_version');
-  if (versionUpdate.changes === 0) {
-    db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)').run('schema_version', String(STORE_SCHEMA_VERSION));
-  }
+  db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('schema_version', String(STORE_SCHEMA_VERSION));
   // 表结构定稿后重建内存 facts（captain 要的重建耗时在这里打印）。
   const rebuildStats = rebuildFacts('startup');
 
@@ -1282,7 +1075,13 @@ export function open(dbPath = ':memory:', opts = {}) {
       if (committing || db.isTransaction) throw failStore(error);
       throw error;
     }
-    if (!dryRun) ensureFresh();
+    if (!dryRun) {
+      try {
+        ensureFresh();
+      } catch (error) {
+        throw failStore(error);
+      }
+    }
     return { forgotten, retained, count: forgotten.length, dryRun };
   }
 
@@ -1418,6 +1217,19 @@ export function open(dbPath = ':memory:', opts = {}) {
     // 否则一次不关心 tier 的重写就会把 nightly 算出来的层级静默抹掉。
     const tierGiven = input.tier != null && input.tier !== '' && Number.isFinite(Number(input.tier));
     const tier = tierGiven ? normalizeTier(input.tier, kind) : defaultTier(kind);
+    // 防误升格的第二道保险（第一道是 normalizeTier 的结构钳制）：
+    //   - 默认（strictPinnedTier 未开）：钳回 1 并 warn 一次，保持既有的「不抛错」契约；
+    //   - open(..., { strictPinnedTier: true })：直接把整条写入打回，调用方必须自己
+    //     想清楚为什么给身份条目指定了衰减档位。自动通路在写入前就用 defaultTier，
+    //     永远走不到这条分支。
+    if (tierGiven && (kind === 'person' || kind === 'promise') && Number(input.tier) !== MEMORY_TIER_PINNED) {
+      if (opts.strictPinnedTier === true) {
+        throw new TypeError(
+          `put: kind ${kind} 必须钉在 tier ${MEMORY_TIER_PINNED}，收到 tier ${String(input.tier)}`,
+        );
+      }
+      warnPinnedTierClamp(kind, input.tier);
+    }
     let committing = false;
     try {
     db.exec('BEGIN IMMEDIATE');
@@ -1442,6 +1254,8 @@ export function open(dbPath = ':memory:', opts = {}) {
       committing = true;
       db.exec('COMMIT');
       if (db.isTransaction) throw new Error('put commit left an active transaction');
+      derivedStamp = readSnapshotStamp();
+      derivedEpoch = databaseEpoch();
       return {
         id: hit.id,
         inserted: false,
@@ -1482,6 +1296,9 @@ export function open(dbPath = ':memory:', opts = {}) {
       db.exec('COMMIT');
       if (db.isTransaction) throw new Error('put commit left an active transaction');
       memFacts = nextFacts;
+      derivedTexts.set(ord, text);
+      derivedStamp = readSnapshotStamp();
+      derivedEpoch = databaseEpoch();
       factsRevision++;
       return { id, inserted: true, factCount, segmentCount: segs.length, kind, tier };
     } catch (err) {
@@ -1497,6 +1314,54 @@ export function open(dbPath = ':memory:', opts = {}) {
     } finally {
       putting = false;
     }
+  }
+
+  /**
+   * 显式改分类：误判的 person/promise 降级成 event（也允许反向提升）。
+   *
+   * 为什么必须有这条通道：`forget` 删掉正文就再也捞不回来，而误判只是「分类错了」，
+   * 内容本身是对的。降级要把两件事一起改掉——kind 决定它属于哪个注入段，tier 决定它
+   * 还该不该占席位。person→event 时 tier 落到 MEMORY_TIER_EVENT(3)，从此可以随
+   * nightly 正常升降；event→person/promise 时落回 PINNED(1)。
+   *
+   * 与 put 的幂等命中分支不同：那条路径是「纠正分类但保留已有 tier」，本方法是
+   * 操作者明确要求「按新分类重设层级」，所以 tier 无条件归 defaultTier(next)。
+   *
+   * @returns {{id:string, kindBefore:string, tierBefore:number, kind:string, tier:number, changed:boolean}|null}
+   *   条目不存在时返回 null（不抛：调用方拿 id 来纠正，找不到是常见输入错误）。
+   */
+  function setKind(id, kind) {
+    assertOpen();
+    if (db.isTransaction) throw new Error('setKind requires an idle connection');
+    const key = String(id);
+    const next = normalizeKind(kind);
+    const row = stmt.byId.get(key);
+    if (!row) return null;
+    const kindBefore = normalizeKind(row.kind);
+    const tierBefore = normalizeTier(row.tier, kindBefore);
+    const nextTier = defaultTier(next);
+    if (kindBefore === next && tierBefore === nextTier) {
+      return { id: key, kindBefore, tierBefore, kind: next, tier: nextTier, changed: false };
+    }
+    let committing = false;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      stmt.setKind.run(next, key);
+      stmt.setTier.run(nextTier, key);
+      committing = true;
+      db.exec('COMMIT');
+      if (db.isTransaction) throw new Error('setKind commit left an active transaction');
+    } catch (err) {
+      if (!db.isTransaction) {
+        if (committing) throw failStore(err);
+        throw err;
+      }
+      try { db.exec('ROLLBACK'); }
+      catch (cleanup) { throw failStore(new AggregateError([err, cleanup], 'setKind and cleanup failed', { cause: err })); }
+      if (db.isTransaction) throw failStore(new AggregateError([err, new Error('setKind cleanup left an active transaction')], 'setKind and cleanup failed', { cause: err }));
+      throw err;
+    }
+    return { id: key, kindBefore, tierBefore, kind: next, tier: nextTier, changed: true };
   }
 
   function get(id, withFacts = true) {
@@ -1597,36 +1462,6 @@ export function open(dbPath = ':memory:', opts = {}) {
     const t = Number.isFinite(when) ? when : now();
     stmt.touch.run(t, id);
     return get(id, false);
-  }
-
-  function touchSnapshot(ids, when, version, generation) {
-    assertOpen();
-    if (db.isTransaction) throw new Error('snapshot touch requires an idle connection');
-    let committing = false;
-    try {
-      db.exec('BEGIN IMMEDIATE');
-      if (generation() !== version.generation || db.prepare('PRAGMA data_version').get().data_version !== version.dataVersion) {
-        throw new Error('snapshot view stale');
-      }
-      for (const id of new Set(ids)) {
-        if (stmt.touch.run(when, id).changes !== 1) throw new Error('snapshot view stale');
-      }
-      committing = true;
-      db.exec('COMMIT');
-      committing = false;
-      if (db.isTransaction) throw new Error('snapshot touch commit left an active transaction');
-    } catch (error) {
-      let failure = error;
-      if (db.isTransaction) {
-        try { db.exec('ROLLBACK'); }
-        catch (cleanup) { failure = new AggregateError([error, cleanup], 'snapshot touch cleanup failed', { cause: error }); committing = true; }
-      }
-      if (db.isTransaction || committing) throw failStore(failure);
-      throw failure;
-    }
-    if (generation() !== version.generation || db.prepare('PRAGMA data_version').get().data_version !== version.dataVersion) {
-      throw new Error('snapshot view stale');
-    }
   }
 
   /** 全量导出，按写入顺序。text 原样返回，供逐字往返校验 */
@@ -1819,6 +1654,7 @@ export function open(dbPath = ':memory:', opts = {}) {
   const api = {
     path: file,
     put,
+    setKind,
     forget,
     contentVersion,
     get,
@@ -1828,7 +1664,6 @@ export function open(dbPath = ':memory:', opts = {}) {
     bySourcePrefixV1,
     byKind,
     updateAccess,
-    touchSnapshot,
     dump,
     bytes,
     stats,
@@ -1856,25 +1691,29 @@ export function open(dbPath = ':memory:', opts = {}) {
     coverSegments,
     wear,
     maxChars,
-    scanConflictsV2,
     injectionSnapshot,
-    contentSnapshot,
     close,
     /** 直接拿底层连接做诊断查询（只读用法） */
     raw: () => db,
   };
+  const SKIP_FRESH = new Set([
+    'close', 'raw', 'rebuildFactsHybrid',
+    'put', 'forget', 'setKind', 'setTier', 'updateAccess', 'coverSegments',
+    'putVectors', 'deleteVector', 'injectionSnapshot', 'contentVersion', 'compact', 'bytes',
+  ]);
   for (const [name, fn] of Object.entries(api)) {
     if (typeof fn === 'function') {
       api[name] = (...args) => {
+        if (name === 'raw') return fn(...args);
         if (putting) {
           const error = new Error('put operation in progress');
           if (name === 'rebuildFactsHybrid') return Promise.reject(error);
           throw error;
         }
         if (name === 'rebuildFactsHybrid') return fn(...args);
-        if (name !== 'close' && name !== 'raw') {
+        if (name !== 'close') {
           assertOpen();
-          ensureFresh();
+          if (!SKIP_FRESH.has(name)) ensureFresh();
         }
         return fn(...args);
       };
@@ -1907,6 +1746,7 @@ export default {
   MEMORY_TIER_MAX,
   defaultTier,
   normalizeTier,
+  resetPinTierWarnings,
   TIER_IDLE_DAYS,
   TIER_PROMOTE_ACCESS,
   escapeLikePattern,

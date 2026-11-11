@@ -8,20 +8,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
 
 import { open, STORE_SCHEMA_VERSION, MEMORY_KINDS, normalizeKind } from '../src/store.mjs';
 import { apply, SECTION_NAME, INJECT_HARD_LIMIT, INJECT_SEGMENTS } from '../src/index.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const TMP = path.join(HERE, `.tmp-kind-${process.pid}`);
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'memjudge-kind-'));
 const DAY = 86400000;
 const T0 = Date.UTC(2026, 9, 27);
-
-fs.rmSync(TMP, { recursive: true, force: true });
-fs.mkdirSync(TMP, { recursive: true });
 
 test.after(() => {
   try {
