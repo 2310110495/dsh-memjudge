@@ -475,9 +475,10 @@ test('v2 工作区切换、五类范畴徽标、L0-L3 角标与双层注入预�
   const tierSNode = ui.one((n) => n.props['data-budget-tier'] === 'tierS');
   const tierDNode = ui.one((n) => n.props['data-budget-tier'] === 'tierD');
   assert.match(ui.text(tierSNode), /Tier-S 静态底座/);
-  assert.match(ui.text(tierSNode), /1,200/);
+  // Observability reports the effective backend caps, not the oversized raw config.
+  assert.match(ui.text(tierSNode), /600/);
   assert.match(ui.text(tierDNode), /Tier-D 动态召回/);
-  assert.match(ui.text(tierDNode), /2,000/);
+  assert.match(ui.text(tierDNode), /900/);
 
   // 3. 五类范畴徽标与四级代谢角标齐全
   for (const cat of ['rule', 'profile', 'decision', 'experience', 'state']) {
@@ -602,6 +603,7 @@ test('单活 state 状态白板置顶展示与 Revisions 历史演化链展开�
             found: true,
             item: {
               id: 'mem-lazy-1',
+              spaceId: 'global',
               text: 'green',
               revisions: [{ revId: 9, memoryId: 'mem-lazy-1', prevText: 'failing-lint', reason: 'state-update', changedAt: Date.now() - 5000 }],
             },

@@ -1,6 +1,6 @@
 {
   "name": "dsh-memjudge",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "DeepSeek Harness v2 自进化长效记忆引擎：Schema v8 多空间隔离 + 双边闭合轮异步脱水 + 三路 RRF 混合检索 + O(log N) 槽位证据门 + 保 KV Cache 两段式动态注入 + L0-L3 热冷代谢与增量 Wiki 编译。",
   "type": "module",
   "main": "./src/index.mjs",

@@ -71,6 +71,7 @@ import {
   autoCaptureConfig,
 } from './config.mjs';
 import { installMemjudgeRpc as defaultInstallRpc } from './rpc.mjs';
+import { createInjectionObserver } from './observability.mjs';
 import { createService, SERVICE_NAME } from './service.mjs';
 
 export const name = 'memjudge';
@@ -390,7 +391,7 @@ function extractQueryFromPromptContext(promptCtx, pendingQueries) {
     return { query: promptCtx.query.trim(), isToolSubstep: Boolean(promptCtx.isToolSubstep) };
   }
   const session = promptCtx.session ?? promptCtx.agent?.session ?? null;
-  const sessionId = session?.id ?? promptCtx.sessionId ?? null;
+  const sessionId = promptCtx.sessionId ?? session?.id ?? session?.header?.id ?? promptCtx.header?.id ?? null;
   if (sessionId && pendingQueries.has(sessionId)) {
     const pq = pendingQueries.get(sessionId);
     return { query: pq.query, isToolSubstep: pq.isToolSubstep };
@@ -738,6 +739,27 @@ export function apply(ctx, config = {}, dependencies = {}) {
       ...decayOptions,
     });
     track(() => injector.dispose());
+    const injectionObserver = createInjectionObserver({ now });
+    track(() => injectionObserver.clear());
+    // The engine freezes S per key: qualify it by scope so a cwd switch in the
+    // same host session cannot replay another project's frozen prefix.
+    const injectionSessionKeys = new Map();
+    function scopedInjectionSession(injectCtx) {
+      const sid = injectCtx.sessionId;
+      const key = JSON.stringify([sid, injectCtx.spaceId]);
+      if (!injectionSessionKeys.has(sid)) injectionSessionKeys.set(sid, new Set());
+      injectionSessionKeys.get(sid).add(key);
+      return key;
+    }
+    function clearInjectionSession(sessionId, compact = false) {
+      for (const key of injectionSessionKeys.get(sessionId) ?? []) {
+        if (compact) injector.onCompaction(key);
+        else injector.onSessionEnd(key);
+      }
+      if (!compact) injectionSessionKeys.delete(sessionId);
+      injectionObserver.clear(sessionId);
+    }
+    track(() => injectionSessionKeys.clear());
     // Resume persisted pending work on every activation (stale processing leases
     // retain the existing 5-minute claim timeout to avoid stealing a live worker).
     scheduleIngestDrain();
@@ -745,7 +767,7 @@ export function apply(ctx, config = {}, dependencies = {}) {
     // -------------------------------------------------------------- 双边闭合轮采集与宿主会话总线接线
 
     function getOrCreateCollector(session, turnOverride) {
-      const sessionId = session?.id ?? 'default';
+      const sessionId = session?.id ?? session?.header?.id ?? 'default';
       const header = session?.header ?? session ?? {};
       const scopeInfo = resolveScope({ session, header, cwd: header.cwd });
       ensureSpaceRegistered(scopeInfo);
@@ -773,15 +795,15 @@ export function apply(ctx, config = {}, dependencies = {}) {
 
     function handleSessionEvent(session, event) {
       if (disposed || fault || !event || typeof event !== 'object') return;
-      const sessionId = session?.id ?? event.sessionId ?? 'default';
+      const sessionId = session?.id ?? session?.header?.id ?? event.sessionId ?? 'default';
       const header = session?.header ?? session ?? {};
 
       if (event.type === 'compaction/end') {
-        injector.onCompaction(sessionId);
+        clearInjectionSession(sessionId, true);
         return;
       }
       if (event.type === 'session/end' || event.type === 'session/dispose') {
-        injector.onSessionEnd(sessionId);
+        clearInjectionSession(sessionId);
         pendingQueries.delete(sessionId);
         const pendingTurn = turnCollectors.get(sessionId);
         if (pendingTurn && pendingTurn.hasInput) {
@@ -926,6 +948,7 @@ export function apply(ctx, config = {}, dependencies = {}) {
       touchWiki,
       compileWikiNow,
       runMetabolismNow,
+      injectionObserver,
       getInjectStatus: () => ({
         hasContextChannel: typeof ctx?.systemPrompt?.context === 'function',
       }),
@@ -1080,7 +1103,8 @@ export function apply(ctx, config = {}, dependencies = {}) {
     function resolveInjectCtx(promptCtx) {
       const session = promptCtx?.session ?? promptCtx?.agent?.session ?? null;
       const header = session?.header ?? promptCtx?.header ?? {};
-      const sessionId = promptCtx?.sessionId ?? session?.id ?? 'default';
+      const observedSessionId = promptCtx?.sessionId ?? session?.id ?? header?.id ?? null;
+      const sessionId = observedSessionId ?? 'default';
       const scopeInfo = resolveScope({
         space: promptCtx?.spaceId ?? promptCtx?.space,
         session,
@@ -1091,6 +1115,7 @@ export function apply(ctx, config = {}, dependencies = {}) {
       ensureSpaceRegistered(scopeInfo);
       return {
         sessionId,
+        observedSessionId,
         spaceId: scopeInfo.spaceId,
         spaces: scopeInfo.spaces,
         session,
@@ -1098,7 +1123,15 @@ export function apply(ctx, config = {}, dependencies = {}) {
       };
     }
 
-    function renderTierS(promptCtx) {
+    function observeInjection(promptCtx, injectCtx, frame) {
+      // Only prompt callbacks are observed; stats/preview must not fabricate events.
+      try {
+        injectionObserver.record({ token: promptCtx, sessionId: injectCtx.observedSessionId,
+          spaceId: injectCtx.spaceId, ...frame });
+      } catch { /* diagnostics must not affect actual injection */ }
+    }
+
+    function renderTierS(promptCtx, observe = true) {
       assertHealthy();
       if (!cfg.autoInject) return '';
       const injectCtx = resolveInjectCtx(promptCtx);
@@ -1107,15 +1140,17 @@ export function apply(ctx, config = {}, dependencies = {}) {
       }
       const res = injector.getTierS({
         store,
-        sessionId: injectCtx.sessionId,
+        sessionId: scopedInjectionSession(injectCtx),
         spaceId: injectCtx.spaceId,
         spaces: injectCtx.spaces,
         tierSMaxChars: Math.min(TIER_S_MAX_CHARS, cfg.tierSBudget, cfg.injectBudget),
       });
-      return sanitizeWellFormed(res.text);
+      const text = sanitizeWellFormed(res.text);
+      if (observe) observeInjection(promptCtx, injectCtx, { tier: 'tierS', text });
+      return text;
     }
 
-    function renderTierDSync(promptCtx) {
+    function renderTierDSync(promptCtx, observe = true) {
       assertHealthy();
       if (!cfg.autoInject) return '';
       const injectCtx = resolveInjectCtx(promptCtx);
@@ -1123,11 +1158,14 @@ export function apply(ctx, config = {}, dependencies = {}) {
         return '';
       }
       const { query, isToolSubstep } = extractQueryFromPromptContext(promptCtx, pendingQueries);
-      if (!query || isToolSubstep) return '';
+      if (!query || isToolSubstep) {
+        if (observe) observeInjection(promptCtx, injectCtx, { tier: 'tierD', text: '' });
+        return '';
+      }
       const res = injector.getTierDSync(query, {
         store,
         searchIndex: getIndex(),
-        sessionId: injectCtx.sessionId,
+        sessionId: scopedInjectionSession(injectCtx),
         spaceId: injectCtx.spaceId,
         spaces: injectCtx.spaces,
         isToolSubstep,
@@ -1135,19 +1173,29 @@ export function apply(ctx, config = {}, dependencies = {}) {
         tierDMaxChars: Math.min(TIER_D_MAX_CHARS, cfg.tierDBudget),
         totalMaxChars: Math.min(TOTAL_INJECT_MAX_CHARS, cfg.injectBudget),
       });
-      return sanitizeWellFormed(res.text);
+      const text = sanitizeWellFormed(res.text);
+      if (observe) observeInjection(promptCtx, injectCtx, { tier: 'tierD', text });
+      return text;
     }
 
-    function renderSection(promptCtx) {
+    function renderSection(promptCtx, observe = true) {
       if (shouldUseTieredMode(promptCtx)) {
-        const tierS = renderTierS(promptCtx);
+        const tierS = renderTierS(promptCtx, observe && hasContextChannel);
         if (hasContextChannel) return tierS;
-        const tierD = renderTierDSync(promptCtx);
-        if (!tierD) return tierS;
-        if (!tierS) return tierD;
+        let tierD = renderTierDSync(promptCtx, false);
         const totalCap = Math.min(TOTAL_INJECT_MAX_CHARS, cfg.injectBudget);
-        const combined = `${tierS}\n\n${tierD}`;
-        return sanitizeWellFormed(combined.length <= totalCap ? combined : combined.slice(0, totalCap));
+        const separator = tierS && tierD ? '\n\n' : '';
+        // Account for the exact post-sanitization/truncation text returned to host.
+        const text = sanitizeWellFormed((tierS + separator + tierD).slice(0, totalCap));
+        const actualSeparator = text.slice(tierS.length, tierS.length + separator.length);
+        tierD = text.slice(tierS.length + actualSeparator.length);
+        if (observe) {
+          const injectCtx = resolveInjectCtx(promptCtx);
+          if (!isSubagentSession(injectCtx.session) && !isSubagentSession(injectCtx.header)) {
+            observeInjection(promptCtx, injectCtx, { tierS, tierD, separator: actualSeparator });
+          }
+        }
+        return text;
       }
       return renderLegacyInject();
     }
@@ -2508,7 +2556,7 @@ export function apply(ctx, config = {}, dependencies = {}) {
         const base = store.stats();
         const ix = getIndex().stats();
         const sessionCtx = exec?.agent?.session ? { session: exec.agent.session } : undefined;
-        const injectText = renderSection(sessionCtx);
+        const injectText = renderSection(sessionCtx, false);
         const tidy = sleepPhase(buildChapterRows(), { tierRows: store.dump() });
         const report = deps.configReport();
 
@@ -2847,7 +2895,7 @@ export function apply(ctx, config = {}, dependencies = {}) {
                 const td = await injector.getTierD(query, {
                   store,
                   searchIndex: getIndex(),
-                  sessionId: injectCtx.sessionId,
+                  sessionId: scopedInjectionSession(injectCtx),
                   spaceId: injectCtx.spaceId,
                   spaces: injectCtx.spaces,
                   isToolSubstep,
@@ -2861,6 +2909,9 @@ export function apply(ctx, config = {}, dependencies = {}) {
                     content: [{ type: 'text', text: sanitizeWellFormed(td.text) }],
                     source: { kind: 'runtime-context', form: 'snapshot', sections: [CONTEXT_NAME] },
                   });
+                  // No shared host frame token with the section callback: a real
+                  // generated channel event, but never fabricate a complete pair.
+                  observeInjection(input, injectCtx, { tier: 'tierD', text: sanitizeWellFormed(td.text) });
                 }
               }
             }

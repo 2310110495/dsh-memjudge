@@ -59,12 +59,14 @@ window.__ModuleLoader__.load({
     // -------------------------------------------------------------- 工具
 
     function fmt(n) {
+      if (n == null || n === '') return '—';
       const v = Number(n);
       if (!Number.isFinite(v)) return '—';
       return v.toLocaleString('zh-CN');
     }
 
     function kb(n) {
+      if (n == null || n === '') return '—';
       const v = Number(n);
       if (!Number.isFinite(v)) return '—';
       return (v / 1024).toFixed(1);
@@ -457,6 +459,147 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'mj-wikibody' }, nodes);
     }
 
+    // Pure UI adapter: missing measurements stay null, never become measured zeroes.
+    function observedNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+    }
+
+    function observedText(value) { return typeof value === 'string' ? value : ''; }
+
+    function adaptObservability(status, selectedSpace, sessionId, includeInjectionText) {
+      const data = status || {};
+      const supported = !!(data.observability && data.observability.version === 1);
+      const raw = supported ? data.observability : {};
+      const storage = raw.storage || {};
+      const stats = data.stats || {};
+      const injection = raw.injection || {};
+      const legacy = data.inject || {};
+      const frame = injection.current;
+      const hasIdentity = typeof sessionId === 'string' && sessionId.length > 0 && sessionId.length <= 256 && !/\s/.test(sessionId);
+      const explicitScope = typeof selectedSpace === 'string' && selectedSpace !== 'all' && !!selectedSpace;
+      const scopeMatches = hasIdentity && explicitScope && frame
+        && frame.spaceId === selectedSpace && frame.sessionId === sessionId;
+      const current = supported && includeInjectionText === true && injection.measurement === 'observed' && scopeMatches
+        ? frame : null;
+      const num = (value, fallback) => value === undefined && !supported ? observedNumber(fallback) : observedNumber(value);
+      return {
+        supported, capturedAt: observedText(raw.capturedAt),
+        storage: {
+          logicalBytes: num(storage.logicalBytes, stats.bytes), textChars: num(storage.textChars, stats.textChars),
+          limitBytes: num(storage.limitBytes, stats.limitBytes), databasePath: observedText(storage.databasePath),
+          semantics: observedText(storage.semantics) || '沿用宿主 store.bytes() 库体占用口径；旧版未提供细分，不代表每轮注入。',
+        },
+        injection: {
+          mode: observedText(injection.mode || legacy.mode) || '未提供',
+          enabled: typeof injection.enabled === 'boolean' ? injection.enabled : (typeof legacy.enabled === 'boolean' ? legacy.enabled : null),
+          totalBudgetChars: num(injection.totalBudgetChars, legacy.totalBudget ?? legacy.injectBudget),
+          tierSBudgetChars: num(injection.tierSBudgetChars, data.tierS?.budget ?? legacy.tierSBudget),
+          tierDBudgetChars: num(injection.tierDBudgetChars, data.tierD?.budget ?? legacy.tierDBudget),
+          current,
+          unavailableReason: current ? '' : (!supported ? '旧版宿主未提供 observability；实际注入正文与活动不可用。'
+            : !hasIdentity ? '宿主未提供已验证的当前会话身份；实际注入正文与会话活动不可用，不从 URL、记忆或事件猜测。'
+              : !explicitScope ? '请先选择明确的记忆空间；综合范围不请求注入正文。'
+                : frame && !scopeMatches ? '当前帧不属于所选空间或会话，正文已隐藏。'
+                  : observedText(injection.unavailableReason) || '尚无本会话的完整注入帧；配置预算不等于实际注入。'),
+        },
+        spaces: (Array.isArray(raw.spaces) ? raw.spaces : (!supported && Array.isArray(data.spaces) ? data.spaces : [])).filter((s) => s && typeof s === 'object'),
+        categories: raw.categories || (!supported ? data.categories : null) || {}, layers: raw.layers || (!supported ? data.layers : null) || {},
+        indexes: raw.indexes || {}, capabilities: raw.capabilities || {},
+        events: (Array.isArray(raw.events) ? raw.events : []).filter((e) => hasIdentity && explicitScope
+          && e && typeof e === 'object' && e.details?.sessionId === sessionId && e.details?.spaceId === selectedSpace).slice(-32).reverse(),
+        limitations: (Array.isArray(raw.limitations) ? raw.limitations : []).filter((s) => typeof s === 'string').slice(0, 16),
+      };
+    }
+
+    // Diagnostics show only numeric/boolean module metadata, not arbitrary string bodies or credentials.
+    function diagnosticRows(value, prefix, depth) {
+      if (!value || typeof value !== 'object' || (depth || 0) > 2) return [];
+      const out = [];
+      for (const [key, item] of Object.entries(value).slice(0, 40)) {
+        if (/key|secret|token|password|credential|prompt|text|body|authorization/i.test(key)) continue;
+        const label = prefix ? prefix + ' / ' + key : key;
+        if (item == null) out.push([label, '未提供']);
+        else if (typeof item === 'boolean') out.push([label, item ? '开启 / 可用' : '关闭 / 不可用']);
+        else if (observedNumber(item) !== null) out.push([label, fmt(item)]);
+        else if (item && typeof item === 'object' && !Array.isArray(item)) out.push(...diagnosticRows(item, label, (depth || 0) + 1));
+      }
+      return out.slice(0, 80);
+    }
+
+    function DiagnosticList({ value }) {
+      const rows = diagnosticRows(value);
+      return rows.length ? h('dl', { className: 'mj-ob-list' }, rows.map(([label, value]) => h('div', { key: label },
+        h('dt', null, label), h('dd', null, value)))) : h(Hint, null, '宿主未提供可展示的计数或模块状态。');
+    }
+
+    function ObservationPanel({ model, phase, tab, onTab, onRetry, onBrowse }) {
+      const inj = model.injection;
+      const frame = inj.current;
+      const metric = (n, suffix) => observedNumber(n) === null ? '未提供' : fmt(n) + (suffix || '');
+      const tabs = [['overview', '概览'], ['injection', '注入正文'], ['spaces', '记忆空间'], ['indexes', '索引与生命周期'], ['events', '事件活动']];
+      return h('section', { className: 'mj-sec mj-ob', 'aria-label': '记忆可观测性', 'data-section': 'observability' },
+        h(Card, { title: '记忆透视', right: h(Hint, null, model.supported ? '只读快照 · v1' : '兼容模式') },
+          h('div', { className: 'mj-ob-nav', role: 'group', 'aria-label': '观测视图' }, tabs.map(([id, label]) => h(Btn, {
+            key: id, onClick: () => onTab(id), 'data-ob-tab': id, 'aria-pressed': tab === id ? 'true' : 'false',
+            style: { color: tab === id ? C.accent : C.fg2, borderColor: tab === id ? C.accent : C.line2, minHeight: 32 },
+          }, label))),
+          h('div', { role: 'status', 'aria-live': 'polite' }, phase === 'loading' ? '正在读取观测快照…'
+            : phase === 'error' ? h(ErrorBlock, { title: '观测快照读取失败', onRetry })
+              : h(Hint, null, model.capturedAt ? '快照时间：' + model.capturedAt : '未提供观测时间；以下仅展示已返回的数据。')),
+          phase !== 'ready' ? null : h('div', { className: 'mj-ob-content', 'data-ob-view': tab },
+            !model.supported ? h(Hint, { tone: C.warn }, '旧版 status 无 observability：保留库体与配置数据，实际注入和活动不可用。') : null,
+            tab === 'overview' ? h('div', null,
+              h('div', { className: 'mj-ob-grid' },
+                h(Stat, { label: '库内存储（非每轮注入）', value: metric(model.storage.logicalBytes, ' B'), sub: '整库 store.bytes() · 上限 ' + metric(model.storage.limitBytes, ' B'), tone: C.ok }),
+                h(Stat, { label: '注入字符预算（配置）', value: metric(inj.totalBudgetChars, ' 字符'), sub: '实际帧 ' + (frame ? metric(frame.totalChars, ' 字符') + ' / ' + metric(frame.totalBytes, ' UTF-8 B') : '未观测'), tone: C.accent }),
+                h(Stat, { label: '宿主上下文 / tokens', value: '宿主未提供', sub: '不按字符或存储量估算 token' })),
+              model.storage.logicalBytes !== null && model.storage.limitBytes > 0 ? h(Bar, { used: model.storage.logicalBytes, limit: model.storage.limitBytes }) : null,
+              h(Hint, { style: { marginTop: 8 } }, model.storage.semantics),
+              h('details', null, h('summary', null, '库体详情与计量口径'),
+                h(Hint, null, '原文总字符：' + metric(model.storage.textChars, ' 字符') + '；这不是注入正文。'),
+                model.storage.databasePath ? h(Hint, { mono: true }, model.storage.databasePath) : null),
+              h('details', null, h('summary', null, '按记忆分类浏览'),
+                CATEGORIES.map((cat) => h(Btn, { key: cat.id, 'data-ob-category': cat.id, onClick: () => onBrowse({ category: cat.id }) }, cat.label + ' · ' + metric(model.categories[cat.id]))))) : null,
+            tab === 'injection' ? h('div', null,
+              h(Hint, null, '模式：' + inj.mode + ' · 自动注入：' + (inj.enabled === null ? '未提供' : inj.enabled ? '开启' : '关闭') + ' · 配置总预算 ' + metric(inj.totalBudgetChars, ' 字符')),
+              h(Hint, null, '字符用于预算；UTF-8 字节是编码大小，二者不等于 tokens。'),
+              !frame ? h(Hint, { tone: C.warn }, inj.unavailableReason) : h(Hint, null,
+                '已观测帧：' + metric(frame.totalChars, ' 字符') + ' / ' + metric(frame.totalBytes, ' UTF-8 B')
+                + ' · 空间 ' + (observedText(frame.spaceId) || '未提供') + ' · 会话 ' + (observedText(frame.sessionId) || '未提供') + ' · ' + observedText(frame.at)),
+              [['tierS', 'Tier-S 静态底座', inj.tierSBudgetChars], ['tierD', 'Tier-D 动态召回', inj.tierDBudgetChars]].map(([id, label, budget]) => {
+                const tier = frame && frame[id];
+                return h('details', { key: id, 'data-ob-tier': id }, h('summary', null, label + ' · 预算 ' + metric(budget, ' 字符')),
+                  tier ? h('div', null,
+                    h(Hint, null, '实测 ' + metric(tier.chars, ' 字符') + ' / ' + metric(tier.bytes, ' UTF-8 B')),
+                    observedNumber(tier.chars) !== null && budget > 0 ? h(Bar, { used: tier.chars, limit: budget }) : null,
+                    h('pre', { className: 'mj-ob-raw' }, typeof tier.text === 'string' ? (tier.text || '（本层正文为空）') : '宿主未授权返回本层正文。'))
+                    : h(Hint, null, '尚无可展示的实际正文。'));
+              })) : null,
+            tab === 'spaces' ? h('div', null,
+              h(Hint, null, '计数以宿主返回范围为准；点击只读取所选空间的有界列表。'),
+              model.spaces.length ? model.spaces.map((space, i) => {
+                const id = observedText(space.id || space.spaceId);
+                return h('details', { key: id || i }, h('summary', null, friendlySpaceLabel(space) + ' · ' + metric(space.memoryCount, ' 条')),
+                  h(Hint, { mono: true }, id), h(Hint, null, '类型：' + observedText(space.kind)),
+                  id ? h(Btn, { 'data-ob-space': id, onClick: () => onBrowse({ space: id }) }, '浏览这个空间') : null);
+              }) : h(Hint, null, '空间列表未提供；旧版可继续浏览下方记忆条目。')) : null,
+            tab === 'indexes' ? h('div', null,
+              h('details', { open: true }, h('summary', null, '真实索引与模块状态'), h(DiagnosticList, { value: model.indexes })),
+              h('details', null, h('summary', null, '生命周期层级（点击浏览）'), LAYERS.map((layer) => h('div', { key: layer.id },
+                h(Btn, { 'data-ob-layer': layer.id, onClick: () => onBrowse({ layer: layer.id }) }, layer.label + ' ' + layer.name + ' · ' + metric(model.layers[layer.id])), h(Hint, null, layer.desc)))),
+              h('details', null, h('summary', null, '宿主能力'), h(DiagnosticList, { value: model.capabilities })),
+              h(Hint, null, '重建索引、编译 Wiki 和执行代谢仍由下方原有工具显式触发；此视图不自动写入。')) : null,
+            tab === 'events' ? h('div', null,
+              h(Hint, null, '最多显示 32 条所选空间与当前会话的已记录事件；仅手动刷新，不自动轮询。'),
+              !frame ? h(Hint, { tone: C.warn }, inj.unavailableReason) : null,
+              model.events.length ? model.events.map((event, i) => h('details', { key: observedText(event.id) || i, 'data-ob-event': observedText(event.id) },
+                h('summary', null, observedText(event.type) + ' · ' + (observedText(event.summary) || '无摘要')),
+                h(Hint, null, observedText(event.at)), h(DiagnosticList, { value: event.details })))
+                : h(Hint, null, model.supported ? '暂无可见活动；不代表从未执行过注入或检索。' : '旧版宿主未提供活动记录。')) : null,
+            model.limitations.length ? h('details', null, h('summary', null, '已知边界 · ' + model.limitations.length),
+              h('ul', null, model.limitations.map((line, i) => h('li', { key: i }, line)))) : null)));
+    }
+
     // ----------------------------------------------------- 注入 CSS（§10）
     //
     // 内联 style 有四个硬缺口：:hover、:focus-visible、@container、后代选择器。
@@ -466,6 +609,19 @@ window.__ModuleLoader__.load({
     const CSS = [
       '.mj-panel{padding:24px 28px 40px;max-width:1120px;box-sizing:border-box}',
       '.mj-sec{margin-top:20px}',
+      '.mj-ob{min-width:0;overflow-wrap:anywhere}',
+      '.mj-ob .mj-ob-nav{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}',
+      '.mj-ob .mj-ob-content{margin-top:12px}',
+      '.mj-ob .mj-ob-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:10px}',
+      '.mj-ob details{margin-top:10px;border-top:1px solid var(--dsw-alias-border-l1);padding-top:8px}',
+      '.mj-ob summary{cursor:pointer;min-height:32px;color:var(--dsw-alias-label-primary);font-weight:600}',
+      '.mj-ob summary:focus-visible{outline:2px solid var(--dsw-alias-label-primary);outline-offset:2px}',
+      '.mj-ob details .mj-btn{margin:4px 6px 4px 0;white-space:normal;text-align:left}',
+      '.mj-panel .mj-ob-raw{margin:8px 0 0;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,monospace);font-size:12px;padding:10px;box-sizing:border-box;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:8px}',
+      '.mj-ob .mj-ob-list{margin:8px 0}',
+      '.mj-ob .mj-ob-list>div{display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px 12px;padding:5px 0}',
+      '.mj-ob .mj-ob-list dt{color:var(--dsw-alias-label-secondary)}',
+      '.mj-ob .mj-ob-list dd{margin:0;font-variant-numeric:tabular-nums}',
       '.mj-card{padding:14px 16px;box-sizing:border-box}',
       '.mj-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}',
       '.mj-budgetgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}',
@@ -1031,48 +1187,37 @@ window.__ModuleLoader__.load({
     };
 
     function useEndpoint(rpc, endpoint, customPayload, depsKey) {
-      const [state, setState] = useState({ phase: 'loading', data: null, error: '' });
+      const contextKey = depsKey || '';
+      const [state, setState] = useState({ phase: 'loading', data: null, error: '', contextKey });
       const alive = useRef(true);
+      const requestSeq = useRef(0);
+      const latestContext = useRef(contextKey);
+      latestContext.current = contextKey;
       const payloadRef = useRef(customPayload || ENDPOINT_PAYLOAD[endpoint]);
       payloadRef.current = customPayload || ENDPOINT_PAYLOAD[endpoint];
-      // 重新挂载时必须把标记置回 true，否则 StrictMode 下第一次 cleanup 之后
-      // 所有落地回调都被丢弃，面板永远停在「读取中…」。
-      useEffect(() => {
-        alive.current = true;
-        return () => { alive.current = false; };
-      }, []);
+      useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
       const load = useCallback((overridePayload) => {
-        setState((prev) => ({ phase: 'loading', data: prev.data, error: '' }));
-        const reqPayload = (overridePayload && typeof overridePayload === 'object' && !overridePayload.nativeEvent)
-          ? overridePayload
-          : payloadRef.current;
-        let p;
-        try {
-          p = rpc(endpoint, reqPayload);
-        } catch (e) {
-          p = Promise.reject(e);
-        }
-        return Promise.resolve(p).then((res) => {
-          if (!alive.current) return null;
-          if (res && res.ok) {
-            setState({ phase: 'ready', data: res.value || null, error: '' });
-            return res.value || null;
-          }
-          setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError(res) : errMsg(res) });
-          return null;
-        }, (e) => {
-          if (!alive.current) return null;
-          setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError() : (e && e.message ? String(e.message) : String(e)) });
-          return null;
+        const seq = ++requestSeq.current;
+        const requestContext = contextKey;
+        setState(prev => ({ phase: 'loading', data: prev.contextKey === requestContext ? prev.data : null, error: '', contextKey: requestContext }));
+        const reqPayload = overridePayload && typeof overridePayload === 'object' && !overridePayload.nativeEvent ? overridePayload : payloadRef.current;
+        return Promise.resolve().then(() => rpc(endpoint, reqPayload)).then(res => {
+          if (!alive.current || requestSeq.current !== seq || latestContext.current !== requestContext) return null;
+          if (res && res.ok) { setState({ phase: 'ready', data: res.value || null, error: '', contextKey: requestContext }); return res.value || null; }
+          setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError(res) : errMsg(res), contextKey: requestContext }); return null;
+        }, e => {
+          if (!alive.current || requestSeq.current !== seq || latestContext.current !== requestContext) return null;
+          setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError() : String(e?.message || e), contextKey: requestContext }); return null;
         });
       }, [rpc, endpoint, depsKey || '']);
       useEffect(() => { load(); }, [load]);
-      return [state, load, setState];
+      return [state.contextKey === contextKey ? state : { phase: 'loading', data: null, error: '' }, load, setState];
     }
 
     // -------------------------------------------------------------- 面板
 
-    function MemjudgePanel({ rpc }) {
+    // Reserved for a verified host adapter; current registrations provide no identity.
+    function MemjudgePanel({ rpc, sessionId: suppliedSessionId }) {
       ensureCss();
 
       // ---- v2 作用域、五类范畴、代谢层级、视图与治理状态（全部顶层固定槽位）
@@ -1082,6 +1227,11 @@ window.__ModuleLoader__.load({
       const [searchQuery, setSearchQuery] = useState('');
       const [viewTab, setViewTab] = useState('all');
       const [openMems, setOpenMems] = useState({});
+      const [observationTab, setObservationTab] = useState('overview');
+      const [detailCache, setDetailCache] = useState({});
+      const scopeEpoch = useRef(activeSpace);
+      scopeEpoch.current = activeSpace;
+      const detailRequests = useRef({});
       const [openRevs, setOpenRevs] = useState({});
       const [revCache, setRevCache] = useState({});
       const [openWikis, setOpenWikis] = useState({});
@@ -1098,7 +1248,9 @@ window.__ModuleLoader__.load({
       }, []);
 
       const trimmedQuery = searchQuery.trim();
-      const statusPayload = activeSpace !== 'all' ? { spaceId: activeSpace } : ENDPOINT_PAYLOAD.status;
+      const sessionId = typeof suppliedSessionId === 'string' && suppliedSessionId.length <= 256 && !/\s/.test(suppliedSessionId) ? suppliedSessionId : '';
+      const includeInjectionText = !!sessionId && activeSpace !== 'all' && observationTab === 'injection';
+      const statusPayload = { ...(activeSpace !== 'all' ? { spaceId: activeSpace } : {}), ...(sessionId ? { sessionId } : {}), includeInjectionText };
       const memPayload = (() => {
         if (activeSpace === 'all' && activeCategory === 'all' && activeLayer === 'all' && !trimmedQuery) {
           return ENDPOINT_PAYLOAD.memories;
@@ -1114,7 +1266,8 @@ window.__ModuleLoader__.load({
         ? { cap: 40, spaceId: activeSpace }
         : ENDPOINT_PAYLOAD.conflicts;
 
-      const statusDepsKey = activeSpace;
+      const statusDepsKey = JSON.stringify([activeSpace, sessionId, includeInjectionText]);
+      const statusEpoch = useRef(statusDepsKey); statusEpoch.current = statusDepsKey;
       const memDepsKey = activeSpace + '|' + activeCategory + '|' + activeLayer + '|' + trimmedQuery;
       const confDepsKey = activeSpace;
 
@@ -1123,11 +1276,12 @@ window.__ModuleLoader__.load({
       const [confSt, reloadConf] = useEndpoint(rpc, 'conflicts', confPayload, confDepsKey);
 
       const reloadAll = useCallback(() => {
-        setWikiSnapOverride(null);
+        setWikiSnapOverride(null); setDetailCache({}); setOpenMems({}); detailRequests.current = {};
         reloadStatus(); reloadMems(); reloadConf();
       }, [reloadStatus, reloadMems, reloadConf]);
 
       const statusData = statusSt.data;
+      const observationModel = adaptObservability(statusData, activeSpace, sessionId, includeInjectionText);
       const memData = memsSt.data;
       const cfg = statusData && statusData.config ? statusData.config : null;
       const stats = statusData && statusData.stats ? statusData.stats : null;
@@ -1212,16 +1366,15 @@ window.__ModuleLoader__.load({
       }, [patchSlot]);
 
       const pullStatus = useCallback(() => {
-        const req = activeSpace !== 'all' ? { spaceId: activeSpace } : {};
-        return Promise.resolve(rpc('status', req)).then((res) => {
-          if (res && res.ok) { setStatusSt({ phase: 'ready', data: res.value || null, error: '' }); return res.value; }
-          setStatusSt({ phase: 'error', data: null, error: modelError(res) });
-          return null;
-        }, (e) => {
-          setStatusSt({ phase: 'error', data: null, error: modelError() });
-          return null;
+        return Promise.resolve(rpc('status', statusPayload)).then(res => {
+          if (statusEpoch.current !== statusDepsKey) return null;
+          if (res && res.ok) { setStatusSt({ phase: 'ready', data: res.value || null, error: '', contextKey: statusDepsKey }); return res.value; }
+          setStatusSt({ phase: 'error', data: null, error: modelError(res), contextKey: statusDepsKey }); return null;
+        }, () => {
+          if (statusEpoch.current !== statusDepsKey) return null;
+          setStatusSt({ phase: 'error', data: null, error: modelError(), contextKey: statusDepsKey }); return null;
         });
-      }, [rpc, setStatusSt, activeSpace]);
+      }, [rpc, setStatusSt, statusDepsKey]);
 
       /** 保存一组的密钥：payload 带 group，成功后只重读 status（回读为准），并清掉该组输入。 */
       const saveKeyFor = useCallback((group) => {
@@ -1494,7 +1647,8 @@ window.__ModuleLoader__.load({
 
       const selectSpace = useCallback((nextSpace) => {
         const sp = nextSpace || 'all';
-        setActiveSpace(sp);
+        setActiveSpace(sp); setOpenMems({}); setOpenRevs({}); setRevCache({});
+        setDetailCache({}); detailRequests.current = {};
         setConfirmForgetId('');
         setWikiSnapOverride(null);
       }, [setActiveSpace, setConfirmForgetId, setWikiSnapOverride]);
@@ -1593,10 +1747,28 @@ window.__ModuleLoader__.load({
         }).then(() => { setGovBusy(''); });
       }, [govBusy, rpc, reloadAll, showGovMsg]);
 
-      const toggleMemOpen = useCallback((id) => {
-        if (!id) return;
-        setOpenMems((prev) => Object.assign({}, prev, { [id]: !prev[id] }));
-      }, [setOpenMems]);
+      const loadMemoryDetail = useCallback((item) => {
+        if (!item || !item.id) return;
+        const id = String(item.id);
+        const space = observedText(item.spaceId) || (activeSpace !== 'all' ? activeSpace : '');
+        if (!space) { setDetailCache(prev => ({ ...prev, [id]: { phase: 'unsupported', error: '宿主未提供条目空间，无法安全读取完整原文。' } })); return; }
+        const requestScope = activeSpace, request = {};
+        detailRequests.current[id] = request;
+        setDetailCache(prev => ({ ...prev, [id]: { phase: 'loading' } }));
+        const settle = value => { if (scopeEpoch.current === requestScope && detailRequests.current[id] === request) setDetailCache(prev => ({ ...prev, [id]: value })); };
+        Promise.resolve().then(() => rpc('memories', { id, detail: true, spaceId: space })).then(res => {
+          const found = res && res.ok && res.value && res.value.item;
+          if (!found || found.id !== id || found.spaceId !== space) settle({ phase: 'error', error: '未找到当前范围内的原文详情；可重试。' });
+          else if (typeof found.fullText !== 'string') settle({ phase: 'unsupported', error: '此宿主未提供完整原文，列表仅为预览。' });
+          else settle({ phase: 'ready', item: found });
+        }, () => settle({ phase: 'error', error: '原文读取失败，请重试。' }));
+      }, [rpc, activeSpace]);
+      const toggleMemOpen = useCallback(item => {
+        if (!item || !item.id) return;
+        const id = String(item.id), opening = !openMems[id];
+        setOpenMems(prev => ({ ...prev, [id]: !prev[id] }));
+        if (opening && !detailCache[id]) loadMemoryDetail(item);
+      }, [openMems, detailCache, loadMemoryDetail]);
 
       const toggleWikiOpen = useCallback((key) => {
         if (!key) return;
@@ -1612,18 +1784,23 @@ window.__ModuleLoader__.load({
         if (Array.isArray(item.revisions) && item.revisions.length > 0) return;
         if (revCache[id] && (revCache[id].loading || Array.isArray(revCache[id].items))) return;
         setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: true, items: null, error: '' } }));
-        Promise.resolve(rpc('memories', { id, withRevisions: true })).then((res) => {
+        const requestScope = activeSpace;
+        const requestSpace = item.spaceId || (activeSpace !== 'all' ? activeSpace : '');
+        Promise.resolve(rpc('memories', { id, withRevisions: true, ...(requestSpace ? { spaceId: requestSpace } : {}) })).then((res) => {
+          if (scopeEpoch.current !== requestScope) return;
           if (res && res.ok && res.value) {
             const found = res.value.item || (Array.isArray(res.value.items) ? res.value.items[0] : null);
-            const revs = found && Array.isArray(found.revisions) ? found.revisions : [];
+            const revs = found && found.id === id && requestSpace && found.spaceId === requestSpace
+              && Array.isArray(found.revisions) ? found.revisions : [];
             setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: false, items: revs, error: '' } }));
           } else {
             setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: false, items: [], error: '无法读取修订记录' } }));
           }
         }, () => {
+          if (scopeEpoch.current !== requestScope) return;
           setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: false, items: [], error: '无法读取修订记录' } }));
         });
-      }, [openRevs, revCache, rpc]);
+      }, [openRevs, revCache, rpc, activeSpace, observationModel.supported]);
 
       const manualReload = useCallback(() => {
         setWikiSnapOverride(null);
@@ -1712,7 +1889,7 @@ window.__ModuleLoader__.load({
       );
 
       const spaceOptions = isV2
-        ? buildSpaceOptions(statusData && statusData.spaces, stats, rawMemList, activeSpace)
+        ? buildSpaceOptions(statusData?.spaces || observationModel.spaces, stats, rawMemList, activeSpace)
         : [];
       const spaceLabelMap = (() => {
         const map = { all: '全部空间', global: '全局' };
@@ -1880,8 +2057,8 @@ window.__ModuleLoader__.load({
           }
           return acc;
         }
-        const base = statusData && statusData.categories && typeof statusData.categories === 'object'
-          ? statusData.categories
+        const base = observationModel.categories && typeof observationModel.categories === 'object'
+          ? observationModel.categories
           : null;
         if (base) return base;
         if (!isV2 || !rawMemList) return null;
@@ -1902,7 +2079,8 @@ window.__ModuleLoader__.load({
           }
           return acc;
         }
-        const base = (statusData && statusData.layers && typeof statusData.layers === 'object')
+        const base = observationModel.supported ? observationModel.layers
+          : (statusData && statusData.layers && typeof statusData.layers === 'object')
           ? statusData.layers
           : (stats && stats.lTiers && typeof stats.lTiers === 'object' ? stats.lTiers : null);
         if (base) return base;
@@ -1920,18 +2098,17 @@ window.__ModuleLoader__.load({
         const tS = statusData.tierS && typeof statusData.tierS === 'object' ? statusData.tierS : null;
         const tD = statusData.tierD && typeof statusData.tierD === 'object' ? statusData.tierD : null;
         const inj = statusData.inject && typeof statusData.inject === 'object' ? statusData.inject : null;
-        if (!tS && !tD && !inj) return null;
+        if (!tS && !tD && !inj && !observationModel.supported) return null;
 
-        const sBudget = Number(tS && tS.budget != null ? tS.budget : (inj && inj.tierSBudget != null ? inj.tierSBudget : 1200));
-        const sMax = Number(tS && tS.maxChars != null ? tS.maxChars : sBudget);
-        const dBudget = Number(tD && tD.budget != null ? tD.budget : (inj && inj.tierDBudget != null ? inj.tierDBudget : 2000));
-        const dMax = Number(tD && tD.maxChars != null ? tD.maxChars : dBudget);
-        const totalBudget = Number((inj && (inj.totalBudget || inj.injectBudget)) || (sBudget + dBudget) || 3200);
-
-        const sRawUsed = tS && (tS.usedChars ?? tS.used) != null ? Number(tS.usedChars ?? tS.used)
-          : (inj && (inj.tierSUsed ?? inj.tierSChars) != null ? Number(inj.tierSUsed ?? inj.tierSChars) : null);
-        const dRawUsed = tD && (tD.usedChars ?? tD.used) != null ? Number(tD.usedChars ?? tD.used)
-          : (inj && (inj.tierDUsed ?? inj.tierDChars) != null ? Number(inj.tierDUsed ?? inj.tierDChars) : null);
+        const measured = observationModel.injection;
+        const sBudget = measured.tierSBudgetChars;
+        const sMax = sBudget;
+        const dBudget = measured.tierDBudgetChars;
+        const dMax = dBudget;
+        const totalBudget = measured.totalBudgetChars;
+        // Legacy status.usedChars is a static measurement, not the current generated frame.
+        const sRawUsed = observedNumber(measured.current?.tierS?.chars);
+        const dRawUsed = observedNumber(measured.current?.tierD?.chars);
 
         const sHasUsed = sRawUsed !== null && Number.isFinite(sRawUsed);
         const dHasUsed = dRawUsed !== null && Number.isFinite(dRawUsed);
@@ -2044,7 +2221,7 @@ window.__ModuleLoader__.load({
               }),
               h(Stat, { key: 'c', label: '正文字数', value: fmt(stats.textChars), sub: fmt(stats.textBytes) + ' 字节' }),
               h(Stat, {
-                key: 'b', label: '占用',
+                key: 'b', label: '库内存储（非每轮注入）',
                 value: kb(stats.bytes) + 'KB',
                 sub: '上限 ' + kb(stats.limitBytes) + 'KB · 余 ' + kb(Math.max(0, Number(stats.limitBytes) - Number(stats.bytes))) + 'KB',
                 tone: stats.withinLimit === false ? C.bad : C.fg,
@@ -2863,7 +3040,9 @@ window.__ModuleLoader__.load({
                 r: r,
                 isV2: isV2,
                 open: !!openMems[rid],
-                onToggleOpen: () => toggleMemOpen(rid),
+                onToggleOpen: () => toggleMemOpen(r),
+                detail: detailCache[rid] || null,
+                onRetryDetail: () => loadMemoryDetail(r),
                 spaceLabel: (activeSpace === 'all' && r.spaceId)
                   ? (spaceLabelMap[r.spaceId] || friendlyPathTail(r.spaceId))
                   : '',
@@ -2937,7 +3116,15 @@ window.__ModuleLoader__.load({
           cfg ? h('div', null, '密钥文件 ' + cfg.secretsPath) : null));
 
       return h('div', { className: 'mj-panel', style: rootStyle },
-        header, scopeSection, sectionA, stateSection, wikiSection, sectionC, sectionD, sectionB, sectionE);
+        header, scopeSection, h(ObservationPanel, {
+          model: observationModel, phase: statusSt.phase, tab: observationTab,
+          onTab: setObservationTab, onRetry: reloadStatus,
+          onBrowse: ({ space, category, layer }) => {
+            if (space) selectSpace(space);
+            setActiveCategory(category || 'all'); setActiveLayer(layer || 'all');
+            setSearchQuery(''); setViewTab('memories'); setMemCollapsed(false);
+          },
+        }), sectionA, stateSection, wikiSection, sectionC, sectionD, sectionB, sectionE);
 
       // ------------------------------------------------------------ 内部渲染件
 
@@ -3131,7 +3318,7 @@ window.__ModuleLoader__.load({
      * v1/v7：保留原紧凑单行按钮；v2：叠加五类范畴徽标、L0-L3 角标、修订链展开、降级与确认遗忘。
      */
     function MemoryRow({
-      r, isV2, open, onToggleOpen, spaceLabel,
+      r, isV2, open, onToggleOpen, spaceLabel, detail, onRetryDetail,
       revOpen, cachedRev, onToggleRevisions,
       onDemote, isArmedForget, onForget, onCancelForget, govBusy,
     }) {
@@ -3188,7 +3375,13 @@ window.__ModuleLoader__.load({
               }, '· 来自 ' + src)
               : null)));
 
-      if (!isV2) return bodyBtn;
+      const detailBody = open ? h('div', { 'data-memory-detail': rid, style: { padding: '6px 8px', overflowWrap: 'anywhere' } },
+        h(Hint, { mono: true }, 'ID：' + rid + ' · 空间：' + (observedText(r.spaceId) || '未提供')),
+        h(Hint, null, '来源：' + (sourceText(detail?.item?.source ?? r.source) || '未提供') + ' · 分类：' + (resolveItemCategory(detail?.item || r) || '未提供')),
+        !detail || detail.phase === 'loading' ? h('div', { role: 'status' }, '读取完整原文中…')
+          : detail.phase === 'ready' ? h('div', null, h(Hint, null, '原始正文（不改写）'), h('pre', { className: 'mj-ob-raw' }, detail.item.fullText || '（原文为空）'))
+            : h(ErrorBlock, { title: detail.error, onRetry: onRetryDetail })) : null;
+      if (!isV2) return h('div', null, bodyBtn, detailBody);
 
       const catId = resolveItemCategory(r) || 'experience';
       const layerId = resolveItemLayer(r) || 'L1';
@@ -3289,6 +3482,7 @@ window.__ModuleLoader__.load({
               }, '取消')
               : null) : null),
         bodyBtn,
+        detailBody,
         revOpen ? h(RevisionTimeline, {
           currentText: text,
           revisions: revs,

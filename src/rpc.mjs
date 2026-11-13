@@ -36,6 +36,7 @@ import { TIER_S_MAX_CHARS, TIER_D_MAX_CHARS, TOTAL_INJECT_MAX_CHARS } from './in
 import { deriveClusterSlug, buildWikiPage, compileDirtyWikiPages, runMetabolism } from './lifecycle.mjs';
 import { SearchIndex } from './search.mjs';
 import { resolveScope } from './scope.mjs';
+import { buildObservabilitySnapshot, collectObservationCounts, resolveObservationScope } from './observability.mjs';
 
 function normalizeRpcSpace(raw) {
   const s = typeof raw === 'string' ? raw.trim() : '';
@@ -835,6 +836,7 @@ export function installMemjudgeRpc(ctx, opts = {}) {
           const rawSpace = normalizeRpcSpace(rawSpaceInput);
           const spaceFilter = rawSpace && rawSpace !== 'all' ? rawSpace : undefined;
 
+          const observationScope = resolveObservationScope(payload, opts.cwd ?? process.cwd());
           const data = runWithStore(opts, (store) => {
             let compileResult = null;
             let metabolism = null;
@@ -888,6 +890,7 @@ export function installMemjudgeRpc(ctx, opts = {}) {
             const wikiSnap = buildWikiSnapshot(store, payload);
             return {
               stats,
+              observationCounts: collectObservationCounts(store, observationScope),
               attrCount,
               spaces,
               wikiSnap,
@@ -910,7 +913,19 @@ export function installMemjudgeRpc(ctx, opts = {}) {
             L3: Number(lt[3] ?? lt.L3 ?? 0),
           };
 
+          // Diagnostic failures must degrade to unavailable, never fail an otherwise valid status.
+          let observation = null;
+          try { observation = opts.injectionObserver?.read(observationScope) ?? null; } catch { /* unavailable */ }
+          const observability = buildObservabilitySnapshot({
+            capturedAt: new Date().toISOString(), stats: data.stats, counts: data.observationCounts,
+            config: cfg, dbPath: opts.dbPath, modules: { ...moduleFlags(),
+              ...Object.fromEntries(Object.entries(cfg).filter(([, value]) => typeof value === 'boolean')),
+            },
+            observation, scope: observationScope,
+          });
+
           return ok({
+            observability,
             schemaVersion: data.stats.schemaVersion ?? 8,
             stats: { ...data.stats, attrCount: data.attrCount, wikiCount: data.wikiSnap.total },
             config: configReport(),
