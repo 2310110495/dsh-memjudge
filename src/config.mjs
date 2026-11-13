@@ -28,6 +28,12 @@ export const STATE_DIR = join(HOME, 'memjudge');
 export const CONFIG_PATH = join(STATE_DIR, 'config.json');
 export const SECRETS_PATH = join(STATE_DIR, 'secrets.json');
 
+/** 动态解析 secrets.json 路径，尊重运行期 DSH_HOME 环境变量隔离。 */
+export function secretsFilePath(env = process.env) {
+  const base = (env && env.DSH_HOME) || join(homedir(), '.dsh');
+  return join(base, 'memjudge', 'secrets.json');
+}
+
 function readJson(path) {
   try {
     if (!existsSync(path)) return {};
@@ -38,8 +44,8 @@ function readJson(path) {
   }
 }
 
-/** 库体展示上限的默认值。200KB 只够 SPEC 的验收语料，真实库要大得多。 */
-export const DEFAULT_STORAGE_LIMIT_BYTES = 2 * 1024 * 1024;
+/** 库体展示上限的默认值：与 store.mjs Schema v8 生产容量上限（10MB）严格同源。 */
+export const DEFAULT_STORAGE_LIMIT_BYTES = 10 * 1024 * 1024;
 /** 写入闸门默认值：0 = 不设硬限（要「写满即拒」得用户显式填）。 */
 export const DEFAULT_MAX_CHARS = 0;
 
@@ -304,6 +310,9 @@ const ENV_SIG_NAMES = (() => {
     'MEMJUDGE_STORAGE_LIMIT_BYTES',
     'MEMJUDGE_MAX_CHARS',
   ]);
+  for (const envName of Object.values(AUTO_CAPTURE_ENV)) {
+    names.add(envName);
+  }
   for (const spec of Object.values(GROUP_SPEC)) {
     for (const n of spec.baseUrlEnv) names.add(n);
     for (const n of spec.modelEnv) names.add(n);
@@ -415,6 +424,7 @@ export function storageLimitBytes() { return load().storageLimitBytes; }
 /** 写入闸门（字符）：0 = 不设硬限；>0 时超限抛 BUDGET_EXCEEDED，不截断。 */
 export function maxChars() { return load().maxChars; }
 export function rawConfig() { return load().config; }
+export function autoCaptureConfig() { return load().autoCapture; }
 
 /**
  * 一组的完整状态快照：生效值 + 来源 + 是否继承。只给掩码，绝不给明文 key。
@@ -616,6 +626,7 @@ export function configReport() {
     dims: embedDims(),
     storageLimitBytes: storageLimitBytes(),
     maxChars: maxChars(),
+    autoCapture: load().autoCapture,
     // 三组各自的完整状态（掩码 + 来源 + 是否继承）
     groups: { chat, embed, rerank },
     credSpec: credSpec(),

@@ -36,11 +36,13 @@ test('拦幻觉：编造的标识、限定语、复合专名', () => {
   assert.equal(gate(hallucination.find((h) => h.id === 'H2').q, store).reason, 'scope-not-recorded');
 });
 
-test('已知边界：真实实体配编造属性，全文判据拦不住（记录，不粉饰）', () => {
+test('修复回归：真实实体配编造属性，全文与预算候选均必须拒答', () => {
   const h3 = hallucination.find((h) => h.id === 'H3');
   const g = gate(h3.q, store);
-  assert.equal(g.deny, false, 'H3 在 3 万字全文上确实漏了，测试如实记录这条边界');
-  // 但同一条问题在 2000 字注入预算内可以被拦下——材料里根本没有「海燕」，也没有那章
+  // 历史用例刻意断言旧缺陷仍存在；T13 修复后改为更严格的拒答契约，保留全文与预算两路检查。
+  assert.equal(g.deny, true, 'H3 不能从其他主体借用属性，全文同样必须拒答');
+  assert.match(g.reason, /^(attribute|entity)-not-recorded$/);
+  // 同一条问题在 2000 字注入预算内也必须被拦下。
   const cands = chapters.map((c) => ({ id: `ch${c.n}`, text: c.text, score: 1, createdAt: NOW }));
   const r = render(h3.q, cands, { now: NOW, maxChars: 2000 });
   assert.equal(r.gate.deny, true, 'H3 在裁剪后的候选集上应被拦');

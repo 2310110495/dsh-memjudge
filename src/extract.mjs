@@ -25,11 +25,11 @@ const UNIT_RE = new RegExp(`(${NUM})\\s*(${UNITS.join('|')})`, 'g');
 
 // 属性块尾部要剥的虚词/动词。「实测/目测/估值」必须在表里，否则
 // ch15「凹陷实测深度为十一厘米」与 ch5「凹陷深度约九厘米」会分不到同一 key。
-const TAIL_STRIP = /(采用|记录|实测|目测|估值|记作|写作|认定|认为|估计|大约|至少|超过|不足|达到|还有|约|为|是|达|有|共|计|在|到|以|上|下|中|内|外|前|后|系|即|均|已|仅|只|该|此|其|本|各|之|于|的)+$/;
+const TAIL_STRIP = /(统一设定|统一|设定|采用|记录|实测|目测|估值|记作|写作|认定|认为|估计|大约|至少|超过|不足|达到|还有|约|为|是|达|有|共|计|在|到|以|上|下|中|内|外|前|后|系|即|均|已|仅|只|该|此|其|本|各|之|于|的)+$/;
 const HEAD_STRIP = /^(报告|材料|照片|数据显示|据|按|经|由|将|把|被|让|对|向|从|和|与|及|或|而|又|也|就|都|还|只|仅|已|曾|正|在|该|此|其|本|各|均|约|为|是|达|有|共|计|于)+/;
 
-// 名字禁用字：ROLES 后面跟的不一定都是人名，「船长通过甚高频电台」会被
-// 抽成「通过甚」。姓氏表挡不住，这里再用名字部分的高频动词/虚词挡一层。
+// 名字禁用字：ROLES 后面跟的不一定都是人名，「主管通过网关配置」会被
+// 抽成「通过网」。姓氏表挡不住，这里再用名字部分的高频动词/虚词挡一层。
 const NAME_STOP = new Set('过甚知常讯报道说问话信行用事情定在有的是的活和与及把将对从向为被让给替由就都还只又也才正已曾并且或但而则因所以到至自同跟吃喝看听走跑坐站拿放开上下进出回来去'.split(''));
 // 人名尾字的边界：落在这些字上说明名字只有 2 字，第 3 字属于句子
 const EDGE_CHARS = new Set('的在与和及把将对从向为被让给替由就都还只又也才正已曾并且或但而则所以到至自同跟进出来去说问答'.split(''));
@@ -44,24 +44,24 @@ const ATTR_REJECT = new Set([
 // 「十海里以东 / 三米以内」这类是方位短语，不是「某物的某属性」
 const ATTR_DIRECTION = /^[东西南北方位前后]?(?:以东|以西|以南|以北|以上|以下|以内|以外|之后|之前|左右)$/;
 
-// 名词性后缀：命中这些尾巴的属性块优先被认成名词短语，而不是被截成两字碎片。
-const ATTR_SUFFIX = /(?:编号|代号|型号|呼号|名称|名字|日期|时间|深度|长度|宽度|高度|厚度|半径|面积|体积|重量|吨位|人数|页数|数量|件数|金额|费用|费率|流量|速度|温度|气压|湿度|角度|距离|续航|功率|电压|比重|含量|浓度|盐度|压力|工期|时限|期限|吃水|载重|航速|航次|容量|排量|定额|标准|结论|原因|用途|去向|位置|坐标|方向|等级|类别|方式|方法|状态|结果|记录|报告|证书|合同|图纸|清单|台账|纪要|批复|申请|计划|方案|措施|要求|意见|责任|职务|岗位|姓名|年龄|工龄|资历|经历|目的港|装货港|卸货港|船籍港|港区|港口|海峡|航线|码头|锚地|水道|运河)$/;
+// 中文名词中心语的构词后缀；完整属性由原句边界决定，不维护行业字段目录。
+const ATTR_SUFFIX = /(?:[\u4e00-\u9fff][度率数量额值期限码型]|[长宽高深重]|[称名期时位置向级类态式法因果途责务龄历]|大小|端口|版本|功率|容量|费用|预算|标准|结论|记录|报告|证书|合同|图纸|清单|台账|纪要|批复|申请|计划|方案|措施|要求|意见)$/;
 
-const ORG_TAIL = /([\u4e00-\u9fff]{2,8}(?:船级社|海事局|造船厂|船厂|保险公司|保险公估|研究院|设计院|委员会|协会|调查组|法庭|港务局|航运公司|有限公司|公司))/g;
+// 通用机构后缀构词（零特定行业专有词硬编码）
+const ORG_TAIL = /([\u4e00-\u9fff]{2,8}(?:委员会|研究院|设计院|研究所|实验室|事务所|调查组|工作组|保险公司|保险公估|公估|协会|学会|法庭|法院|有限公司|公司|总局|分局|局|社|厂))(?![\u4e00-\u9fff])/g;
 const VESSEL = /([\u4e00-\u9fff]{2,5}号)/g;
 
-const ROLES = [
-  '船东代表', '货主代表', '值班水手', '轮机长', '大管轮', '二管轮', '三管轮',
-  '水手长', '验船师', '质检员', '调查员', '公估人', '引航员', '电机员',
-  '船长', '大副', '二副', '三副', '木匠', '大厨',
-];
-// 姓氏白名单是过滤「船长证书 / 大副收据 / 二副要去机」这类非人名的唯一可靠手段：
+// 姓氏白名单是过滤「证书 / 收据 / 要去机」这类非人名的唯一可靠手段：
 // 职务词后面的字不在姓氏表里就直接不认。
 const SURNAME = '赵钱孙李周吴郑王冯陈蒋沈韩杨朱许何吕张孔曹严金魏陶姜谢邹苏潘葛范彭鲁韦马方俞任袁柳史唐薛雷贺倪汤罗毕郝安常傅余顾孟黄萧姚邵汪毛戴宋庞熊纪舒屈项董梁杜阮蓝季贾江郭林钟徐邱骆高夏蔡田樊胡凌霍万卢莫房解应丁邓郁单洪包左石崔龚程邢陆荣翁荀曲封靳段富焦侯全班秋仲伊宫宁武刘景詹龙叶黎白怀蒲鄂索赖卓屠蒙池乔翟谭劳姬申冉雍桑桂牛通边燕尚农温庄晏柴瞿阎慕连茹艾容向古易廖居衡步都耿满匡国文寇广禄东欧沃利越隆师巩聂晁融冷辛简饶曾沙鞠丰巢关查荆红游权盖益桓公哈';
 
-const ROLE_RE = new RegExp(`(${ROLES.join('|')})([${SURNAME}][\\u4e00-\\u9fff]{1,2})`, 'g');
+// 通用中文职务后缀构词（零特定行业专有词硬编码）：修饰词素 + 中心词尾 + 姓氏人名
+const ROLE_RE = new RegExp(
+  `((?:[一二三四五总正副大值班首席执行助理见习][\\u4e00-\\u9fff]{0,2}|[\\u4e00-\\u9fff]{1,2})(?:代表|主任|经理|总监|委员|顾问|专家|主管|专员|长|副|师|员|人|手|匠|厨))([${SURNAME}][\\u4e00-\\u9fff]{1,2})`,
+  'g',
+);
 const ID_RE = /\b[A-Z]{2,5}(?:-[A-Z]{1,5})?-\d{4,6}(?:-[A-Z0-9]{2,8})+\b/g;
-const COORD_RE = /(南纬|北纬|东经|西经)([零一二三四五六七八九十百千两]+度[零一二三四五六七八九十点两]+分)/g;
+const COORD_RE = /([东西南北])([经纬])([零一二三四五六七八九十百千两]+度[零一二三四五六七八九十点两]+分)/g;
 
 // 值形态补全：旧实现只有「数字+单位」，日期/时刻/百分比全部漏抽，
 // 而这些正是「更换日期」「离港时间」「硫含量」这类问句的落点。
@@ -73,14 +73,25 @@ const PCT_RE = /(百分之[零一二三四五六七八九十百点]+|\d+(?:\.\d+
 const COPULA_RE = /([\u4e00-\u9fff]{2,10})(?:是|为|叫|名为|称为|称作|改名为|改称|记作|写作|标注为)\s*([^\s，。；、：]{2,30})/g;
 
 /** 实体候选清洗：吞了虚词/疑问/动词的词块不是实体。 */
-const ENTITY_LEAD_BAD = /^(?:又|再|还|就|才|也|都|只|仅|已|曾|正|在|把|被|对|向|从|和|与|及|或|而|但|则|因|所|每|各|该|此|其|本|这|那|谁|哪|什么|怎么|为什么|是否|没有|不是|不是|决定|要求|发现|表示|认为|自称|成为|变成|作为|设置|安装|属于|包括|包含|需要|应该|可以|能够|进行|实现|完成|算出|签署|签发|离港|抵港|到达|抵达|离开|驶离|超过|不超过|改成|改回|减为|挂靠|反映|取样|化验|看到|看见|听见|敲|报|问|说|讲)/;
+const ENTITY_LEAD_BAD = /^(?:又|再|还|就|才|也|都|只|仅|已|曾|正|在|把|被|对|向|从|和|与|及|或|而|但|则|因|所|每|各|该|此|其|本|这|那|谁|哪|什么|怎么|为什么|是否|没有|不是|不是|决定|要求|发现|表示|认为|自称|成为|变成|作为|设置|安装|属于|包括|包含|需要|应该|可以|能够|进行|实现|完成|算出|签署|签发|到达|抵达|离开|超过|不超过|改成|改回|减为|反映|取样|化验|看到|看见|听见|敲|报|问|说|讲)/;
 const ENTITY_INNER_BAD = /[对把被了过着的吗呢吧啊]/;
 
 export function cleanEntity(name) {
   if (!name) return null;
-  const s = String(name).trim();
+  let s = String(name).trim();
+  const locMatch = /^(?:在|于)(?:模块|系统|项目|组件|服务|文件|目录|包|库)?\s*(.+?)\s*(?:中|里|内|下)$/.exec(s);
+  if (locMatch) {
+    const inner = locMatch[1].trim();
+    const cleanedInner = inner.replace(/^[“”"'`「」『』《》【】()（）\[\]]+|[“”"'`「」『』《》【】()（）\[\]]+$/g, '').trim();
+    if (/^[A-Za-z0-9_./:-]{2,}$/.test(cleanedInner) || /(?:委员会|研究院|设计院|公司|局|社|厂|号)$/.test(cleanedInner)) {
+      s = cleanedInner;
+    } else {
+      return null;
+    }
+  }
+  s = s.replace(/^[“”"'`「」『』《》【】()（）\[\]]+|[“”"'`「」『』《》【】()（）\[\]]+$/g, '').trim();
   if (s.length < 2) return null;
-  // 「航次代号」「平台编号」也会被 `{2,5}号` 这条船名规则吃进来，先挡掉。
+  // 「航次代号」「平台编号」也会被 `{2,5}号` 这条规则吃进来，先挡掉。
   if (/(?:代号|编号|型号|呼号|名号)$/.test(s)) return null;
   if (ENTITY_LEAD_BAD.test(s)) return null;
   if (ENTITY_INNER_BAD.test(s)) return null;
@@ -88,10 +99,10 @@ export function cleanEntity(name) {
 }
 
 /** 属性必须是名词性短语：含量词/序号/日期形态、或带「的」的长块都不算。 */
-const ATTR_SEQ_BAD = /^(?:最后|首先|其次|第一|第二|第三|第四|第五|其中|其他|另一|同一|此|该|每|各|本|上|下|前|后|这条|那条|这艘|那艘|该船|本船|船上|全船)/;
+const ATTR_SEQ_BAD = /^(?:最后|首先|其次|第一|第二|第三|第四|第五|其中|其他|另一|同一|此|该|每|各|本|上|下|前|后|这条|那条)/;
 const ATTR_VALUE_LIKE = /[年月日时分]|百分之|^[零〇一二三四五六七八九十百千两\d]+/;
 // 动词/状态词：剥完只剩这些说明窗口里没有名词核心
-const ATTR_VERB_BAD = /^(?:服役|航行|停泊|装货|卸货|离港|抵港|值班|交接|签收|化验|检测|检验|检查|确认|通知|报告完毕)$/;
+const ATTR_VERB_BAD = /^(?:进行|执行|处理|使用|实现|完成|服役|值班|交接|签收|化验|检测|检验|检查|确认|通知|报告完毕)$/;
 export function attrIsNoun(attr) {
   const a = String(attr || '');
   if (a.length < 2 || a.length > 8) return false;
@@ -121,12 +132,12 @@ function stripAttr(raw) {
 }
 
 // 长块收紧：旧窗口回看 26 字，句内没标点时会把整句吃成属性
-// （「白鲸号本航次装载一万八千四百吨袋装水泥与」）。这里先用连词/介词断尾，
+// （「核心网关本轮压测承载一万八千四百次并发连接与」）。这里先用连词/介词断尾，
 // 再按名词后缀锚定，最后才退到「末 4 字」。
 const ATTR_BREAK = ['的', '在', '了', '与', '和', '及', '把', '被', '对', '向', '从', '是', '为', '将', '由', '按', '经'];
 function tightenAttr(attr) {
   let a = stripAttr(attr);
-  // 先在整段上断尾：「白鲸号的航次代号」的属性是「航次代号」，不是含「的」的整块。
+  // 先在整段上断尾：「核心网关的实例代号」的属性是「实例代号」，不是含「的」的整块。
   // 「目的港」里的「的」是词内字，替换成同长占位后再找切点，切点索引不变。
   const probe = a.replace(/目的/g, '目地');
   let cut = -1;
@@ -213,7 +224,7 @@ export function extractL1(text, opts = {}) {
     // Grounding Invariant：句子不是原文子串就整条丢弃，绝不改写补齐。
     if (!f.sent || !text.includes(f.sent)) return;
     if (!f.attr || f.attr.length < 1) return;
-    // 实体名本身不是属性：「白鲸号 | 白鲸号 | 二〇二三年…」这种行没有判定价值。
+    // 实体名本身不是属性：「核心网关 | 核心网关 | 二〇二三年…」这种行没有判定价值。
     if (f.entity && f.attr === f.entity) return;
     const src = f.sourceText ?? '';
     if (src && !text.includes(src)) return;
@@ -230,18 +241,24 @@ export function extractL1(text, opts = {}) {
     let value = f.value;
     if (f.unit) {
       const merged = `${f.value}${f.unit}`;
-      if (!text.includes(merged)) return;
-      value = merged;
+      const spaced = `${f.value} ${f.unit}`;
+      // 数字与单位之间带空格（「15 秒」）也要能落槽位：只要落库值取原文连续子串，
+      // grounding 回溯依然成立；旧实现只认无空格形态，整句事实被静默丢弃。
+      if (text.includes(merged)) value = merged;
+      else if (text.includes(spaced)) value = spaced;
+      else return;
     }
     out.push({
-      entity: f.entity ?? null,
+      entity: f.entity ?? '',
       attr: f.attr,
+      attribute: f.attr,
       key: keyOf(f.attr),
       value,
       unit: null,
       kind: f.kind,
       valueType: f.valueType ?? valueTypeOf(f),
       sent: f.sent,
+      quote: f.sourceText ?? f.sent ?? '',
       // 句子指针：库里只存偏移与长度，grounding 时回 memories.text 切片比对，
       // facts 表不再抄一份原文（SPEC §2.7 体积预算）。
       sentOff: f.sentOff ?? (f.at ?? 0),
@@ -263,8 +280,9 @@ export function extractL1(text, opts = {}) {
     COORD_RE.lastIndex = 0;
     let m;
     while ((m = COORD_RE.exec(sent)) !== null) {
-      const attr = m[1] === '南纬' || m[1] === '北纬' ? '纬度' : '经度';
-      push({ ...base, attr, value: m[2], unit: null, kind: 'coord', at: s.at + m.index });
+      if (!(m[2] === '纬' ? '南北' : '东西').includes(m[1])) continue;
+      const attr = `${m[2]}度`;
+      push({ ...base, attr, value: m[3], unit: null, kind: 'coord', at: s.at + m.index });
       coordSpans.push([m.index, m.index + m[0].length]);
     }
     const inCoord = (i) => coordSpans.some(([a, b]) => i >= a && i < b);
@@ -462,14 +480,14 @@ export async function extractL1Hybrid(entries, opts = {}) {
  */
 export function rebuildFacts(entries, opts = {}) {
   const list = Array.isArray(entries) ? entries : [];
-  const grouped = new Map();
+  const out = [];
   for (const e of list) {
     const id = e?.id ?? e?.rowid;
     if (id == null) continue;
     const facts = extractL1(String(e.text ?? ''), { ch: e.chapter ?? null, ...opts });
-    grouped.set(id, facts);
+    out.push({ id, count: facts.length, facts });
   }
-  return grouped;
+  return out;
 }
 
 export default { extractL1, extractFacts, rebuildFacts, cleanEntity };

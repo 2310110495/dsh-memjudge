@@ -52,20 +52,33 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { rankWeight, decayFactor, DECAY } from './schema.mjs';
 import { embed as defaultEmbed, cosineInt8 } from './vector.mjs';
-import { expand as defaultExpand } from './query-expand.mjs';
-import { select as defaultSelect } from './llm-select.mjs';
+import { expand as defaultExpand, expandForHybrid } from './query-expand.mjs';
+import { select as defaultSelect, selectFromFused } from './llm-select.mjs';
+import { rerank as defaultRerank, applyRerank, rerankCandidates, rerankOptIn } from './rerank.mjs';
+import { extractSlots, cleanSlotEntity, cleanSlotAttr, normalizeValueAndUnit } from './slots.mjs';
+import { tokenize as codeTokenize } from './tokenizer.mjs';
+import {
+  GLOBAL_SPACE_ID,
+  GLOBAL_SPACE_WEIGHT,
+  CURRENT_SPACE_WEIGHT,
+  spaceWeight,
+  visibleSpaces,
+  visibleSpaceWeights,
+} from './scope.mjs';
 
 export const SEARCH_DEFAULTS = Object.freeze({
   k1: 1.5, // BM25 词频饱和参数（与 mem-eval worker 的 buildBM25Index 同值）
   b: 0.75, // 长度归一化强度。1=完全归一，0=不归一；段级语料取 0.75 让长段不吃亏
   singleCharDiscount: 0.35, // 单汉字 token 的分数折扣（只降权，不禁止）
-  subwordDiscount: 0.35, // jieba 子词的分数折扣（「轮机」之于「轮机长」：同一处证据，不重复计满权）
+  subwordDiscount: 0.35, // jieba 子词的分数折扣（子词之于复合整词：同一处证据，不重复计满权）
   decayFloor: 0, // 0 = 严格按衰减公式（能力 12 要求 30 天 ≤0.25）；>0 会放宽旧条目
   halfLifeDays: null, // null = 用 schema 双档（warm 120 / cold 12）；数值 = 统一覆盖（RestRegular 风格）
   topChapters: 3, // 章级聚合取前几章。旧实测 1→0.946、2→0.989（bigram 时代）；jieba 接入后词级候选更稀疏，取 2 会让「一章只有一段强命中」的章整体落选（R10 的正确段在第 3 章），取 3 同时保住召回 91/92 与能力 4 的 0.583
   chapterAgg: 3, // 章分 = 章内 top-N 段分之和
   maxChars: 2000, // 单次返回字符预算（能力 8 阈值）
   limit: 16, // 单次返回段数上限（防极短段填满预算）
+  rrfK: 60, // RRF 平滑因子 k=60
+  dedupeSlotKey: true, // 按 slot_key 去重与多样性装填
 });
 
 // ── meow 分词器（类别路由 v0.20.0 + en 归一化） ────────────────────────────
@@ -274,8 +287,8 @@ export function tokenize(text) {
         }
         // 子词不再删除，只登记到 tokenize 的 weak 集合由打分侧折扣。
         // 腾讯那边用 FTS5 的 OR 串，重复词不重复计分，所以它不用管；
-        // memjudge 带 tf 权重，必须把「轮机/机长/轮机长」的重复计分压下去，
-        // 但同一批子词对「硫含量/检验员机舱」这类问法是唯一的召回桥梁，不能删。
+        // memjudge 带 tf 权重，必须把复合词与其子词的重复计分压下去，
+        // 但同一批子词对短词组问法是唯一的召回桥梁，不能删。
         for (const w of picked) {
           raw.push(w);
           emitted += 1;
@@ -296,8 +309,21 @@ export function tokenize(text) {
   }
   // 英语归一化：停用词 + Porter 词干还原
   const tokens = normalizeEn(raw);
+  // 协同 src/tokenizer.mjs：对包含代码复合标识符（camelCase/snake_case/kebab-case/路径/semver/hex/URL）
+  // 的文本补充结构化 token 与拆分后的子词，既不扰动纯自然语言语料的词长分布，又让代码符号精准命中。
+  if (/[/_\\.:]|(?:[a-z][A-Z])|(?:[A-Z]{2,}[a-z])|0x[0-9a-fA-F]{2,}|[a-zA-Z0-9]+-[a-zA-Z0-9]+/.test(s)) {
+    const existing = new Set(tokens);
+    const extraCodeTokens = codeTokenize(s, { mode: 'index', useJieba: false });
+    for (const ct of extraCodeTokens) {
+      if (!ct || ct.length < 2 || existing.has(ct)) continue;
+      // 跳过纯 CJK 二元组（已由上方 jieba/bigram 处理）
+      if (HAN.test(ct) && !/[a-zA-Z0-9_./:-]/.test(ct)) continue;
+      existing.add(ct);
+      tokens.push(ct);
+    }
+  }
   const strong = tokens.filter((t) => t.length >= 2);
-  // 子词归并表：子词 → 包含它的整词。cutForSearch 把「轮机长」同时吐成 轮机/机长/轮机长，
+  // 子词归并表：子词 → 包含它的整词。cutForSearch 会把三字复合词同时吐成二字子词与三字整词，
   // 三者是同一处证据。全部照收会让 tf 变成三倍（同一句里出现两次 = 6），把只含子词的段落
   // 顶到正确段之上（实测 R10 误命中 c16p11 得分 13.64）；全部删掉又会丢掉子词级召回
   // （R12「硫含量」被整词盖住后 body 覆盖率从 0.56 掉到 0.33，被拒答门误杀）。
@@ -388,16 +414,335 @@ export function finalScore(bm25, mem, nowMs = Date.now(), opts = {}) {
 }
 
 /**
- * RRF 融合：score = Σ 1/(k + rank_i)。k=60 是原论文的默认值，这里也没调——
- * 实测等权就是最优点（wVec=2 反而让 R02 掉出，wVec=3/5 掉 4–5 题）。
- * 两臂各自按自己的序给分，不比较绝对分值：BM25 的分是 jieba 词权重、向量的分是余弦，
- * 两者量纲不可比，唯一可比的是「在各自排序里排第几」。
+ * 通用余弦相似度：Int8Array 走高速定点 cosineInt8，Float32Array / Array 走浮点余弦。
  */
-export function rrfFuse(bm25Ranked, vecRanked, k = 60) {
+export function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length || a.length === 0) return 0;
+  if (a instanceof Int8Array && b instanceof Int8Array) return cosineInt8(a, b);
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    const va = Number(a[i]) || 0;
+    const vb = Number(b[i]) || 0;
+    dot += va * vb;
+    na += va * va;
+    nb += vb * vb;
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom > 0 ? dot / denom : 0;
+}
+
+/**
+ * 构建前置作用域过滤器与空间权重表（支持 workspace:<id> + global 硬过滤与加权）。
+ * 未传入任何空间参数时 enabled=false，保持全量零开销兼容。
+ */
+export function buildScopeGuard(opts = {}) {
+  const explicitSpaces = opts.spaces;
+  const rawSpaceId = opts.spaceId ?? opts.space_id ?? opts.space ?? null;
+  const customWeights = opts.spaceWeights && typeof opts.spaceWeights === 'object' ? opts.spaceWeights : null;
+
+  if (!explicitSpaces && !rawSpaceId && !customWeights) {
+    return {
+      enabled: false,
+      primarySpace: GLOBAL_SPACE_ID,
+      spaces: null,
+      weights: new Map(),
+      allow: () => true,
+      weight: () => 1,
+    };
+  }
+
+  const weights = new Map();
+  const spaces = [];
+  const addSpace = (id, w) => {
+    const normId = String(id || GLOBAL_SPACE_ID).trim() || GLOBAL_SPACE_ID;
+    if (!weights.has(normId)) spaces.push(normId);
+    weights.set(normId, Number.isFinite(w) && w > 0 ? Number(w) : 1);
+  };
+
+  if (Array.isArray(explicitSpaces) && explicitSpaces.length > 0) {
+    const primary = typeof rawSpaceId === 'string' && rawSpaceId.trim()
+      ? rawSpaceId.trim()
+      : (typeof explicitSpaces[0] === 'string' ? explicitSpaces[0] : explicitSpaces[0]?.spaceId ?? GLOBAL_SPACE_ID);
+    for (const item of explicitSpaces) {
+      if (typeof item === 'string') {
+        addSpace(item, spaceWeight(item, primary));
+      } else if (item && typeof item === 'object' && item.spaceId) {
+        addSpace(item.spaceId, item.weight ?? spaceWeight(item.spaceId, primary));
+      }
+    }
+  } else if (explicitSpaces && typeof explicitSpaces === 'object' && !(explicitSpaces instanceof Set)) {
+    for (const [sp, w] of Object.entries(explicitSpaces)) addSpace(sp, Number(w));
+  } else if (explicitSpaces instanceof Set) {
+    const arr = [...explicitSpaces];
+    const primary = rawSpaceId ?? arr[0] ?? GLOBAL_SPACE_ID;
+    for (const sp of arr) addSpace(sp, spaceWeight(sp, primary));
+  } else if (rawSpaceId) {
+    const strict = Boolean(opts.strictSpace || opts.includeGlobal === false);
+    if (strict) {
+      const sp = String(rawSpaceId).trim();
+      addSpace(sp, 1.0);
+    } else {
+      const sp = String(rawSpaceId).trim();
+      if (/^workspace:/i.test(sp) || /^session:/i.test(sp)) {
+        for (const entry of visibleSpaceWeights(sp, opts)) {
+          addSpace(entry.spaceId, entry.weight);
+        }
+      } else {
+        // 自定义或字面 space_id（如 project-x、global 等），直接作为主空间纳入，并附加 global
+        addSpace(sp, 1.0);
+        addSpace(GLOBAL_SPACE_ID, GLOBAL_SPACE_WEIGHT);
+      }
+    }
+  }
+
+  if (customWeights) {
+    for (const [sp, w] of Object.entries(customWeights)) {
+      if (weights.has(sp) || (!explicitSpaces && !rawSpaceId)) {
+        addSpace(sp, Number(w));
+      }
+    }
+  }
+
+  const primarySpace = spaces[0] ?? GLOBAL_SPACE_ID;
+  const allowedSet = new Set(spaces);
+  return {
+    enabled: allowedSet.size > 0,
+    primarySpace,
+    spaces,
+    weights,
+    allow: (docSpaceId) => allowedSet.has(String(docSpaceId || GLOBAL_SPACE_ID)),
+    weight: (docSpaceId) => weights.get(String(docSpaceId || GLOBAL_SPACE_ID)) ?? spaceWeight(docSpaceId, primarySpace),
+  };
+}
+
+/**
+ * 多路 RRF 倒数排名融合：score(doc) = sum_{route}(1 / (k + rank_{route}))，其中 rank_{route} 为 1-based。
+ * 同时兼容历史二路签名 `rrfFuse(bm25Ranked, vecRanked, k = 60)`、
+ * 三路及多路可变参数 `rrfFuse(bm25Ranked, vecRanked, slotRanked, 60)`、
+ * 以及路由数组形式 `rrfFuse([routeA, routeB, routeC], 60)`。
+ */
+export function rrfFuse(...args) {
+  let k = 60;
+  let rawRoutes = args;
+  if (rawRoutes.length >= 2 && typeof rawRoutes[rawRoutes.length - 1] === 'number' && Number.isFinite(rawRoutes[rawRoutes.length - 1])) {
+    k = rawRoutes[rawRoutes.length - 1];
+    rawRoutes = rawRoutes.slice(0, -1);
+  }
+  // 支持 rrfFuse([routeA, routeB, routeC], k) 单数组嵌套调用
+  if (
+    rawRoutes.length === 1 &&
+    Array.isArray(rawRoutes[0]) &&
+    (rawRoutes[0].length === 0 || Array.isArray(rawRoutes[0][0]) || (rawRoutes[0][0] && typeof rawRoutes[0][0] === 'object' && Array.isArray(rawRoutes[0][0].ids)))
+  ) {
+    rawRoutes = rawRoutes[0];
+  }
+
   const m = new Map();
-  bm25Ranked.forEach((id, i) => m.set(id, (m.get(id) ?? 0) + 1 / (k + i + 1)));
-  vecRanked.forEach((id, i) => m.set(id, (m.get(id) ?? 0) + 1 / (k + i + 1)));
+  for (const route of rawRoutes) {
+    if (!route) continue;
+    const ids = Array.isArray(route) ? route : Array.isArray(route.ids) ? route.ids : [];
+    const routeWeight = typeof route === 'object' && !Array.isArray(route) && Number.isFinite(route.weight) ? route.weight : 1;
+    const seenInRoute = new Set();
+    let rank = 0;
+    for (const rawId of ids) {
+      if (rawId === null || rawId === undefined) continue;
+      const id = String(rawId);
+      if (seenInRoute.has(id)) continue;
+      seenInRoute.add(id);
+      rank += 1;
+      m.set(id, (m.get(id) ?? 0) + routeWeight / (k + rank));
+    }
+  }
   return m;
+}
+
+const GENERIC_SLOT_ATTRS = new Set([
+  '状态', '时间', '数值', '结果', '情况', '配置', '版本', '端口', '地址', '数量', '大小', '名称', '类型', '参数', '值',
+  'status', 'state', 'time', 'value', 'version', 'port', 'host', 'url', 'name', 'type', 'count', 'size',
+]);
+
+const SLOT_STRONG_SUB_CACHE = new Map();
+
+/**
+ * 路 C：entity_slots 槽位图匹配（对接 slots.mjs 与 store.listEntitySlots / store.querySlots / 内存槽位表）。
+ * 按 (entity, attr, value) 结构化图边匹配度排序返回文档 ID 列表及详细命中记录。
+ */
+export function matchEntitySlots(queries, opts = {}) {
+  const qList = (Array.isArray(queries) ? queries : [queries])
+    .map((q) => String(q ?? '').trim())
+    .filter(Boolean);
+  if (!qList.length) return { rankedIds: [], hits: [] };
+
+  const scopeGuard = opts.scopeGuard ?? buildScopeGuard(opts);
+  const topN = Number.isInteger(opts.topN) && opts.topN > 0 ? opts.topN : 40;
+  const store = opts.store ?? null;
+  const memSlots = Array.isArray(opts.slots) ? opts.slots : [];
+
+  // 1. 提取查询中的槽位线索：结构化槽位 + 词元集合 + 归一化数值集合
+  const parsedSlots = [];
+  const qNormStrings = [];
+  const strongTokens = new Set();
+  const normValues = new Set();
+
+  for (const q of qList) {
+    const qLower = q.normalize('NFKC').toLowerCase();
+    qNormStrings.push(qLower);
+    for (const s of extractSlots(q)) parsedSlots.push(s);
+    for (const t of tokenize(q).strong) strongTokens.add(t.toLowerCase());
+    for (const ct of codeTokenize(q, { mode: 'query', useJieba: false })) {
+      if (ct && ct.length >= 2) strongTokens.add(ct.toLowerCase());
+    }
+    const nv = normalizeValueAndUnit(q);
+    if (nv && nv.unit) normValues.add(`${nv.value}${nv.unit}`.toLowerCase());
+  }
+
+  // 2. 拉取作用域内的候选 entity_slots（优先走 store SQL 索引查询，兼容 listEntitySlots 与 querySlots）
+  let candidateSlots = [];
+  const querySlotsFn = store
+    ? (typeof store.listEntitySlots === 'function'
+      ? store.listEntitySlots.bind(store)
+      : typeof store.querySlots === 'function'
+        ? store.querySlots.bind(store)
+        : null)
+    : null;
+
+  if (querySlotsFn) {
+    const seenSlotIds = new Set();
+    const pushRows = (rows) => {
+      if (!Array.isArray(rows)) return;
+      for (const r of rows) {
+        const key = r.slotId ?? `${r.memoryId}:${r.entity}:${r.attr}:${r.value}`;
+        if (seenSlotIds.has(key)) continue;
+        seenSlotIds.add(key);
+        candidateSlots.push(r);
+      }
+    };
+    const baseFilter = {
+      ...(scopeGuard.enabled && scopeGuard.spaces ? { spaces: scopeGuard.spaces } : {}),
+      activeOnly: opts.includeInactive ? false : true,
+    };
+    // 对解析出的明确实体先走索引精确点查
+    for (const ps of parsedSlots) {
+      const ent = cleanSlotEntity(ps.entity);
+      if (ent) {
+        pushRows(querySlotsFn({ ...baseFilter, entity: ent, limit: 64 }));
+      }
+    }
+    // 补充当前可见作用域的活跃槽位图边（SQLite 索引扫描）
+    pushRows(querySlotsFn({ ...baseFilter, limit: opts.slotScanLimit ?? 600 }));
+  }
+
+  if (memSlots.length) {
+    for (const s of memSlots) {
+      const sp = s.spaceId ?? s.space_id ?? GLOBAL_SPACE_ID;
+      if (scopeGuard.enabled && !scopeGuard.allow(sp)) continue;
+      if (!opts.includeInactive && s.status && s.status !== 'active') continue;
+      candidateSlots.push(s);
+    }
+  }
+
+  if (!candidateSlots.length) return { rankedIds: [], hits: [] };
+
+  // 3. 评估每条槽位边 (entity --attr--> value) 与查询的图匹配得分
+  const bestByMem = new Map();
+  const queryTermMemo = new Map();
+  const matchTerm = (target) => {
+    if (!target) return false;
+    const tl = String(target).normalize('NFKC').toLowerCase().trim();
+    if (!tl) return false;
+    const cached = queryTermMemo.get(tl);
+    if (cached !== undefined) return cached;
+
+    let hit = false;
+    if (qNormStrings.some((qs) => qs.includes(tl)) || strongTokens.has(tl)) {
+      hit = true;
+    } else {
+      // 支持复合实体/属性的子词强匹配（长度≥2 且至少命中核心词），复用模块级分词缓存
+      let sub = SLOT_STRONG_SUB_CACHE.get(tl);
+      if (sub === undefined) {
+        sub = tokenize(tl).strong;
+        if (SLOT_STRONG_SUB_CACHE.size >= 4096) SLOT_STRONG_SUB_CACHE.clear();
+        SLOT_STRONG_SUB_CACHE.set(tl, sub);
+      }
+      if (sub.length >= 2) {
+        let matched = 0;
+        for (const st of sub) {
+          if (strongTokens.has(st) || qNormStrings.some((qs) => qs.includes(st))) matched += 1;
+        }
+        if (matched >= Math.ceil(sub.length * 0.67)) hit = true;
+      }
+    }
+    queryTermMemo.set(tl, hit);
+    return hit;
+  };
+
+  for (const slot of candidateSlots) {
+    const memId = String(slot.memoryId ?? slot.memory_id ?? slot.id ?? '');
+    if (!memId) continue;
+    const sp = String(slot.spaceId ?? slot.space_id ?? GLOBAL_SPACE_ID);
+    if (scopeGuard.enabled && !scopeGuard.allow(sp)) continue;
+
+    const ent = cleanSlotEntity(slot.entity ?? '');
+    const attr = cleanSlotAttr(slot.attr ?? '');
+    const val = String(slot.value ?? '').trim();
+    const unit = String(slot.unit ?? '').trim();
+
+    const entHit = ent ? matchTerm(ent) : false;
+    const attrHit = attr ? matchTerm(attr) : false;
+    const fullVal = unit && !val.endsWith(unit) ? `${val}${unit}` : val;
+    const valHit = fullVal.length >= 2
+      ? (matchTerm(fullVal) || normValues.has(fullVal.toLowerCase()))
+      : false;
+
+    // 过滤泛化属性单边误命中：仅有泛化属性词但无实体且无特定值时不入路 C
+    if (!entHit && !(attrHit && valHit) && !(attrHit && attr.length >= 3 && !GENERIC_SLOT_ATTRS.has(attr.toLowerCase()))) {
+      continue;
+    }
+
+    let rawScore = 0;
+    if (entHit) rawScore += 3.0;
+    if (attrHit) rawScore += 2.5;
+    if (valHit) rawScore += 2.0;
+    if (entHit && attrHit) rawScore += 4.0; // (Entity, Attr) 图边精确锁定加成
+    if (entHit && attrHit && valHit) rawScore += 2.0;
+
+    // 若查询解析出了同槽位结构，额外加权
+    for (const ps of parsedSlots) {
+      if (ps.entity && ent && ps.entity.toLowerCase() === ent.toLowerCase()) rawScore += 1.5;
+      if (ps.attr && attr && ps.attr.toLowerCase() === attr.toLowerCase()) rawScore += 1.5;
+    }
+
+    if (rawScore <= 0) continue;
+    const conf = Number.isFinite(slot.confidence) ? Math.max(0.1, Number(slot.confidence)) : 1.0;
+    const finalSlotScore = rawScore * conf * scopeGuard.weight(sp);
+
+    const prev = bestByMem.get(memId);
+    if (!prev || finalSlotScore > prev.score) {
+      bestByMem.set(memId, {
+        memoryId: memId,
+        spaceId: sp,
+        entity: ent,
+        attr,
+        value: val,
+        unit,
+        score: finalSlotScore,
+        entHit,
+        attrHit,
+        valHit,
+      });
+    }
+  }
+
+  const hits = [...bestByMem.values()]
+    .sort((a, b) => b.score - a.score || a.memoryId.localeCompare(b.memoryId))
+    .slice(0, topN);
+
+  return {
+    rankedIds: hits.map((h) => h.memoryId),
+    hits,
+  };
 }
 
 /**
@@ -502,13 +847,56 @@ function fillFromScored(scored, o, query) {
   const out = [];
   const ordered = [];
   let chars = 0;
-  const push = (s) => {
-    if (picked.has(s.idx) || out.length >= o.limit) return;
-    if (chars + s.doc.text.length > o.maxChars) return;
+  const dedupeSlot = o.dedupeSlotKey !== false;
+  const maxPerSlotKey = Number.isInteger(o.maxPerSlotKey) && o.maxPerSlotKey > 0 ? o.maxPerSlotKey : 1;
+  const maxPerEntity = Number.isInteger(o.maxPerEntity) && o.maxPerEntity > 0 ? o.maxPerEntity : Infinity;
+  const slotCounts = new Map();
+  const entityCounts = new Map();
+  const deferredForDiversity = [];
+
+  const getSlotGroupKey = (doc) => {
+    const sk = doc?.slotKey ?? doc?.slot_key ?? null;
+    if (!sk) return null;
+    return o.dedupeSlotAcrossSpaces === false
+      ? `${doc.spaceId ?? GLOBAL_SPACE_ID}::${sk}`
+      : String(sk);
+  };
+  const getEntityPrefix = (doc) => {
+    const sk = doc?.slotKey ?? doc?.slot_key ?? null;
+    if (!sk) return null;
+    const sep = String(sk).indexOf('::');
+    return sep > 0 ? String(sk).slice(0, sep) : null;
+  };
+
+  const tryAccept = (s, ignoreEntityCap = false) => {
+    if (picked.has(s.idx) || out.length >= o.limit) return false;
+    if (chars + s.doc.text.length > o.maxChars) return false;
+    if (dedupeSlot) {
+      const sk = getSlotGroupKey(s.doc);
+      if (sk) {
+        const used = slotCounts.get(sk) ?? 0;
+        if (used >= maxPerSlotKey) return false;
+      }
+    }
+    const entPrefix = getEntityPrefix(s.doc);
+    if (!ignoreEntityCap && entPrefix && maxPerEntity < Infinity) {
+      const entUsed = entityCounts.get(entPrefix) ?? 0;
+      if (entUsed >= maxPerEntity) {
+        deferredForDiversity.push(s);
+        return false;
+      }
+    }
+    if (dedupeSlot) {
+      const sk = getSlotGroupKey(s.doc);
+      if (sk) slotCounts.set(sk, (slotCounts.get(sk) ?? 0) + 1);
+    }
+    if (entPrefix) entityCounts.set(entPrefix, (entityCounts.get(entPrefix) ?? 0) + 1);
     picked.add(s.idx);
     out.push(s);
     chars += s.doc.text.length;
+    return true;
   };
+
   for (const { chapter } of chapterRank) {
     const list = perChapter.get(chapter).slice().sort((a, b) => {
       if (pri) {
@@ -519,7 +907,12 @@ function fillFromScored(scored, o, query) {
       }
       return b.score - a.score;
     });
-    for (const s of list) { ordered.push(s); push(s); }
+    for (const s of list) { ordered.push(s); tryAccept(s, false); }
+  }
+  // 若开启了实体多样性软上限且预算尚有富余，用延后项补齐剩余空间（仍遵守 slot_key 硬去重）
+  for (const s of deferredForDiversity) {
+    if (out.length >= o.limit) break;
+    tryAccept(s, true);
   }
 
   if (out.length && out.length < o.limit && o.maxChars - chars >= 16) {
@@ -550,10 +943,18 @@ function fillFromScored(scored, o, query) {
 class SearchIndex {
   /** @type {Map<string, Int8Array>|null} 文档向量（int8），由 store 注入；缺省为 null = 纯 BM25 */
   #vectors = null;
+  /** @type {object|null} 绑定的持久化 SQLiteStore（用于路 B searchVectors 与路 C listEntitySlots/querySlots） */
+  #store = null;
+  /** @type {Array<object>|null} 显式注入的槽位表 */
+  #slots = null;
+  /** @type {Array<object>|null} 内存文档懒抽取的槽位缓存 */
+  #lazySlots = null;
 
   /** @param {object} [opts] SEARCH_DEFAULTS 覆盖项 */
   constructor(opts = {}) {
     this.opts = { ...SEARCH_DEFAULTS, ...opts };
+    if (opts.store) this.#store = opts.store;
+    if (Array.isArray(opts.slots)) this.#slots = opts.slots.slice();
     /** @type {Array<object>} 文档表：一条 = 一个片段（段） */
     this.docs = [];
     /** @type {Map<string, Array<[number, number]>>} token → [docIdx, tf] */
@@ -585,11 +986,18 @@ class SearchIndex {
     }
     const idx = this.docs.length;
     const nowMs = normNum(mem?.createdAt, Date.now());
+    const id = String(mem?.id ?? `doc-${idx}`);
+    const spaceId = String(mem?.spaceId ?? mem?.space_id ?? GLOBAL_SPACE_ID);
+    const slotKey = mem?.slotKey ?? mem?.slot_key ?? null;
     const doc = {
-      id: String(mem?.id ?? `doc-${idx}`),
+      id,
       text,
-      chapter: normNum(mem?.source?.chapter, 0),
-      para: normNum(mem?.source?.para, idx + 1),
+      spaceId,
+      slotKey,
+      category: mem?.category ?? null,
+      status: mem?.status ?? 'active',
+      chapter: normNum(mem?.source?.chapter ?? mem?.chapter, 0),
+      para: normNum(mem?.source?.para ?? mem?.para, idx + 1),
       kind: mem?.kind ?? 'fact',
       len: tokens.length,
       tf,
@@ -599,6 +1007,13 @@ class SearchIndex {
       lastAccessed: normNum(mem?.lastAccessed, nowMs),
       supersededBy: mem?.supersededBy ?? null,
     };
+    if (Array.isArray(mem?.slots) && mem.slots.length) {
+      if (!this.#slots) this.#slots = [];
+      for (const s of mem.slots) {
+        this.#slots.push({ ...s, memoryId: s.memoryId ?? id, spaceId: s.spaceId ?? spaceId });
+      }
+    }
+    this.#lazySlots = null;
     this.docs.push(doc);
     this._totalLen += doc.len;
     for (const [t, f] of tf) {
@@ -629,20 +1044,75 @@ class SearchIndex {
     return this;
   }
 
+  /** 写入单条文档向量到内存向量表。 */
+  setVector(id, vec) {
+    if (!id || !vec) return this;
+    if (!this.#vectors) this.#vectors = new Map();
+    this.#vectors.set(String(id), vec);
+    return this;
+  }
+
+  /** 清空内存文档向量表。 */
+  clearVectors() {
+    if (this.#vectors) this.#vectors.clear();
+    this.#vectors = null;
+    return this;
+  }
+
+  /** 绑定持久化 store（供三路 RRF 的向量检索与 entity_slots SQL 索引查询使用）。 */
+  setStore(store) {
+    this.#store = store ?? null;
+    return this;
+  }
+
+  /** 显式注入内存 entity_slots 边列表。 */
+  setSlots(slots) {
+    this.#slots = Array.isArray(slots) ? slots.slice() : null;
+    return this;
+  }
+
   /** 向量臂是否就绪（只读诊断用）。 */
   get hasVectors() {
-    return Boolean(this.#vectors && this.#vectors.size);
+    return Boolean((this.#vectors && this.#vectors.size) || this.#store);
+  }
+
+  /** 懒构建内存文档的 entity_slots 图边（仅在无外部 store 时供路 C 使用）。 */
+  #getMemorySlots(autoExtract = true) {
+    if (this.#slots && this.#slots.length) return this.#slots;
+    if (!autoExtract) return [];
+    if (this.#lazySlots) return this.#lazySlots;
+    const built = [];
+    for (const d of this.docs) {
+      if (d.status && d.status !== 'active') continue;
+      for (const s of extractSlots(d.text)) {
+        built.push({
+          ...s,
+          memoryId: d.id,
+          spaceId: d.spaceId,
+          status: d.status,
+        });
+      }
+    }
+    this.#lazySlots = built;
+    return built;
   }
 
   /** BM25 命中 → 混合分候选，按 score 降序。search 与 searchAsync 共用。 */
-  #buildScored(acc, nowMs, o) {
+  #buildScored(acc, nowMs, o, scopeGuard = null) {
     // 强命中闸门：只命中单汉字的候选一律不进结果
     const scored = [];
     for (const [docIdx, e] of acc) {
       if (e.strongHits === 0 || e.bm25 <= 0) continue;
       const d = this.docs[docIdx];
       const mix = finalScore(e.bm25, d, nowMs, o);
-      scored.push({ idx: docIdx, doc: d, ...mix });
+      const wSpace = scopeGuard?.enabled ? scopeGuard.weight(d.spaceId) : 1;
+      scored.push({
+        idx: docIdx,
+        doc: d,
+        ...mix,
+        score: mix.score * wSpace,
+        spaceWeight: wSpace,
+      });
     }
     scored.sort(
       (a, b) => b.score - a.score || b.bm25 - a.bm25 || a.doc.id.localeCompare(b.doc.id),
@@ -666,10 +1136,11 @@ class SearchIndex {
 
   /**
    * 只走倒排：按查询 token 拉 posting list，不遍历 this.docs。
-   * 返回 Map<docIdx, {bm25, strongHits}> 与工作量统计。
+   * 支持前置 space_id 硬过滤。返回 Map<docIdx, {bm25, strongHits}> 与工作量统计。
    */
   scoreTerms(query, opts = {}) {
     const o = { ...this.opts, ...opts };
+    const scopeGuard = opts.scopeGuard ?? buildScopeGuard(o);
     const { tokens, strong, covers: qCovers } = tokenize(query);
     const qAll = new Set(tokens);
     // 查询侧同样归并：整词已在，子词不再单独加一次分（否则一次提问被数三遍）。
@@ -695,6 +1166,8 @@ class SearchIndex {
         const tf = list[k][1];
         postingsVisited += 1;
         const d = this.docs[docIdx];
+        if (scopeGuard.enabled && !scopeGuard.allow(d.spaceId)) continue;
+        if (!o.includeInactive && d.status && d.status !== 'active') continue;
         const denom = tf + o.k1 * (1 - o.b + (o.b * d.len) / (this.avgdl || 1));
         const add = disc * idf * ((tf * (o.k1 + 1)) / (denom || 1));
         let e = acc.get(docIdx);
@@ -713,25 +1186,23 @@ class SearchIndex {
         docsScored: acc.size,
         docsTotal: this.n,
         scanRatio: this.n ? Number((acc.size / this.n).toFixed(4)) : 0,
+        ...(scopeGuard.enabled ? { spaces: scopeGuard.spaces } : {}),
       },
     };
   }
 
   /**
-   * 检索主入口。
-   * 两阶段：段级 BM25 → 章级聚合选章 → 章内按混合分装填预算。
-   *
-   * 章级聚合不是冗余步骤：段级 top-K 单独跑只能到 0.978（R44/R20 掉出），
-   * 因为一道题的证据往往散在同一章的两三段里，而其中只有一段与查询共享 bigram。
-   * 先聚章再取章内段，等于承认「同章上下文是相关的」，实测把 0.978 拉到 0.989。
+   * 同步检索主入口。
+   * 两阶段：前置作用域硬过滤 + 段级 BM25 → 章级聚合选章 → 章内按混合分与 slot_key 去重装填预算。
    */
   search(query, opts = {}) {
     const o = { ...this.opts, ...opts };
+    const scopeGuard = opts.scopeGuard ?? buildScopeGuard(o);
     const nowMs = normNum(opts.now ?? Date.now(), Date.now());
     const t0 = process.hrtime.bigint();
 
-    const { acc, scan } = this.scoreTerms(query, o);
-    const scored = this.#buildScored(acc, nowMs, o);
+    const { acc, scan } = this.scoreTerms(query, { ...o, scopeGuard });
+    const scored = this.#buildScored(acc, nowMs, o, scopeGuard);
 
     if (!scored.length) {
       const emptyNow = process.hrtime.bigint();
@@ -749,6 +1220,9 @@ class SearchIndex {
     const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
     const hits = out.map((s) => ({
       id: s.doc.id,
+      spaceId: s.doc.spaceId,
+      slotKey: s.doc.slotKey,
+      category: s.doc.category,
       chapter: s.doc.chapter,
       para: s.doc.para,
       text: s.doc.text,
@@ -780,63 +1254,36 @@ class SearchIndex {
   }
 
   /**
-   * 异步融合检索：BM25 臂 + 向量臂 → RRF → 同一套装填。
-   *
-   * 为什么不改 search()：0.989 与全部单测压在同步路径上，异步会污染整条链。
-   * 这里只做「多一臂」：没有向量、没有 key、超时、429，任何情况都退回 scored 原序，
-   * 降级对调用方不可见（不抛错、不改返回结构）。
-   */
-  /**
-   * 查询扩展检索：把长问句拆成 2–4 条子查询，各跑一次 BM25，候选取并集后按秩合并。
-   *
-   * 为什么不是「把子查询的分数相加」：各子查询的 BM25 量纲不同（短查询 idf 更高），
-   * 直接相加等于让最短的子查询说了算。这里用「名次倒数 × 权重」做合并分，原 query 权重 1.0、
-   * 子查询 0.7——同一段被多条子查询命中会自然累加，这就是「多角度命中」的加分。
-   *
-   * 合并后的 scored 交给同一个 fillFromScored（章级聚合 + 2000 字预算 + limit 16），
-   * 所以召回路径的装填语义没有被改写，只是候选来源多了一路。
-   *
-   * 降级可观测：返回值里的 `expansion` 一定带 expanded / degraded / queries / ms，
-   * 不允许出现「不知道扩展跑没跑」的状态（t25 的静默降级就是这么埋掉整轮实验的）。
+   * 查询扩展检索（向下兼容接口）：原 query 结果为底，子查询补尾。
    */
   async searchExpanded(query, opts = {}) {
     const o = { ...this.opts, ...opts };
-    const nowMs = normNum(opts.now ?? Date.now(), Date.now());
     const t0 = process.hrtime.bigint();
-    const expandFn = opts.expandFn ?? defaultExpand;
-    let qe = { queries: [String(query)], expanded: false, degraded: 'empty', ms: 0 };
-
-    try {
-      const r = await expandFn(query, {
-        timeoutMs: o.expandTimeoutMs,
-        cacheTtlMs: o.expandCacheTtlMs,
-        maxQueries: o.expandMaxQueries,
-        fetchImpl: opts.expandFetch,
-        cache: opts.expandCache,
-      });
-      if (r && Array.isArray(r.queries) && r.queries.length) qe = r;
-    } catch {
-      qe = { queries: [String(query)], expanded: false, degraded: 'http', ms: 0 };
-    }
+    const qe = await expandForHybrid(query, {
+      expandFn: opts.expandFn ?? defaultExpand,
+      timeoutMs: o.expandTimeoutMs,
+      cacheTtlMs: o.expandCacheTtlMs,
+      maxQueries: o.expandMaxQueries,
+      fetchImpl: opts.expandFetch,
+      cache: opts.expandCache,
+      model: o.expandModel,
+    });
 
     if (!qe.expanded || qe.queries.length < 2) {
       const single = this.search(query, o);
       return { ...single, expansion: { expanded: false, degraded: qe.degraded, queries: qe.queries, ms: qe.ms } };
     }
 
-    // ── 原 query 的结果是底，子查询只做补尾 ─────────────────────────────────
-    // 第一版按「名次倒数 × 权重」把四路合并后统一排序，实测综合题 0.583 → 0.500：
-    // S03 从 1.00 掉到 0.50、S09 从 1.00 掉到 0.00 —— 子查询各有自己的第 1 名，
-    // 三条子查询的 0.7 一累加就压过了原 query 的 1.0，把原本正确的段挤出预算。
-    // 结论：扩展不能改写原 query 的排序，只能占用它没花掉的预算。
-    const baseRes = this.search(query, o);
+    const scopeGuard = buildScopeGuard(o);
+    const baseRes = this.search(query, { ...o, scopeGuard });
     const baseIds = new Set(baseRes.hits.map((h) => h.id));
     let chars = baseRes.chars;
     const extra = [];
     const idxById2 = new Map(this.docs.map((d, i) => [d.id, i]));
+    const seenSlots = new Set(baseRes.hits.map((h) => h.slotKey).filter(Boolean));
     const merged2 = new Map();
     qe.queries.slice(1).forEach((sub, qi) => {
-      const r = this.search(sub, { ...o, maxChars: Number.MAX_SAFE_INTEGER, limit: 1e6 });
+      const r = this.search(sub, { ...o, scopeGuard, maxChars: Number.MAX_SAFE_INTEGER, limit: 1e6 });
       r.hits.forEach((h, rank) => {
         if (baseIds.has(h.id)) return;
         const add = 1 / (1 + rank + qi * 2);
@@ -851,9 +1298,12 @@ class SearchIndex {
       const di = idxById2.get(id);
       if (di === undefined) continue;
       const doc = this.docs[di];
+      if (o.dedupeSlotKey !== false && doc.slotKey && seenSlots.has(doc.slotKey)) continue;
       if (chars + doc.text.length > o.maxChars) continue;
+      if (doc.slotKey) seenSlots.add(doc.slotKey);
       extra.push({
-        id: doc.id, chapter: doc.chapter, para: doc.para, text: doc.text,
+        id: doc.id, spaceId: doc.spaceId, slotKey: doc.slotKey, category: doc.category,
+        chapter: doc.chapter, para: doc.para, text: doc.text,
         chars: doc.text.length, truncated: false, score: merged2.get(id),
         bm25: 0, rrf: null, weight: 1, decay: 1, ageDays: 0, tier: 'warm',
       });
@@ -870,58 +1320,264 @@ class SearchIndex {
     };
   }
 
+  /**
+   * 三路 RRF 混合检索主引擎（彻底解除 expand / vector / slot / rerank / llmSelect 互斥限制）：
+   * - 前置 space_id 硬过滤与空间加权（workspace:<id> 1.0 + global 0.85）；
+   * - 路 A：BM25（支持协同 query-expand 子查询扩展）；
+   * - 路 B：Int8 向量检索（对接 store.searchVectors / store.vectorSearch 或内存 cosineSimilarity）；
+   * - 路 C：entity_slots 槽位图匹配（对接 slots.mjs 与 store.listEntitySlots / store.querySlots 或内存槽位图）；
+   * - 三路统一倒数排名融合 RRF（k=60）：score(doc) = sum_{route}(1 / (k + rank_{route}))；
+   * - 可选在线介入 rerank.mjs（超时/异常优雅回退 RRF）与 llm-select.mjs；
+   * - 按 slot_key 去重与多样性装填。
+   */
   async searchAsync(query, opts = {}) {
     const o = { ...this.opts, ...opts };
+    const scopeGuard = buildScopeGuard(o);
+    const store = o.store ?? this.#store ?? null;
     const nowMs = normNum(opts.now ?? Date.now(), Date.now());
+    const rrfK = Number.isFinite(o.rrfK) && o.rrfK > 0 ? o.rrfK : 60;
     const t0 = process.hrtime.bigint();
-    const { acc, scan } = this.scoreTerms(query, o);
-    const scored = this.#buildScored(acc, nowMs, o);
 
-    let fused = scored;
-    const vecInfo = { used: false, vecCandidates: 0, rrfK: o.rrfK ?? 60 };
-    if (this.#vectors && this.#vectors.size) {
+    // ── Step 0: 可选协同查询扩展（不再与 vector / slot / llmSelect 互斥） ─────────
+    let expansion = { expanded: false, degraded: 'disabled', queries: [String(query ?? '')], ms: 0 };
+    if (o.expand || typeof opts.expandFn === 'function') {
+      expansion = await expandForHybrid(query, {
+        expandFn: opts.expandFn ?? defaultExpand,
+        timeoutMs: o.expandTimeoutMs,
+        cacheTtlMs: o.expandCacheTtlMs,
+        maxQueries: o.expandMaxQueries,
+        fetchImpl: opts.expandFetch,
+        cache: o.expandCache,
+        model: o.expandModel,
+      });
+    }
+    const queryList = expansion.queries?.length ? expansion.queries : [String(query ?? '')];
+
+    // ── 路 A: BM25（含前置 space_id 过滤 + 扩展子查询补尾） ─────────────────────
+    const { acc, scan } = this.scoreTerms(query, { ...o, scopeGuard });
+    const scored = this.#buildScored(acc, nowMs, o, scopeGuard);
+    const bm25ArmSet = new Set(
+      scored.length
+        ? fillFromScored(
+            scored,
+            { ...o, dedupeSlotKey: false, maxChars: Number.MAX_SAFE_INTEGER, limit: o.bm25TopN ?? 60 },
+            query,
+          ).out.map((s) => s.doc.id)
+        : [],
+    );
+    const extraScoredById = new Map();
+    if (expansion.expanded && queryList.length > 1) {
+      for (let qi = 1; qi < queryList.length; qi += 1) {
+        const subQ = queryList[qi];
+        const subAcc = this.scoreTerms(subQ, { ...o, scopeGuard }).acc;
+        const subScored = this.#buildScored(subAcc, nowMs, o, scopeGuard);
+        for (const s of subScored.slice(0, 24)) {
+          if (!bm25ArmSet.has(s.doc.id)) bm25ArmSet.add(s.doc.id);
+          if (!extraScoredById.has(s.doc.id)) extraScoredById.set(s.doc.id, { ...s, score: s.score * 0.7 });
+        }
+      }
+    }
+    const bm25Arm = [...bm25ArmSet];
+
+    // ── 路 B: Int8 向量检索（对接 store.searchVectors / vectorSearch 或内存向量） ──
+    const vecMap = o.vectors instanceof Map ? o.vectors : this.#vectors;
+    const vecSearchFn = store
+      ? (typeof store.searchVectors === 'function'
+        ? store.searchVectors.bind(store)
+        : typeof store.vectorSearch === 'function'
+          ? store.vectorSearch.bind(store)
+          : null)
+      : null;
+    const vecInfo = { used: false, vecCandidates: 0, rrfK };
+    let vecRanked = [];
+    const storeDocCache = new Map();
+
+    if (o.vector !== false && (o.queryVector || (vecMap && vecMap.size) || vecSearchFn)) {
       try {
-        const embedFn = opts.embed ?? defaultEmbed;
-        // defaultEmbed 是 vector.mjs 的批量接口 embed(texts[], opts) —— 直接传字符串
-        // 会在内部 `texts.map` 上抛 TypeError，被下面的 catch 吞掉，于是**每次都静默降级回
-        // 纯 BM25**（t25 判定实验发现：vector.used 恒为 false，融合从未真正跑过）。
-        // 这里统一按批量接口调用再取第一条，同时兼容注入的「单条」实现（返回向量本身）。
-        const rawVec = await embedFn([query], { dims: o.dims, cacheDir: o.cacheDir });
-        const qv = Array.isArray(rawVec) ? (rawVec[0] ?? null) : rawVec;
+        let qv = o.queryVector ?? null;
+        if (!qv && (typeof opts.embed === 'function' || (vecMap && vecMap.size) || o.vector === true)) {
+          const embedFn = opts.embed ?? defaultEmbed;
+          const rawVec = await embedFn([query], { dims: o.dims, cacheDir: o.cacheDir });
+          qv = Array.isArray(rawVec) ? (rawVec[0] ?? null) : rawVec;
+        }
         if (qv) {
-          // 向量臂取 top-vecTopN：全库排序太噪，40 是实测里「能补到 BM25 漏掉的目标段、
-          // 又不会把噪声段塞满融合池」的位置。
-          const vecRanked = [...this.#vectors.entries()]
-            .map(([id, v]) => ({ id, cos: cosineInt8(qv, v) }))
-            .sort((a, b) => b.cos - a.cos)
-            .slice(0, o.vecTopN ?? 40)
-            .map((x) => x.id);
-          // BM25 臂用 search() 的实际返回序（含章级聚合后的装填序），不是全部 scored：
-          // 直接拿 scored 会把几百个低分段也塞进臂 1，把向量的高名次信号稀释掉。
-          const bm25Arm = this.search(query, { ...o, maxChars: Number.MAX_SAFE_INTEGER }).hits.map((h) => h.id);
-          const rrf = rrfFuse(bm25Arm, vecRanked, o.rrfK ?? 60);
-          const byId = new Map(scored.map((x) => [x.doc.id, x]));
-          const idxById = new Map(this.docs.map((d, i) => [d.id, i]));
-          // 两臂并集：向量臂可能召回 BM25 完全没有候选的段（这是加向量的全部意义），
-          // 这些段要在这里补出 doc 条目，而不是被 byId 过滤掉。
-          fused = [...rrf.entries()]
-            .map(([id, r]) => {
-              const exist = byId.get(id);
-              if (exist) return { ...exist, rrf: r, score: r };
-              const di = idxById.get(id);
-              if (di === undefined) return null;
-              const d = this.docs[di];
-              const mix = finalScore(0, d, nowMs, o);
-              return { idx: di, doc: d, ...mix, bm25: 0, rrf: r, score: r };
-            })
-            .filter(Boolean)
-            .sort((a, b) => b.score - a.score || a.doc.id.localeCompare(b.doc.id));
-          vecInfo.used = true;
-          vecInfo.vecCandidates = vecRanked.length;
+          const vecTopN = o.vecTopN ?? 40;
+          if (vecSearchFn) {
+            const rows = vecSearchFn(qv, {
+              topK: vecTopN,
+              minScore: o.minVecScore ?? -1,
+              ...(scopeGuard.enabled && scopeGuard.spaces ? { spaces: scopeGuard.spaces } : {}),
+            });
+            if (Array.isArray(rows) && rows.length) {
+              const weightedRows = rows
+                .filter((r) => !scopeGuard.enabled || scopeGuard.allow(r.spaceId ?? r.space_id))
+                .map((r) => {
+                  const id = String(r.memoryId ?? r.id);
+                  const sp = String(r.spaceId ?? r.space_id ?? GLOBAL_SPACE_ID);
+                  storeDocCache.set(id, r);
+                  return { id, sim: Number(r.score ?? 0) * scopeGuard.weight(sp) };
+                })
+                .sort((a, b) => b.sim - a.sim)
+                .slice(0, vecTopN);
+              vecRanked = weightedRows.map((x) => x.id);
+            }
+          }
+          if (!vecRanked.length && vecMap && vecMap.size) {
+            const docByIdLocal = new Map(this.docs.map((d) => [d.id, d]));
+            vecRanked = [...vecMap.entries()]
+              .filter(([id]) => {
+                if (!scopeGuard.enabled) return true;
+                const d = docByIdLocal.get(String(id));
+                return d ? scopeGuard.allow(d.spaceId) : true;
+              })
+              .map(([id, v]) => {
+                const d = docByIdLocal.get(String(id));
+                const wSp = d && scopeGuard.enabled ? scopeGuard.weight(d.spaceId) : 1;
+                return { id: String(id), cos: cosineSimilarity(qv, v) * wSp };
+              })
+              .sort((a, b) => b.cos - a.cos)
+              .slice(0, vecTopN)
+              .map((x) => x.id);
+          }
+          if (vecRanked.length > 0 || qv) {
+            vecInfo.used = vecRanked.length > 0 || Boolean(vecMap && vecMap.size);
+            vecInfo.vecCandidates = vecRanked.length;
+          }
         }
       } catch {
-        fused = scored; // 静默降级：任何异常都回到纯 BM25 顺序
+        vecRanked = [];
       }
+    }
+
+    // ── 路 C: entity_slots 槽位图匹配（对接 slots.mjs 与 store SQL 索引/内存槽位） ──
+    const slotInfo = { used: false, slotCandidates: 0 };
+    let slotRanked = [];
+    const enableSlotRoute = o.slotRoute !== false && (
+      Boolean(store) ||
+      Boolean(Array.isArray(o.slots) && o.slots.length) ||
+      Boolean(this.#slots && this.#slots.length) ||
+      o.slotRoute === true ||
+      this.docs.some((d) => Boolean(d.slotKey))
+    );
+    if (enableSlotRoute) {
+      try {
+        const memSlots = Array.isArray(o.slots)
+          ? o.slots
+          : store
+            ? (this.#slots ?? [])
+            : this.#getMemorySlots(true);
+        const slotMatch = matchEntitySlots(queryList, {
+          store,
+          slots: memSlots,
+          scopeGuard,
+          topN: o.slotTopN ?? 40,
+          slotScanLimit: o.slotScanLimit,
+          includeInactive: o.includeInactive,
+        });
+        slotRanked = slotMatch.rankedIds;
+        slotInfo.used = slotRanked.length > 0;
+        slotInfo.slotCandidates = slotRanked.length;
+      } catch {
+        slotRanked = [];
+      }
+    }
+
+    // ── 三路统一 RRF 融合（k=60）：score(doc) = sum_{route}(1 / (k + rank_{route})) ──
+    const byId = new Map(scored.map((x) => [x.doc.id, x]));
+    for (const [id, ex] of extraScoredById) {
+      if (!byId.has(id)) byId.set(id, ex);
+    }
+    const idxById = new Map(this.docs.map((d, i) => [d.id, i]));
+    const routeMembership = new Map();
+    const markRoute = (ids, routeName) => {
+      for (const id of ids) {
+        let s = routeMembership.get(id);
+        if (!s) { s = []; routeMembership.set(id, s); }
+        if (!s.includes(routeName)) s.push(routeName);
+      }
+    };
+    markRoute(bm25Arm, 'bm25');
+    markRoute(vecRanked, 'vector');
+    markRoute(slotRanked, 'slot');
+
+    let fused = scored;
+    if (expansion.expanded && extraScoredById.size > 0 && !vecRanked.length && !slotRanked.length && !o.forceRrf) {
+      fused = [...scored, ...[...extraScoredById.values()].filter((x) => !scored.some((s) => s.doc.id === x.doc.id))];
+    }
+
+    if (vecRanked.length > 0 || slotRanked.length > 0 || o.forceRrf) {
+      const activeRoutes = [bm25Arm, vecRanked, slotRanked].filter((r) => r.length > 0);
+      const rrf = rrfFuse(activeRoutes, rrfK);
+      let virtualIdx = this.docs.length + 100000;
+
+      const resolveCandidateDoc = (id) => {
+        const di = idxById.get(id);
+        if (di !== undefined) return { di, doc: this.docs[di] };
+        let rawMem = storeDocCache.get(id);
+        if (!rawMem && store && typeof store.get === 'function') {
+          rawMem = store.get(id);
+        }
+        if (!rawMem || !rawMem.text) return null;
+        const sp = String(rawMem.spaceId ?? rawMem.space_id ?? GLOBAL_SPACE_ID);
+        if (scopeGuard.enabled && !scopeGuard.allow(sp)) return null;
+        const vIdx = virtualIdx++;
+        return {
+          di: vIdx,
+          doc: {
+            id: String(rawMem.id ?? rawMem.memoryId ?? id),
+            text: String(rawMem.text),
+            spaceId: sp,
+            slotKey: rawMem.slotKey ?? rawMem.slot_key ?? null,
+            category: rawMem.category ?? null,
+            status: rawMem.status ?? 'active',
+            chapter: normNum(rawMem?.source?.chapter ?? rawMem?.chapter, 0),
+            para: normNum(rawMem?.source?.para ?? rawMem?.para, vIdx),
+            kind: rawMem.kind ?? 'fact',
+            len: tokenize(rawMem.text).tokens.length,
+            importance: Math.min(1, Math.max(0, normNum(rawMem.importance, 0.5))),
+            accessCount: Math.max(0, normNum(rawMem.accessCount, 0)),
+            createdAt: normNum(rawMem.createdAt, nowMs),
+            lastAccessed: normNum(rawMem.lastAccessed, nowMs),
+            supersededBy: rawMem.supersededBy ?? null,
+          },
+        };
+      };
+
+      fused = [...rrf.entries()]
+        .map(([id, r]) => {
+          const exist = byId.get(id);
+          const resolved = exist ? { di: exist.idx, doc: exist.doc } : resolveCandidateDoc(id);
+          if (!resolved) return null;
+          const wSpace = scopeGuard.enabled ? scopeGuard.weight(resolved.doc.spaceId) : 1;
+          const weightedRrf = r * wSpace;
+          if (exist) {
+            return {
+              ...exist,
+              rrf: r,
+              score: weightedRrf,
+              spaceWeight: wSpace,
+              routes: routeMembership.get(id) ?? ['bm25'],
+            };
+          }
+          const mix = finalScore(0, resolved.doc, nowMs, o);
+          return {
+            idx: resolved.di,
+            doc: resolved.doc,
+            ...mix,
+            bm25: 0,
+            rrf: r,
+            score: weightedRrf,
+            spaceWeight: wSpace,
+            routes: routeMembership.get(id) ?? [],
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score || (b.bm25 ?? 0) - (a.bm25 ?? 0) || a.doc.id.localeCompare(b.doc.id));
+    } else {
+      fused = fused.map((item) => ({
+        ...item,
+        routes: routeMembership.get(item.doc.id) ?? ['bm25'],
+      }));
     }
 
     if (!fused.length) {
@@ -929,47 +1585,65 @@ class SearchIndex {
         hits: [],
         text: '',
         chars: 0,
-        scan: { ...scan, chaptersConsidered: 0, candidates: 0, vector: vecInfo },
+        scan: { ...scan, chaptersConsidered: 0, candidates: 0, vector: vecInfo, slots: slotInfo },
+        expansion,
         elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
       };
     }
 
-    // ── LLM 在环选段（t27，MEMJUDGE_LLMSELECT=1）────────────────────────
-    // 把 top-N 候选段的原文摊给 chat 模型，让它判「哪几段能回答这个问题」。
-    // 与 reranker 的区别：reranker 打浅层相关度，这里做的是推理（「多绕了 = 航程增加」）。
-    // 只重排、不丢段：选中段置顶，其余按原序补尾；降级时 selection.degraded 有值。
+    // ── Step 4: 在线可选介入 src/rerank.mjs（超时/异常时优雅降级回退 RRF 结果） ────
+    let rerankInfo = { used: false, degraded: 'disabled', ms: 0, candidates: 0 };
+    const shouldRerank = Boolean(o.rerank === true || typeof o.rerankFn === 'function' || (o.rerank !== false && rerankOptIn()));
+    if (shouldRerank) {
+      const rr = await rerankCandidates(query, fused, {
+        topN: o.rerankTopN,
+        poolSize: o.rerankPoolSize,
+        timeoutMs: o.rerankTimeoutMs,
+        cacheTtlMs: o.rerankCacheTtlMs,
+        model: o.rerankModel,
+        fetchImpl: o.rerankFetch,
+        cache: o.rerankCache,
+        apiKey: o.rerankApiKey,
+        rerankFn: o.rerankFn ?? defaultRerank,
+      });
+      fused = rr.items;
+      rerankInfo = { used: rr.used, degraded: rr.degraded, ms: rr.ms, candidates: rr.candidates };
+    }
+
+    // ── Step 5: 可选介入 src/llm-select.mjs（直接消费融合候选池，解除互斥限制） ────
     let selection = { picks: [], degraded: 'empty', ms: 0, tokensIn: 0, tokensOut: 0, pool: 0 };
     if (o.llmSelect) {
-      // 给 LLM 看的池子必须是**章级聚合后的代表段**，不是全局最高分的前 16 段：
-      // 全局 top16 往往整段落在同一两个高章分章里（ch19/ch15），跨章的证据段根本不在里面，
-      // 于是模型只能说「一段都答不了」（实测 12 题 picks 全 0）。改看装填结果后覆盖面才对。
-      const poolRes = this.search(query, { ...o, maxChars: Number.MAX_SAFE_INTEGER, limit: o.selectPool ?? 16 });
-      const pool = poolRes.hits.map((h) => ({ doc: { id: h.id, text: h.text } }));
-      try {
-        const sel = await (o.selectFn ?? defaultSelect)(query, pool.map((s) => s.doc.text), {
-          maxPicks: o.selectMaxPicks,
-          snippetChars: o.selectSnippetChars,
-          poolSize: o.selectPool,
-          timeoutMs: o.selectTimeoutMs,
-          cacheTtlMs: o.selectCacheTtlMs,
-          fetchImpl: o.selectFetch,
-          cache: o.selectCache,
-        });
-        if (sel && Array.isArray(sel.picks)) {
-          selection = sel;
-          if (sel.picks.length) {
-            const ids = sel.picks.map((i) => pool[i]?.doc.id).filter(Boolean);
-            o.priorityIds = new Set(ids);
-          }
-        }
-      } catch {
-        selection = { picks: [], degraded: 'http', ms: 0, tokensIn: 0, tokensOut: 0, pool: pool.length };
+      const poolOrder = fillFromScored(fused, {
+        ...o,
+        dedupeSlotKey: false,
+        maxChars: Number.MAX_SAFE_INTEGER,
+        limit: o.selectPool ?? 16,
+      }, query).out;
+      const sel = await selectFromFused(query, poolOrder, {
+        selectFn: o.selectFn ?? defaultSelect,
+        maxPicks: o.selectMaxPicks,
+        snippetChars: o.selectSnippetChars,
+        poolSize: o.selectPool ?? 16,
+        timeoutMs: o.selectTimeoutMs,
+        cacheTtlMs: o.selectCacheTtlMs,
+        fetchImpl: o.selectFetch,
+        cache: o.selectCache,
+        model: o.selectModel,
+      });
+      selection = sel;
+      if (sel.priorityIds.size > 0) {
+        const mergedPri = new Set(o.priorityIds instanceof Set ? o.priorityIds : []);
+        for (const id of sel.priorityIds) mergedPri.add(id);
+        o.priorityIds = mergedPri;
       }
     }
 
     const { out, chars, chapterRank } = fillFromScored(fused, o, query);
     const hits = out.map((s) => ({
       id: s.doc.id,
+      spaceId: s.doc.spaceId,
+      slotKey: s.doc.slotKey,
+      category: s.doc.category,
       chapter: s.doc.chapter,
       para: s.doc.para,
       text: s.doc.text,
@@ -979,7 +1653,9 @@ class SearchIndex {
       ...(s.window ? { windowStart: s.window.start, windowEnd: s.window.end, startsAtBoundary: s.window.startsAtBoundary } : {}),
       score: s.score,
       bm25: s.bm25,
-      rrf: s.rrf,
+      rrf: s.rrf ?? null,
+      rerankScore: s.rerankScore ?? null,
+      routes: s.routes ?? ['bm25'],
       weight: s.weight,
       decay: s.decay,
       ageDays: s.ageDays,
@@ -995,8 +1671,12 @@ class SearchIndex {
         candidates: fused.length,
         chaptersPicked: chapterRank.map((c) => c.chapter),
         vector: vecInfo,
+        slots: slotInfo,
+        rerank: rerankInfo,
         selection: { picks: selection.picks.length, degraded: selection.degraded, pool: selection.pool },
+        ...(expansion.degraded !== 'disabled' ? { expansion: { expanded: expansion.expanded, degraded: expansion.degraded, queries: expansion.queries.length } } : {}),
       },
+      expansion,
       elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
     };
   }
@@ -1011,6 +1691,27 @@ export function index(mems, opts = {}) {
 export function search(idx, query, opts = {}) {
   if (!(idx instanceof SearchIndex)) throw new TypeError('search: 第一个参数必须是 index() 返回的索引');
   return idx.search(query, opts);
+}
+
+/**
+ * 统一三路 RRF 混合检索便捷入口：
+ * target 可传 SearchIndex 实例，也可直接传 SQLiteStore 实例（按可见 space_id 拉取活跃记忆建索引并融合三路）。
+ */
+export async function hybridSearch(target, query, opts = {}) {
+  if (target instanceof SearchIndex) {
+    return target.searchAsync(query, opts);
+  }
+  if (target && typeof target === 'object' && typeof target.list === 'function') {
+    const scopeGuard = buildScopeGuard(opts);
+    const mems = target.list({
+      ...(scopeGuard.enabled && scopeGuard.spaces ? { spaces: scopeGuard.spaces } : {}),
+      status: 'active',
+      includeText: true,
+    });
+    const idx = new SearchIndex({ ...opts, store: target }).addAll(mems);
+    return idx.searchAsync(query, { ...opts, store: target });
+  }
+  throw new TypeError('hybridSearch: target 必须是 SearchIndex 或 SQLiteStore 实例');
 }
 
 /** 单条打分（不建索引，用于对照实验与单元断言）。 */
@@ -1045,4 +1746,19 @@ export function score(queryText, docText, mem = {}, opts = {}) {
 }
 
 export { SearchIndex };
-export default { SEARCH_DEFAULTS, tokenize, terms, index, search, score, finalScore, SearchIndex, jiebaActive, rrfFuse };
+export default {
+  SEARCH_DEFAULTS,
+  tokenize,
+  terms,
+  index,
+  search,
+  hybridSearch,
+  score,
+  finalScore,
+  SearchIndex,
+  jiebaActive,
+  rrfFuse,
+  cosineSimilarity,
+  buildScopeGuard,
+  matchEntitySlots,
+};

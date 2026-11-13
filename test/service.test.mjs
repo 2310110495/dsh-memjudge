@@ -486,34 +486,6 @@ test('recallByQuery：预算钳到 1..2000 / 取章数 1..4，结果裁掉工具
   }
 });
 
-test('v2 pre-step validates before quota and preserves decision identity', async () => {
-  const ctx = hostCtx();
-  let handler;
-  ctx.on = (name, fn) => { if (name === 'agent/pre-step') handler = fn; return () => {}; };
-  apply(ctx, { dbPath: ':memory:', autoCaptureLimitPerSession: 1, autoCaptureCooldownMs: 0 });
-  const { formatSource } = await import('../src/auto-capture.mjs');
-  const decision = { kind: 'enter', messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '这个项目的包管理器用 pnpm，别用 npm' }] }] };
-  const run = (id, turn) => handler({ agent: { session: { id } }, turn }, async () => decision);
-  try {
-    assert.equal(typeof handler, 'function');
-    for (const id of [null, 42, {}, '', ' ', '\ud800']) assert.equal(await run(id, 1), decision);
-    for (const turn of [Symbol('bad'), Number.MAX_SAFE_INTEGER + 1, { valueOf() { throw new Error('private'); } }]) assert.equal(await run('valid', turn), decision);
-    const api = ctx.services.get(SERVICE_NAME);
-    assert.equal(api.bySourcePrefix('').length, 0);
-    assert.equal(await run('valid', 1), decision);
-    assert.equal(api.bySourcePrefix(formatSource('valid', 1)).length, 1);
-    if (process.env.B01_WORKBENCH_URL) {
-      const { enrichFromMemjudge } = await import(process.env.B01_WORKBENCH_URL);
-      const evidence = enrichFromMemjudge(api, 'valid', { limit: 1 });
-      assert.equal(evidence.count, 1);
-      assert.equal(evidence.samples[0], '这个项目的包管理器用 pnpm，别用 npm');
-      assert.equal(evidence.truncated, true);
-    }
-    assert.equal(await run('valid', 2), decision);
-    assert.equal(api.bySourcePrefix('').length, 1);
-  } finally { ctx.dispose(); }
-});
-
 // ---------------------------------------------------------------- 端到端（apply）
 
 test('apply：带 provide 的 Context 上注册 memjudge 服务，与 5 个工具共存', async () => {

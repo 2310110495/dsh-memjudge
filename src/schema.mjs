@@ -1,22 +1,44 @@
-// memjudge 记忆条目 schema —— 全项目唯一真源（t9 地基）。
+// memjudge 记忆条目 schema —— 全项目唯一真源（Schema v8 + v1 兼容契约）。
 //
-// 三条不可协商的结构约束（来自 mem-eval 实测口径，勿改）：
-//   1. text 是原文，永不改写。要更正就新建条目，用 supersedes 指向被取代的旧条目。
-//      「把旧条目改掉」在本项目里等于杀掉保真能力（F1-F8 要求逐字回来）。
-//   2. 时间一律 epoch 毫秒。假时钟（harness/fake-clock.mjs）直接替换 Date，
-//      任何 ISO 字符串或本地时区都会被折算打偏。
-//   3. 衰减分 warm/cold 两档，档位由 importance 决定，写入时固化，不随时间漂移。
-//      理由见 docs/SPEC.md「能力 11 与能力 12 的自洽性」：单一指数曲线在数学上
-//      无法同时满足「30 天降到 ≤0.25」与「90 天仍留 ≥0.15」。
+// 核心约束：
+//   1. 时间一律 epoch 毫秒。假时钟直接替换 Date，避免时区折算偏差。
+//   2. 五类法定记忆（v2）：rule / profile / decision / experience / state，
+//      双向兼容旧三分 kind（person / promise / event）。
+//   3. 原文哈希统一采用 UTF-8 SHA-256 64 位小写 hex（contentHash）。
+//   4. 保留 assertTextStable 供存量不可变路径调用；单活状态覆写与代谢压缩走 store 事务修订链。
+
+import { createHash } from 'node:crypto';
 
 export const MEMORY_SCHEMA_VERSION = 1;
+export const STORE_SCHEMA_VERSION = 8;
 
-// 语料章数。source.chapter 的合法上界，与 corpus/novel.mjs 的 chapters 长度一致。
+// 语料章数。source.chapter 的合法上界，与评测语料 chapters 长度一致。
 export const CHAPTER_COUNT = 20;
 
+// 法定五类记忆体系（v2）与旧三分（v1/v6）双向兼容枚举
+export const MEMORY_CATEGORIES = Object.freeze([
+  'rule',
+  'profile',
+  'decision',
+  'experience',
+  'state',
+]);
+export const DEFAULT_MEMORY_CATEGORY = 'experience';
+
+export const MEMORY_KINDS = Object.freeze(['person', 'promise', 'event']);
+export const DEFAULT_MEMORY_KIND = 'event';
+
+export const MEMORY_STATUSES = Object.freeze(['active', 'superseded', 'archived', 'deleted']);
+export const SPACE_KINDS = Object.freeze(['global', 'workspace', 'session', 'custom']);
+
+// L0–L3 四级热冷代谢层常量
+export const TIER_L0 = 0;
+export const TIER_L1 = 1;
+export const TIER_L2 = 2;
+export const TIER_L3 = 3;
+
 // 衰减参数：唯一实现，能力 11/12 的验收直接引用这里的输出。
-// warm（importance ≥ 0.6）：半衰期 120 天 —— 事故日期、船名、编号这类长期事实。
-// cold（importance < 0.6）：半衰期 12 天 —— 天气、对话、过程细节这类易腐细节。
+// warm（importance ≥ 0.6）：半衰期 120 天；cold（importance < 0.6）：半衰期 12 天。
 export const DECAY = Object.freeze({
   dayMs: 86_400_000,
   warmImportance: 0.6,
@@ -36,11 +58,19 @@ export class MemorySchemaError extends Error {
 export const TYPES = Object.freeze({
   memory: 'memory',
   KINDS: Object.freeze(['fact', 'event', 'conclusion', 'procedure']),
+  CATEGORIES: MEMORY_CATEGORIES,
   FIELDS: Object.freeze({
     id: 'string',
     text: 'string',
     kind: 'enum:fact|event|conclusion|procedure',
+    category: 'enum:rule|profile|decision|experience|state?',
+    spaceId: 'string?',
+    slotKey: 'string|null?',
+    status: 'enum:active|superseded|archived|deleted?',
+    contentHash: 'sha256_hex?',
+    tier: 'integer?',
     createdAt: 'epoch_ms',
+    updatedAt: 'epoch_ms?',
     lastAccessed: 'epoch_ms',
     accessCount: 'integer>=0',
     importance: 'number0..1',
@@ -95,6 +125,69 @@ function fnv1a(str) {
   return h.toString(16).padStart(8, '0');
 }
 
+/** 统一正文内容哈希：UTF-8 SHA-256 64 位小写十六进制。 */
+export function contentHash(text) {
+  return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
+
+/**
+ * 旧 kind -> 新五类 category：
+ *   promise -> rule
+ *   person  -> profile
+ *   event / 其他 -> experience（若本身已是五类之一则原样返回）
+ */
+export function kindToCategory(kind) {
+  const v = typeof kind === 'string' ? kind.trim().toLowerCase() : '';
+  if (MEMORY_CATEGORIES.includes(v)) return v;
+  if (v === 'promise') return 'rule';
+  if (v === 'person') return 'profile';
+  return DEFAULT_MEMORY_CATEGORY;
+}
+
+/**
+ * 新五类 category -> 旧三分 kind：
+ *   rule    -> promise
+ *   profile -> person
+ *   其余    -> event（若本身已是旧三分之一则原样返回）
+ */
+export function categoryToKind(category) {
+  const v = typeof category === 'string' ? category.trim().toLowerCase() : '';
+  if (MEMORY_KINDS.includes(v)) return v;
+  if (v === 'rule') return 'promise';
+  if (v === 'profile') return 'person';
+  return DEFAULT_MEMORY_KIND;
+}
+
+/** 归一化五类 category：支持直接传五类或旧 person/promise/event 别名，非法归 experience。 */
+export function normalizeCategory(category, fallbackKind) {
+  const c = typeof category === 'string' ? category.trim().toLowerCase() : '';
+  if (MEMORY_CATEGORIES.includes(c)) return c;
+  if (c === 'promise' || c === 'person' || c === 'event') return kindToCategory(c);
+  if (fallbackKind !== undefined && fallbackKind !== null && fallbackKind !== '') {
+    return kindToCategory(fallbackKind);
+  }
+  return DEFAULT_MEMORY_CATEGORY;
+}
+
+/** 五类 category 的默认热冷层级：rule/profile/state 驻 L0(0)，decision/experience 驻 L1(1)。 */
+export function defaultCategoryTier(category) {
+  const c = normalizeCategory(category);
+  if (c === 'rule' || c === 'profile' || c === 'state') return TIER_L0;
+  return TIER_L1;
+}
+
+/** 判定记忆是否处于钉住常驻态（兼容 v8 tier=0 与 v7 tier=1 / rule / profile）。 */
+export function isPinnedMemory(memOrTier, categoryOrKind) {
+  if (isPlainObject(memOrTier)) {
+    const t = Number(memOrTier.tier);
+    const cat = normalizeCategory(memOrTier.category, memOrTier.kind);
+    return t === 0 || t === 1 || cat === 'rule' || cat === 'profile';
+  }
+  const t = Number(memOrTier);
+  const cat = normalizeCategory(categoryOrKind);
+  return t === 0 || t === 1 || cat === 'rule' || cat === 'profile';
+}
+
 // 确定性 id：同一章同一段同一句永远得到同一个 id，重放与去重都靠它。
 export function makeId(chapter, para, text) {
   const ch = String(chapter ?? 0).padStart(2, '0');
@@ -110,8 +203,7 @@ function deepFreeze(v) {
   return v;
 }
 
-// 建条目：补默认值 → 校验 → 深冻结。冻结是「原文永不改写」的执行层保障，
-// 任何试图 obj.text = ... 的代码会静默失败（非严格模式）或抛错（严格模式）。
+// 建条目：补默认值 → 校验 → 深冻结。
 export function createMemory(input = {}) {
   if (!isPlainObject(input)) throw new MemorySchemaError('input', '必须是对象');
   const src = isPlainObject(input.source) ? input.source : {};
@@ -129,6 +221,13 @@ export function createMemory(input = {}) {
     facts: input.facts ?? [],
     source: { chapter: src.chapter, para: src.para },
   };
+  if (input.category !== undefined) draft.category = normalizeCategory(input.category, input.kind);
+  if (input.spaceId !== undefined) draft.spaceId = String(input.spaceId);
+  if (input.slotKey !== undefined) draft.slotKey = input.slotKey == null ? null : String(input.slotKey);
+  if (input.status !== undefined) draft.status = String(input.status);
+  if (input.contentHash !== undefined) draft.contentHash = String(input.contentHash);
+  if (input.tier !== undefined) draft.tier = Number(input.tier);
+  if (input.updatedAt !== undefined) draft.updatedAt = Number(input.updatedAt);
   if (input.meta !== undefined) draft.meta = input.meta;
   validateMemory(draft);
   return deepFreeze(draft);
@@ -144,8 +243,14 @@ export function validateMemory(mem, opts = {}) {
 
   if (typeof mem.id !== 'string' || !mem.id) throw new MemorySchemaError('id', '必须是非空字符串');
   if (!ID_RE.test(mem.id)) throw new MemorySchemaError('id', '只允许字母数字与 . _ : -，长度 3..121');
-  if (mem.kind !== undefined && !TYPES.KINDS.includes(mem.kind)) {
+  if (mem.kind !== undefined && !TYPES.KINDS.includes(mem.kind) && !MEMORY_KINDS.includes(mem.kind)) {
     throw new MemorySchemaError('kind', `必须是 ${TYPES.KINDS.join('|')}`);
+  }
+  if (mem.category !== undefined && !MEMORY_CATEGORIES.includes(mem.category)) {
+    throw new MemorySchemaError('category', `必须是 ${MEMORY_CATEGORIES.join('|')}`);
+  }
+  if (mem.status !== undefined && !MEMORY_STATUSES.includes(mem.status)) {
+    throw new MemorySchemaError('status', `必须是 ${MEMORY_STATUSES.join('|')}`);
   }
 
   if (typeof mem.text !== 'string') throw new MemorySchemaError('text', '必须是字符串（原文）');
@@ -197,7 +302,6 @@ export function validateMemory(mem, opts = {}) {
     if (fact.at !== undefined && !Number.isFinite(fact.at)) {
       throw new MemorySchemaError(`facts[${i}].at`, '必须是 epoch 毫秒数');
     }
-    // 引用必须是原文的逐字子串：抽取层不得自造措辞（幻觉防线的第一道闸）。
     if (fact.quote !== undefined) {
       if (typeof fact.quote !== 'string') throw new MemorySchemaError(`facts[${i}].quote`, '必须是字符串');
       if (fact.quote && !mem.text.includes(fact.quote)) {
@@ -223,7 +327,7 @@ export function validateMemory(mem, opts = {}) {
   return true;
 }
 
-// 原文不可改写：supersede 流程必须先调这个，再建新条目。
+// 保留函数签名以兼容存量不可变校验单测；v2 单活状态与代谢压缩请走 store.putState / store.compactMemory。
 export function assertTextStable(prevText, nextText) {
   if (String(prevText) !== String(nextText)) {
     throw new MemorySchemaError(
@@ -240,7 +344,7 @@ export function decayFactor(mem, nowMs = Date.now(), opts = {}) {
   const importance = Number(mem?.importance ?? 0.5);
   const tier = importance >= warmImportance ? 'warm' : 'cold';
   const halfLifeDays = tier === 'warm' ? hlWarm : hlCold;
-  const last = Number(mem?.lastAccessed ?? nowMs);
+  const last = Number(mem?.lastAccessed ?? mem?.last_accessed_at ?? mem?.last_accessed ?? nowMs);
   const ageDays = Math.max(0, (Number(nowMs) - last) / dayMs);
   return {
     value: Number(Math.pow(0.5, ageDays / halfLifeDays).toFixed(6)),
@@ -251,14 +355,14 @@ export function decayFactor(mem, nowMs = Date.now(), opts = {}) {
 }
 
 // 排序权重：时间强度 × 重要度 × 访问惯量 × 被取代惩罚。
-// 能力 12 判的是 weight（≤0.25），能力 11 判的是留存曲线（不是这个数）。
 export function rankWeight(mem, nowMs = Date.now(), opts = {}) {
   const d = decayFactor(mem, nowMs, opts);
   const importance = Math.min(1, Math.max(0, Number(mem?.importance ?? 0.5)));
-  const accessCount = Math.max(0, Number(mem?.accessCount ?? 0));
+  const accessCount = Math.max(0, Number(mem?.accessCount ?? mem?.access_count ?? 0));
   const importanceFactor = 0.5 + 0.5 * importance;
   const accessFactor = 1 + 0.1 * Math.log1p(accessCount);
-  const supersededPenalty = mem?.supersededBy ? 0.3 : 1;
+  const superseded = mem?.supersededBy ?? mem?.superseded_by;
+  const supersededPenalty = superseded ? 0.3 : 1;
   return {
     ...d,
     weight: Number((d.value * importanceFactor * accessFactor * supersededPenalty).toFixed(6)),

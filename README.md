@@ -1,73 +1,77 @@
 # dsh-memjudge
 
-面向 DeepSeek Harness (Cordis) 的可验证本地记忆插件：L0 原文无损存储 + L1 结构化事实派生 + L2 Wiki 编译投影 + 拒答/冲突裁决 + 双边自动采集 + Web 设置面板。
+> **开发检查点，非正式发布（2026-11-13）**：本次先保存并提交 v2 工作。尚有证据门集成、STRICT 表约束及存储生命周期最终验证未完成；当前提交未通过最终完整回归，也未投产。详见 [已知问题与后续验证](docs/V2-CHECKPOINT.md)。
 
-## 核心能力与工具面（7 Tools + 1 Section + 1 Service）
+面向 DeepSeek Harness (Cordis) 的可验证本地记忆插件（v2）：SQLite Schema v8 工作区隔离存储 + L0-L3 四级热冷代谢 + 增量 Wiki 知识页 + 保 Prefix KV Cache 两段式动态注入（Tier-S + Tier-D）+ O(log N) 结构化槽位拒答与三分冲突裁决 + Turn 级异步脱水采集 + Web 治理面板。
 
-插件挂载后向宿主注册 **7 个 `memjudge_*` 工具**、1 个系统提示词注入段 `memjudge:recall`（order `700`）与只读服务 `ctx.memjudge`：
+## 核心能力与工具面（8 Tools + 2 Prompt Channels + 1 Service）
+
+插件挂载后向宿主注册 **8 个 `memjudge_*` 工具**、两段式提示词通道（静态 `memjudge:recall` + 动态 `memjudge:context`，order `700`）与只读服务 `ctx.memjudge`：
 
 | 工具名 | 职责 |
 |---|---|
-| `memjudge_remember` | 写入一条记忆（幂等哈希去重，支持 `kind`: `person` / `promise` / `event`、`tier`、`importance`、`source`、`supersedes`） |
-| `memjudge_recall` | 按查询检索相关记忆片段（BM25 + jieba 分词 + 可选向量/重排/查询扩展/LLM 选段 + 证据判断门禁与冲突提示） |
-| `memjudge_read` | 按记忆 ID 读取未截断的完整原文与 UTF-16LE 版本摘要 |
-| `memjudge_forget` | 按 ID 列表或 `source` 删除记忆及其来源位置记录（支持 `dryRun` 预览，事务原子提交） |
-| `memjudge_demote` | 将误判为 `person` / `promise` 的钉住记忆显式降级为普通 `event`（恢复时间衰减淘汰） |
-| `memjudge_conflicts` | 扫描库中同一实体属性槽位上的多值冲突及修订线索 |
-| `memjudge_stats` | 返回记忆条数、三分/五层分布、派生事实数、段磨损率与 SQLite 存储体积 |
+| `memjudge_remember` | 写入一条记忆（支持 v2 五类 `category`: `rule` / `profile` / `decision` / `experience` / `state` 与 `slotKey` 单活覆写修订链，向下兼容 `kind`: `person` / `promise` / `event`） |
+| `memjudge_recall` | 按查询混合检索相关记忆片段（前置空间过滤 + BM25 + Int8 向量 + `entity_slots` 三路 RRF + O(log N) 证据门与冲突提示） |
+| `memjudge_read` | 按记忆 ID 分页读取未截断的完整原文与 UTF-16LE 版本摘要 |
+| `memjudge_forget` | 按 ID、查询、`source` 或 `space` 物理删除记忆及其派生槽位/向量（支持 `dryRun` 预览，事务原子提交） |
+| `memjudge_demote` | 将误判为 `rule` / `profile`（`person` / `promise`）的常驻记忆安全降级为普通 `experience` / `event` |
+| `memjudge_conflicts` | 基于 `entity_slots` 与章节聚合扫描多值矛盾，输出 `supersession` / `conditional` / `disputed` 三分定性与原句证据 |
+| `memjudge_stats` | 返回 Schema v8 全维统计：空间分布、五类/三分分布、L0-L3 层级、Wiki 页数、Tier-S/Tier-D 预算与存储体积 |
+| `memjudge_wiki` | 列出、按 `slug` 读取或触发增量编译当前空间的 L2 演进知识页（`wiki_pages`）及单活状态看板（`state`） |
 
 ## 同源 Fetch RPC 与设置面板
 
-`src/rpc.mjs` 与前端 `client.js` / `cordis.patch.yml` 配合，挂载 8 条同源 Fetch 路由供 DSH 设置面板调用：
+`src/rpc.mjs` 与前端 `client.js` / `cordis.patch.yml` 配合，挂载 8 条同源 Fetch 路由供 DSH 设置与记忆治理面板调用：
 
-- `GET /api/memjudge.status` — 库统计、配置脱敏快照与三组模型就绪状态
-- `GET /api/memjudge.memories` — 记忆列表预览与来源标签
-- `GET /api/memjudge.conflicts` — 槽位冲突摘要
+- `GET/POST /api/memjudge.status` — 库统计、空间列表、L0-L3 层级、注入水位、索引重建与配置脱敏快照
+- `GET/POST /api/memjudge.memories` — 空间/范畴/层级过滤记忆列表、修订历史、单活状态、Wiki 编译与代谢触发
+- `GET /api/memjudge.conflicts` — 三分冲突定性与证据摘要
 - `POST /api/memjudge.saveKey` — 保存对话 / 向量 / 重排分组密钥
 - `POST /api/memjudge.clearKey` — 清除已保存分组密钥
-- `POST /api/memjudge.saveConfig` — 保存基础配置项
-- `POST /api/memjudge.saveSettings` — 保存分组接口、自动采集、注入预算、衰减模式等运行设置
+- `POST /api/memjudge.saveConfig` — 保存模块开关或触发索引重建
+- `POST /api/memjudge.saveSettings` — 保存分组接口、模型名、向量维度、存储上限等运行设置
 - `POST /api/memjudge.testKey` — 在线连通性自检（带超时与脱敏诊断）
 
-## 自动采集（双边通道）
+## Turn 级异步脱水采集
 
-- **用户侧（`agent/pre-step`）**：白名单过滤真实用户消息，经长度、形态、近重复、配额、冷却六道闸门与 `person` / `promise` / `event` 分类后幂等落库。
-- **助手侧（`session/event`）**：剔除思考链、工具块与代码围栏，对长回复按段切分并提取高价值结论与动作型事实，统一以 `event` 类落库。
+- **轮次收集器（`src/turn-collector.mjs`）**：挂载 `agent/pre-step` 与 `session/event`，过滤子代理回执、纯寒暄与代码块噪声，剥离 `<think>` 思考链并掩码敏感凭据后写入持久化队列 `ingest_queue`。
+- **双模脱水器（`src/distiller.mjs`）**：后台异步消费 `ingest_queue`，支持云端 LLM 结构化提炼与纯离线确定性规则回退，自动归入五类记忆并触发 `state` 单活槽位覆写。
 
 ## 目录结构
 
 ```text
 memjudge-plugin/
-├── client.js                  # DSH Web 设置面板客户端入口
+├── client.js                  # DSH Web 记忆治理与设置面板客户端入口
 ├── cordis.patch.yml           # 宿主默认配置补丁声明
 ├── package.json               # 包清单（零外部私仓路径依赖）
-├── src/                       # 23 个核心运行时模块
-│   ├── index.mjs              # Cordis 插件入口（7 工具 + 注入段 + 双边采集 + ctx.effect 生命周期）
-│   ├── store.mjs              # SQLite 原文存储（node:sqlite）、v7 迁移、段位图、occurrences 与派生刷新
-│   ├── search.mjs             # BM25 倒排索引、jieba 分词、时间衰减与 RRF 混合检索
-│   ├── judge.mjs              # 存在性拒答门禁、数值单位归一化与文档级冲突检测
-│   ├── layer.mjs              # L2 Wiki 内存编译层、主题路由与冲突裁决行生成
-│   ├── schema.mjs             # 记忆模型、双档/单档衰减公式与 ID 生成
-│   ├── extract.mjs            # L1 规则事实四元组抽取与实体/属性清洗
+├── src/                       # 24 个核心运行时模块（v2 架构）
+│   ├── index.mjs              # Cordis 插件入口（8 工具 + Tier-S/Tier-D 注入 + 轮次采集 + 周期代谢）
+│   ├── store.mjs              # SQLite 存储引擎（Schema v8：spaces / entity_slots / vectors / revisions / wiki_pages / ingest_queue）
+│   ├── search.mjs             # 前置空间过滤 + BM25 + Int8 向量 + 槽位图三路 RRF 混合检索引擎
+│   ├── inject.mjs             # 保 Prefix KV Cache 两段式动态注入器（Tier-S 静态底座 + Tier-D 按问召回 + SessionSeen）
+│   ├── judge.mjs              # O(log N) 槽位拒答门（gateSlots）、数值单位归一化与三分冲突裁决（classifyConflict）
+│   ├── lifecycle.mjs          # L0-L3 四级热冷代谢引擎、增量 Wiki 聚类编译与超限冷归档压缩
+│   ├── distiller.mjs          # 云端 LLM / 本地规则双模异步脱水器与 ingest_queue 消费器
+│   ├── turn-collector.mjs     # 会话轮次收集器、噪声/子代理门禁与敏感凭据脱敏
+│   ├── slots.mjs              # 结构化实体-属性-值-单位-极性槽位抽取与查询匹配
+│   ├── scope.mjs              # 工作区根检测、空间 ID 派生、可见空间矩阵与子代理识别
+│   ├── layer.mjs              # L2 Wiki 内存投影编译与兼容主题路由
+│   ├── schema.mjs             # 五类/三分记忆模型、L0-L3 层级映射、衰减公式与 ID 生成
+│   ├── extract.mjs            # 规则事实四元组抽取与通用实体/属性构词清洗
 │   ├── service.mjs            # ctx.memjudge 只读宿主服务封装
-│   ├── rpc.mjs                # /api/memjudge.* 同源 Fetch RPC 路由
-│   ├── config.mjs             # 对话/向量/重排三组独立凭据与运行参数解析
-│   ├── vector.mjs             # 向量嵌入客户端与按模型隔离的本地缓存
+│   ├── rpc.mjs                # /api/memjudge.* 同源 Fetch RPC 路由与治理动作编排
+│   ├── config.mjs             # 对话/向量/重排三组独立凭据、自动采集参数与运行配置解析
+│   ├── vector.mjs             # 向量嵌入客户端、Int8 标量量化与反量化
 │   ├── rerank.mjs             # Cross-Encoder 重排客户端与降级观测
 │   ├── query-expand.mjs       # LLM 查询扩展（只补尾不改原序）
-│   ├── llm-client.mjs         # OpenAI 兼容 Chat 接口统一调用器
-│   ├── llm-extract.mjs        # 可选 LLM L1 事实抽取与原文子串 Grounding 校验
-│   ├── llm-select.mjs         # 可选 LLM 候选段重排筛选
-│   ├── auto-capture.mjs       # 用户侧自动采集六道闸、配额状态机与 source 编解码
-│   ├── auto-capture-assistant.mjs # 助手侧自动采集五道闸与分段规划入口
-│   ├── auto-capture-segment.mjs   # 助手长回复机械切段与权重评估
-│   ├── auto-capture-facts.mjs     # 动作型事实抽取与工作态摘要
-│   ├── auto-capture-turn.mjs      # 会话轮次缓冲器
-│   ├── kind-classify.mjs      # 人/约/事（person/promise/event）规则分类与配额
-│   └── text-wellformed.mjs    # UTF-16 孤立代理项校验
+│   ├── llm-client.mjs         # OpenAI / DeepSeek 兼容 Chat 接口统一调用器（含超时中断与安全降级）
+│   ├── llm-extract.mjs        # 可选 LLM 事实三元组抽取与原文子串 Grounding 校验
+│   ├── llm-select.mjs         # 可选 LLM 候选段推理筛选
+│   ├── tokenizer.mjs          # 中英混合分词（jieba 可用则加载，否则纯 JS 退化，CJK 连续二元组保 OOV 召回）
+│   └── text-wellformed.mjs    # UTF-16 孤立代理项校验与修复
 ├── scripts/                   # 独立运维与诊断脚本
 │   ├── check-service.mjs      # 只读校验 ctx.memjudge 服务契约
-│   ├── nightly.mjs            # Event 记忆时间衰减分层下沉批处理（支持 --dry-run）
+│   ├── nightly.mjs            # 记忆时间衰减分层下沉批处理（支持 --dry-run）
 │   ├── panel.mjs              # 本地独立可视化诊断面板
 │   └── verify-install.mjs     # 装机副本与源码仓 SHA-256、服务面及库 tier 一致性体检
 ├── docs/                      # 核心架构与模块设计规格
@@ -75,14 +79,16 @@ memjudge-plugin/
 │   ├── auto-capture-spec.md   # 自动采集设计规格
 │   ├── panel-spec.md          # 设置面板与 RPC 协议规格
 │   └── wiki-layer-spec.md     # L2 Wiki 编译投影规格
-└── test/                      # 自包含核心单元测试套件（零外部语料仓耦合）
+└── test/                      # 39 个测试文件：单元、集成、发布回归与 1000 轮端到端压测
 ```
 
 ## 验证与运维命令
 
 ```bash
 # 语法静态检查
-node --check src/*.mjs client.js
+for file in src/*.mjs client.js; do
+  node --check "$file" || exit 1
+done
 
 # 运行全套自包含单元测试
 node --test

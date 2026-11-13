@@ -118,12 +118,19 @@ export function createService(ctx, deps = {}) {
       if (!recall) throw new Error('memjudge service: recall 未接线（deps.recall 缺失）');
       const budget = clampInt(opts?.budget, 1, RECALL_MAX_BUDGET, RECALL_DEFAULT_BUDGET);
       const topChapters = clampInt(opts?.topChapters, 1, 4, RECALL_DEFAULT_TOP_CHAPTERS);
+      const recallOpts = {
+        budget,
+        topChapters,
+        ...(typeof opts?.spaceId === 'string' && opts.spaceId.trim() ? { spaceId: opts.spaceId.trim() } : {}),
+        ...(Array.isArray(opts?.spaces) ? { spaces: opts.spaces } : {}),
+      };
       let found;
-      try { found = await recall(q, { budget, topChapters }); }
+      try { found = await recall(q, recallOpts); }
       catch (error) { guard(); throw error; }
       guard();
       if (contentVersion && version !== contentVersion()) throw new Error('memjudge recall stale: content changed');
       if (deps.validateRecall) deps.validateRecall(found);
+      const wantV2Fields = Boolean(opts?.v2 === true || opts?.spaceId || opts?.spaces);
       return {
         denied: found?.denied === true,
         reason: String(found?.reason ?? ''),
@@ -133,10 +140,14 @@ export function createService(ctx, deps = {}) {
           id: String(h?.id ?? ''),
           chapter: Number(h?.chapter) || 0,
           para: Number(h?.para) || 0,
-          chars: Number(h?.chars) || 0,
+          chars: Number(h?.chars ?? (typeof h?.text === 'string' ? h.text.length : 0)) || 0,
           score: Number(h?.score) || 0,
           text: String(h?.text ?? ''),
           truncated: h?.truncated === true,
+          ...(wantV2Fields && typeof h?.spaceId === 'string' && h.spaceId ? { spaceId: h.spaceId } : {}),
+          ...(wantV2Fields && typeof h?.category === 'string' && h.category ? { category: h.category } : {}),
+          ...(wantV2Fields && typeof h?.slotKey === 'string' && h.slotKey ? { slotKey: h.slotKey } : {}),
+          ...(wantV2Fields && Array.isArray(h?.routes) ? { routes: h.routes } : {}),
           ...(typeof h?.version === 'string' && h.version.length > 0 ? { version: h.version } : {}),
           ...(Number.isInteger(h?.windowStart) ? { windowStart: h.windowStart, windowEnd: h.windowEnd, startsAtBoundary: h.startsAtBoundary === true } : {}),
         })),
@@ -155,7 +166,14 @@ export function createService(ctx, deps = {}) {
       if (typeof prefix !== 'string') {
         throw new TypeError('memjudge service: prefix 必须是字符串');
       }
-      return store.bySourcePrefix(prefix, limit);
+      return store.bySourcePrefix(prefix, limit).map((r) => ({
+        id: r.id,
+        text: r.text,
+        kind: r.kind,
+        importance: r.importance,
+        createdAt: r.createdAt,
+        source: r.source,
+      }));
     },
 
     /** 返回记忆的全部已知位置；未知 source/documentId/chapter/para 保持 null。 */

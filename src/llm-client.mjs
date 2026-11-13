@@ -1,60 +1,131 @@
-// 统一 chat 调用器：所有走 OpenAI 兼容 /chat/completions 的模块共用这一条路径。
+// 统一 chat 调用器：所有走 OpenAI / DeepSeek 兼容 /chat/completions 的模块共用。
+// 零外部重依赖，基于 Node.js 内置 fetch 与 AbortController 实现。
 //
-// 为什么必须有它：端点原本在 llm-extract / llm-select / query-expand 里各写死一份
-// siliconflow 常量，只有 rpc 的 testKey 走 llmBaseUrl()。结果是面板「接口与模型」里
-// 改了 baseUrl，密钥测试走新端点、五项增强却仍打硅基流动——换任何非硅基供应商的用户，
-// 增强能力（向量、重排、查询扩展、LLM 选段、LLM 提取）全部静默失效。
-//
-// 三条约定：
-//   1. 端点只由 chatBaseUrl() 拼，密钥只由 chatKey() 读，模型由 chatModel() 定；
-//      不另立第二套配置读取路径（与 rpc.mjs 的 testKey 同源）。**只用 chat 组**：
-//      向量走 embed 组、重排走 rerank 组，三家供应商可以混搭。
-//   2. 超时 / abort / HTTP 非 2xx 一律原样上抛，由调用方决定怎么降级——这里不吞错、
-//      不把失败改写成成功；只负责把「失败」变成一个调用方认得出的错误。
-//   3. 端点与模型在**每次调用时**求值，不在模块加载时固化：面板改完 config.json
-//      调 reloadConfig() 后立即生效，不需要重启进程。
+// 契约保证：
+//   1. chat(payload, opts)：完整透传响应或抛出 ChatHttpError / Timeout 错误（供底层重试或精细判断）。
+//   2. chatSafe(payload, opts)：静默降级包装，带严格超时（默认 5000ms），失败/超时返回 null，不阻断主流程。
+//   3. 支持从 config/secrets.json 或环境变量（DEEPSEEK_API_KEY / MEMJUDGE_CHAT_KEY 等）自适应解析端点与密钥。
 
-import { chatBaseUrl, chatKey, chatModel, groupReport } from './config.mjs';
+import fs from 'node:fs';
+import { chatBaseUrl, chatKey, chatModel, groupReport, secretsFilePath } from './config.mjs';
 
-/** 默认超时：与三个模块此前的 TIMEOUT_MS 一致（长 prompt 批量提取实测需要这么久）。 */
+/** 长提取默认超时 */
 export const CHAT_TIMEOUT_MS = 150_000;
+/** 快速异步任务/蒸馏默认超时：5000ms */
+export const DEFAULT_FAST_TIMEOUT_MS = 5000;
 
-/** 端点：单一来源，末尾斜杠已由 chatBaseUrl() 剥掉。 */
-export function chatEndpoint() {
-  return `${chatBaseUrl()}/chat/completions`;
-}
-
-/**
- * 模型解析：调用方显式传的优先（评测可指定具体模型），否则用配置里的 chatModel()。
- * 内置常量不再是权威来源——用户换供应商时模型名必须跟着面板走。
- */
-export function resolveModel(explicit) {
-  const m = typeof explicit === 'string' ? explicit.trim() : '';
-  return m || chatModel();
-}
-
-/** 非 2xx：带 status 的错误，让调用方能区分「超时」与「服务端拒绝」。 */
+/** 非 2xx 响应错误，携带状态码与响应体切片 */
 export class ChatHttpError extends Error {
   constructor(status, body) {
     super(`http ${status || 'error'}`);
     this.name = 'ChatHttpError';
     this.status = status || 0;
-    // 服务端原文只用作诊断，可能是很长的 HTML；截断到 400 字再挂上去
     this.body = String(body ?? '').slice(0, 400);
   }
 }
 
 /**
- * 发一次 chat 请求，返回解析后的 JSON。
+ * 尝试直接读取 secrets.json（当 config 未缓存或在独立测试场景下作为安全兜底）
+ */
+function readDirectSecrets() {
+  if (process.env.MEMJUDGE_NO_SECRETS === '1') return {};
+  const p = secretsFilePath();
+  try {
+    if (fs.existsSync(p)) {
+      const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (raw && typeof raw === 'object') return raw;
+    }
+  } catch {
+    // 读失败静默忽略
+  }
+  return {};
+}
+
+/**
+ * 解析 API Key：
+ * 显式传参 > 环境变量 (DEEPSEEK_API_KEY / MEMJUDGE_CHAT_KEY / MEMJUDGE_LLM_KEY) > config.chatKey() > secrets.json
+ */
+export function resolveApiKey(explicit) {
+  if (typeof explicit === 'string' && explicit.trim()) {
+    return explicit.trim();
+  }
+  const envKey = (
+    process.env.DEEPSEEK_API_KEY ||
+    process.env.MEMJUDGE_CHAT_KEY ||
+    process.env.MEMJUDGE_LLM_KEY ||
+    ''
+  ).trim();
+  if (envKey) return envKey;
+
+  try {
+    const k = chatKey();
+    if (k && typeof k === 'string' && k.trim()) return k.trim();
+  } catch {
+    // 忽略
+  }
+
+  const direct = readDirectSecrets();
+  const fileKey = direct.chatKey || direct.llmKey || direct.apiKey || '';
+  return typeof fileKey === 'string' ? fileKey.trim() : '';
+}
+
+/**
+ * 解析 API Base：
+ * 显式传参 > 环境变量 (DEEPSEEK_BASE_URL / MEMJUDGE_CHAT_BASE_URL / MEMJUDGE_LLM_BASE_URL) > config.chatBaseUrl()
+ */
+export function resolveApiBase(explicit) {
+  if (typeof explicit === 'string' && explicit.trim()) {
+    return explicit.trim().replace(/\/+$/, '');
+  }
+  const envBase = (
+    process.env.DEEPSEEK_BASE_URL ||
+    process.env.MEMJUDGE_CHAT_BASE_URL ||
+    process.env.MEMJUDGE_LLM_BASE_URL ||
+    ''
+  ).trim();
+  if (envBase) return envBase.replace(/\/+$/, '');
+
+  try {
+    const b = chatBaseUrl();
+    if (b && typeof b === 'string' && b.trim()) return b.trim().replace(/\/+$/, '');
+  } catch {
+    // 忽略
+  }
+  return 'https://api.deepseek.com';
+}
+
+/**
+ * 端点计算：默认追加 /chat/completions（若 base 已带 /chat/completions 则不重复拼）
+ */
+export function chatEndpoint(explicitBase) {
+  const base = resolveApiBase(explicitBase);
+  if (base.endsWith('/chat/completions')) return base;
+  return `${base}/chat/completions`;
+}
+
+/**
+ * 解析模型名：显式优先，次之配置 chatModel()，默认 'deepseek-chat'
+ */
+export function resolveModel(explicit) {
+  const m = typeof explicit === 'string' ? explicit.trim() : '';
+  if (m) return m;
+  try {
+    const confModel = chatModel();
+    if (confModel && typeof confModel === 'string' && confModel.trim()) {
+      return confModel.trim();
+    }
+  } catch {
+    // 忽略
+  }
+  return 'deepseek-chat';
+}
+
+/**
+ * 发送一次 chat 请求，返回解析后的 JSON。
  *
- * @param {object} payload  请求体（model / messages / temperature / max_tokens / stream …）
- * @param {{timeoutMs?:number, signal?:AbortSignal, fetchImpl?:Function, apiKey?:string}} [opts]
- *   timeoutMs  自定义超时；默认 CHAT_TIMEOUT_MS。rpc 的密钥测试这类场景需要更短的（8s）。
- *   signal     调用方自己的取消信号，与内部超时信号并联，任一触发即 abort。
- *   fetchImpl  注入点：单测用它做零网络验证，不传则用 globalThis.fetch。
- *   apiKey     默认 chatKey()；密钥测试要验「用户刚输入的 key」时才显式传。
- * @returns {Promise<any>} 响应 JSON
- * @throws {ChatHttpError} 非 2xx；其它错误（超时 abort / 网络 / JSON 解析）原样透传
+ * @param {object} payload 请求体
+ * @param {object} [opts] 参数选项
+ * @returns {Promise<any>}
  */
 export async function chat(payload, opts = {}) {
   const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : globalThis.fetch;
@@ -63,51 +134,106 @@ export async function chat(payload, opts = {}) {
     err.code = 'NO_FETCH';
     throw err;
   }
+
   const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
     ? Math.trunc(opts.timeoutMs)
     : CHAT_TIMEOUT_MS;
-  const apiKey = typeof opts.apiKey === 'string' ? opts.apiKey : chatKey();
+  const apiKey = resolveApiKey(opts.apiKey);
   const outer = opts.signal ?? null;
 
   const ctrl = new AbortController();
-  // 外层信号并联而不是替换：调用方在工作流取消时要能立刻停掉在飞的请求
   const onOuterAbort = () => ctrl.abort();
   if (outer) {
     if (outer.aborted) ctrl.abort();
     else outer.addEventListener('abort', onOuterAbort, { once: true });
   }
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
   try {
-    const endpoint = chatEndpoint();
+    const endpoint = chatEndpoint(opts.apiBase);
     const init = {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        ...payload,
+        model: resolveModel(payload?.model),
+      }),
       signal: ctrl.signal,
     };
-    // Check after serialization, with no async gap before starting the request.
-    if (!groupReport('chat').enabled) {
-      const err = new Error('chat disabled');
-      err.code = 'DISABLED';
-      throw err;
-    }
-    const res = await fetchImpl(endpoint, init);
-    if (!res || !res.ok) {
-      // 读 error body 只作诊断；注入的假响应可能没有 text()，失败就当空串
-      let body = '';
-      if (typeof res?.text === 'function') {
-        try { body = await res.text(); } catch { body = ''; }
+
+    try {
+      const rep = groupReport('chat');
+      if (rep && rep.enabled === false) {
+        const err = new Error('chat disabled');
+        err.code = 'DISABLED';
+        throw err;
       }
-      throw new ChatHttpError(Number(res?.status) || 0, body);
+    } catch (e) {
+      if (e?.code === 'DISABLED') throw e;
     }
-    return await res.json();
+
+    // Race the complete fetch/body operation, not just fetch's cooperative signal.
+    // A mock/provider ignoring abort may settle later, but cannot hold teardown open.
+    ctrl.signal.throwIfAborted();
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(ctrl.signal.reason ?? new DOMException('Aborted', 'AbortError'));
+      ctrl.signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([aborted, (async () => {
+        const res = await fetchImpl(endpoint, init);
+        ctrl.signal.throwIfAborted();
+        if (!res || !res.ok) {
+          let body = '';
+          if (typeof res?.text === 'function') {
+            try { body = await res.text(); } catch { body = ''; }
+          }
+          ctrl.signal.throwIfAborted();
+          throw new ChatHttpError(Number(res?.status) || 0, body);
+        }
+        const json = await res.json();
+        ctrl.signal.throwIfAborted();
+        return json;
+      })()]);
+    } finally {
+      ctrl.signal.removeEventListener('abort', onAbort);
+    }
   } finally {
     clearTimeout(timer);
     if (outer) outer.removeEventListener('abort', onOuterAbort);
   }
 }
 
-export default { chat, chatEndpoint, resolveModel, CHAT_TIMEOUT_MS };
+/**
+ * 静默降级的 Chat 调用，超时或出错返回 null，绝不抛出未捕获异常。
+ *
+ * @param {object} payload 请求体
+ * @param {object} [opts] 参数选项（默认 5000ms 超时）
+ * @returns {Promise<any|null>} 成功返回响应 JSON，失败/超时返回 null
+ */
+export async function chatSafe(payload, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+    ? Math.trunc(opts.timeoutMs)
+    : DEFAULT_FAST_TIMEOUT_MS;
+  try {
+    return await chat(payload, { ...opts, timeoutMs });
+  } catch (err) {
+    return null;
+  }
+}
+
+export default {
+  chat,
+  chatSafe,
+  chatEndpoint,
+  resolveModel,
+  resolveApiKey,
+  resolveApiBase,
+  ChatHttpError,
+  CHAT_TIMEOUT_MS,
+  DEFAULT_FAST_TIMEOUT_MS,
+};

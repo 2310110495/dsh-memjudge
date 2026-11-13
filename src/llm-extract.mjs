@@ -9,7 +9,7 @@
 //   3. 缓存按 text 的 sha256 去重，同一段文本永不重复调用（文本改了 hash 就变）。
 
 import { chatKey, groupReport } from './config.mjs';
-import { chat, resolveModel } from './llm-client.mjs';
+import { chat, resolveModel, resolveApiKey } from './llm-client.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -77,16 +77,16 @@ export function createCache(cachePath) {
 const SYSTEM_PROMPT = `你是记忆结构化抽取器。输入若干条中文原文片段，输出事实型三元组。
 
 三类记忆要区分：
-- 事实(fact)：稳定的属性-值，如「白鲸号总长一百八十九点九米」→ (白鲸号, 总长, 一百八十九点九米)
-- 事件(event)：发生过的动作与时间地点，如「三月二十六日三时零八分触损」→ (白鲸号, 触损时间, 三月二十六日三时零八分)
-- 指令(instruction)：要求/规定，如「抵港后一并检验」→ (OTS-9, 要求, 抵港后一并检验)
+- 事实(fact)：稳定的属性-值，如「核心网关监听端口为八千零八十，连接池容量六十四」→ (核心网关, 连接池容量, 六十四)
+- 事件(event)：发生过的动作与时间节点，如「三月二十六日三时零八分发生 SQLite 锁等待超时」→ (SQLite, 锁等待超时时间, 三月二十六日三时零八分)
+- 指令(instruction)：要求/规定，如「网关超时阈值统一设为五秒」→ (GW-9, 要求, 网关超时阈值统一设为五秒)
 本轮只输出事实型三元组，事件与指令只在能被表达为「实体-属性-值」时才输出。
 
 硬性要求：
 1. 每条三元组必须是 {entity, attr, value, vtype, sent} 五个字段。
 2. sent 必须是原文里连续出现的句子（逐字复制，禁止改写、禁止补全、禁止翻译）。
 3. vtype 只能是 number|date|time|percent|id|coord|enum|text 之一。
-4. entity 是原文里出现的具体对象（船名、机构名、人名）；attr 是名词性短语（如「总长」「触损时间」「硫含量」），不要整句、不要动词短语。
+4. entity 是原文里出现的具体对象（服务名、模块名、机构名、人名）；attr 是名词性短语（如「连接池容量」「超时阈值」「端口号」），不要整句、不要动词短语。
 5. 抽不出就返回空数组 []，禁止编造原文没有的值。
 
 只输出 JSON 数组，不要解释，不要 markdown 代码块。`;

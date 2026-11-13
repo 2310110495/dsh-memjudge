@@ -2,9 +2,9 @@
 //
 // 与 t22 的 reranker 不是一回事（这轮必须说清区别）：
 //   - reranker（Qwen3-Reranker-8B）是 cross-encoder，对 (query, doc) 打分，判的是
-//     「字面/浅层语义相关度」。它看不出「多绕了一百八十七海里」等于「航程增加」。
-//   - 这里把段原文整段摊给 chat 模型，让它做**推理判断**：「147 卷钢卷每卷十四点二吨」
-//     能不能回答「货移的直接原因」。这是 rerank 做不到的一步。
+//     「字面/浅层语义相关度」。它看不出「等待耗时增加一百八十七毫秒」等于「锁竞争延迟上升」。
+//   - 这里把段原文整段摊给 chat 模型，让它做**推理判断**：「连接池上限 64 但并发工作线程达 128」
+//     能不能回答「网关超时的直接原因」。这是 rerank 做不到的一步。
 //
 // 降级必须可观测（t25/t26 的教训）：返回值永远带 degraded ∈ no-key|timeout|http|parse|none。
 // 静默降级会让整轮实验测的都是降级版本而没人知道。
@@ -47,7 +47,7 @@ function buildPrompt(query, snippets, maxPicks) {
     `下面是 ${snippets.length} 个候选段落。请挑出**含有回答问题所需事实**的段落编号，按相关程度排序，最多 ${maxPicks} 个。`,
     '判断标准（满足任一条就选）：段落里出现了答案所需的数值、日期、编号、人名职务、地点，或能推出答案的因果叙述。',
     '不必整段都在回答问题——只要这一段里有那个关键事实，就选它。措辞不像也没关系，看事实。',
-    '示例：问题「白鲸号从哪个港区离港？」+ 段落「白鲸号于二〇二三年三月十四日离开宁波北仑港区…」→ 必须选中该段。',
+    '示例：问题「核心网关监听哪个端口？」+ 段落「核心网关于二〇二六年三月十四日切换监听至八千零八十端口…」→ 必须选中该段。',
     '只有当所有段落都没有任何答案所需的事实时，才返回空数组。',
     '',
     body,
@@ -192,4 +192,56 @@ export async function select(query, candidates, opts = {}) {
   }
 }
 
-export default { select, parsePicks, selectEnabled, clearSelectCache, selectCacheSize, lsStats, LS_DEFAULTS };
+/**
+ * 在三路 RRF（及可选 rerank）融合结果之上执行 LLM 选段：
+ * 直接消费融合后的跨模态候选池，而不再回退调用纯 BM25 search()，彻底消除与向量/槽位/扩展路的互斥。
+ */
+export async function selectFromFused(query, fusedCandidates, opts = {}) {
+  const poolLimit = Number.isInteger(opts.poolSize) && opts.poolSize > 0 ? opts.poolSize : LS_DEFAULTS.poolSize;
+  const pool = (Array.isArray(fusedCandidates) ? fusedCandidates : []).slice(0, poolLimit);
+  if (!pool.length) {
+    return { priorityIds: new Set(), picks: [], degraded: 'empty', ms: 0, tokensIn: 0, tokensOut: 0, pool: 0 };
+  }
+  const texts = pool.map((c) => String(c?.doc?.text ?? c?.text ?? ''));
+  const selectFn = typeof opts.selectFn === 'function' ? opts.selectFn : select;
+  try {
+    const sel = await selectFn(query, texts, {
+      maxPicks: opts.maxPicks,
+      snippetChars: opts.snippetChars,
+      poolSize: poolLimit,
+      timeoutMs: opts.timeoutMs,
+      cacheTtlMs: opts.cacheTtlMs,
+      fetchImpl: opts.fetchImpl,
+      cache: opts.cache,
+      model: opts.model,
+    });
+    if (sel && Array.isArray(sel.picks)) {
+      const ids = sel.picks
+        .map((i) => pool[i]?.doc?.id ?? pool[i]?.id)
+        .filter(Boolean);
+      return {
+        priorityIds: new Set(ids),
+        picks: sel.picks,
+        degraded: sel.degraded ?? 'none',
+        ms: Number(sel.ms ?? 0),
+        tokensIn: Number(sel.tokensIn ?? 0),
+        tokensOut: Number(sel.tokensOut ?? 0),
+        pool: Number(sel.pool ?? pool.length),
+      };
+    }
+    return { priorityIds: new Set(), picks: [], degraded: 'parse', ms: 0, tokensIn: 0, tokensOut: 0, pool: pool.length };
+  } catch (err) {
+    const timedOut = /abort/i.test(String(err?.name || err?.message || err));
+    return {
+      priorityIds: new Set(),
+      picks: [],
+      degraded: timedOut ? 'timeout' : 'http',
+      ms: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      pool: pool.length,
+    };
+  }
+}
+
+export default { select, selectFromFused, parsePicks, selectEnabled, clearSelectCache, selectCacheSize, lsStats, LS_DEFAULTS };

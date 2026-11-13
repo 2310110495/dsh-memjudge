@@ -1,9 +1,9 @@
 // 查询扩展：把长问句拆成 2–4 条短子查询，各自检索后合并候选。
 //
 // 为什么需要它（t25 的实测结论）：综合题的丢分 kw 段落与问句「零词面重合」——
-// S01 问「两次省掉书面确认的动作」，证据段写的是「航程增加一百八十七海里」；
-// S07 问「货移的直接原因」，证据段写的是「147 卷、每卷十四点二吨」。单条 BM25 够不到，
-// 64/128 维向量臂也够不到。但把问句拆成「改航 航程增加」「装货 钢卷 件数」这类子查询后，
+// S01 问「两次省掉熔断保护的动作」，证据段写的是「网关超时阈值拉长至三十秒」；
+// S07 问「锁等待超时的直接原因」，证据段写的是「连接池容量 64、长事务并发 128」。单条 BM25 够不到，
+// 64/128 维向量臂也够不到。但把问句拆成「熔断 网关超时」「SQLite 锁等待 连接池容量」这类子查询后，
 // 子查询与目标段的距离就缩短了。
 //
 // 三条硬约束：
@@ -44,7 +44,7 @@ const SYSTEM_PROMPT = [
   '要求：',
   '1. 每条子查询 2–8 个字词，用空格分隔关键词，不要写成完整句子。',
   '2. 覆盖不同角度：实体+属性、事件+数值、时间线/位置、因果或责任人。',
-  '3. **保留原问题里出现的实体名、编号、数值**（如「白鲸号」「OTS-9」「147」），不要替换成同义说法。',
+  '3. **保留原问题里出现的实体名、编号、数值**（如「SQLite」「ADR-09」「8080」），不要替换成同义说法。',
   '4. 不要编造原问题里没有的实体或数值。',
   '5. 只输出 JSON：{"queries":["...","..."]}，不要任何解释。',
 ].join('\n');
@@ -179,4 +179,48 @@ export async function expand(query, opts = {}) {
   }
 }
 
-export default { expand, parseQueries, expandEnabled, clearExpandCache, expandCacheSize, qeStats, QE_DEFAULTS };
+/**
+ * 面向三路 RRF 混合检索的协同查询扩展入口：
+ * 解除与 vector / slot / rerank / llmSelect 的互斥限制，统一降级契约。
+ */
+export async function expandForHybrid(query, opts = {}) {
+  const q = String(query ?? '').trim();
+  if (!q) {
+    return { queries: [], expanded: false, degraded: 'empty', ms: 0, cached: false };
+  }
+  const fn = typeof opts.expandFn === 'function' ? opts.expandFn : expand;
+  try {
+    const r = await fn(q, {
+      maxQueries: opts.maxQueries,
+      timeoutMs: opts.timeoutMs,
+      cacheTtlMs: opts.cacheTtlMs,
+      fetchImpl: opts.fetchImpl,
+      cache: opts.cache,
+      model: opts.model,
+    });
+    if (r && Array.isArray(r.queries) && r.queries.length) {
+      const seen = new Set([q]);
+      const deduped = [q];
+      for (const sub of r.queries) {
+        const s = String(sub ?? '').trim();
+        if (s && !seen.has(s)) {
+          seen.add(s);
+          deduped.push(s);
+        }
+      }
+      return {
+        queries: deduped,
+        expanded: Boolean(r.expanded && deduped.length > 1),
+        degraded: r.degraded ?? null,
+        ms: Number(r.ms ?? 0),
+        cached: Boolean(r.cached),
+      };
+    }
+    return { queries: [q], expanded: false, degraded: 'empty', ms: 0, cached: false };
+  } catch (err) {
+    const timedOut = /abort|AbortError/i.test(String(err?.name || err?.message || err));
+    return { queries: [q], expanded: false, degraded: timedOut ? 'timeout' : 'http', ms: 0, cached: false };
+  }
+}
+
+export default { expand, expandForHybrid, parseQueries, expandEnabled, clearExpandCache, expandCacheSize, qeStats, QE_DEFAULTS };

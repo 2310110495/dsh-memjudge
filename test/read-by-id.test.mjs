@@ -28,7 +28,7 @@ test('recall id reads exact text in bounded surrogate-safe pages', async () => {
     assert.equal(hit.hits[0].truncated, true);
     const read = tools.get('memjudge_read');
     const id = hit.hits[0].id;
-    store.raw().prepare('UPDATE memories SET last_accessed = ?, access_count = ? WHERE id = ?').run(1234, 7, id);
+    store.raw().prepare('UPDATE memories SET last_accessed_at = ?, access_count = ? WHERE id = ?').run(1234, 7, id);
     const before = store.get(id, false);
     assert.equal(before.last_accessed, 1234);
     assert.equal(before.access_count, 7);

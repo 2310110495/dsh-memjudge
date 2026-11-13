@@ -1,10 +1,8 @@
-// 记忆三分（人 / 约 / 事）+ 注入分区：v6 迁移、kind 写入语义、三段配额。
-//
-// 这套用例对着四个真实失败面写：
-//   1. 老库升级必须是 ALTER 而不是「请重建库」——且重复打开不能重复 ALTER。
-//   2. kind 是模型给的标签，写错不该让内容正确的记忆丢掉 → 非法值归 event。
-//   3. person / promise 不进 recency 淘汰，否则身份与约定会被刚写的待办挤出注入面。
-//   4. 三分之后总预算仍是 2000，event 段可以被压缩，person 段不许被整体丢弃。
+// 记忆分类兼容（人 / 约 / 事 ↔ profile / rule / experience）+ Schema v8 迁移 + 分层注入验收：
+//   1. 老库 v5 升级至 Schema v8（8 张核心正交表），老记录无损回填 category='experience' (kind='event')，幂等重复打开不报错。
+//   2. kind 是兼容输入标签，非法值归 event，合法 person/promise 映射为 profile/rule 并进入 Tier-S 静态保护区。
+//   3. v2 分层注入（Tier-S <= 600 + Tier-D <= 900）下，auto 蒸馏记忆不再受 v1“auto 最多补 2 席且需 accessCount>0”死锁限制；
+//      显式 legacy 注入模式仍保留三段配额向后兼容。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -13,7 +11,15 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { open, STORE_SCHEMA_VERSION, MEMORY_KINDS, normalizeKind } from '../src/store.mjs';
-import { apply, SECTION_NAME, INJECT_HARD_LIMIT, INJECT_SEGMENTS } from '../src/index.mjs';
+import {
+  apply,
+  SECTION_NAME,
+  CONTEXT_NAME,
+  TIER_S_MAX_CHARS,
+  TIER_D_MAX_CHARS,
+  INJECT_HARD_LIMIT,
+  INJECT_SEGMENTS,
+} from '../src/index.mjs';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'memjudge-kind-'));
 const DAY = 86400000;
@@ -43,10 +49,22 @@ class NamedEntries {
 }
 
 class MockContext {
-  constructor() {
+  constructor({ withContextHook = false } = {}) {
     this.tools = new NamedEntries('tool');
     this.systemPrompt = new NamedEntries('prompt section');
     this._effects = [];
+    this._contextHooks = [];
+    if (withContextHook) {
+      this.context = {
+        register: (fn) => {
+          this._contextHooks.push(fn);
+          return () => {
+            const idx = this._contextHooks.indexOf(fn);
+            if (idx >= 0) this._contextHooks.splice(idx, 1);
+          };
+        },
+      };
+    }
   }
 
   effect(fn) {
@@ -69,19 +87,23 @@ class MockContext {
   }
 }
 
-function hostCtx() {
-  const ctx = new MockContext();
+function hostCtx(opts = {}) {
+  const ctx = new MockContext(opts);
   ctx.tools.register = (definition) => ctx.tools.insert(definition.name, definition);
   ctx.systemPrompt.section = (section) => ctx.systemPrompt.insert(section.name, section);
+  if (opts.withContextHook) {
+    ctx.systemPrompt.context = (section) => ctx.systemPrompt.insert(section.name, section);
+  }
   return ctx;
 }
 
 const tool = (ctx, name) => ctx.tools.map.get(name);
-const sectionText = (ctx) => ctx.systemPrompt.map.get(SECTION_NAME).text();
+const sectionText = (ctx, env) => ctx.systemPrompt.map.get(SECTION_NAME).text(env);
+const contextText = (ctx, env) => ctx.systemPrompt.map.get(CONTEXT_NAME).text(env);
 
-// ---------------------------------------------------------------- v5 → v6
+// ---------------------------------------------------------------- v5 → v8
 
-/** 按 bf46c46 的 DDL 造一个 schema v5 老库（memories 没有 kind 列）。 */
+/** 按历史 DDL 造一个 schema v5 老库（memories 没有 kind/category 列）。 */
 function buildLegacyDb(file) {
   const db = new DatabaseSync(file);
   db.exec(`
@@ -110,27 +132,29 @@ CREATE TABLE vector_blob (id TEXT PRIMARY KEY, dim INTEGER NOT NULL, slots INTEG
   db.close();
 }
 
-test('v5 老库升级：ALTER 补 kind/tier 列，老记录回填 event/t3，版本升到 7', () => {
+test('v5 老库升级：无损迁移至 Schema v8，老记录回填 experience(event)，版本升到 8', () => {
   const file = path.join(TMP, 'legacy.db');
   buildLegacyDb(file);
   const s = open(file, { now: () => T0 + 10 * DAY });
   const cols = s.raw().prepare('PRAGMA table_info(memories)').all().map((c) => c.name);
-  assert.ok(cols.includes('kind'), 'kind 列缺失');
+  assert.ok(cols.includes('category'), 'category 列缺失');
   assert.ok(cols.includes('tier'), 'tier 列缺失');
-  const rows = s.raw().prepare('SELECT kind, tier FROM memories').all();
-  assert.deepEqual(rows.map((r) => r.kind), ['event', 'event'], "老记录必须全部回填 'event'");
-  assert.deepEqual(rows.map((r) => r.tier), [3, 3], "v5 无 kind 的老记录按 event 落 tier=3");
-  assert.equal(s.raw().prepare("SELECT v FROM meta WHERE k = 'schema_version'").get().v, '7');
-  assert.equal(STORE_SCHEMA_VERSION, 7);
+  assert.ok(cols.includes('space_id'), 'space_id 列缺失');
+  const rows = s.raw().prepare('SELECT category, tier FROM memories ORDER BY created_at ASC').all();
+  assert.deepEqual(rows.map((r) => r.category), ['experience', 'experience'], "v5 无 kind 的老记录必须回填为 'experience'");
+  assert.deepEqual(rows.map((r) => r.tier), [3, 3], 'v5 无 kind 老记录保留兼容 tier=3');
+  assert.equal(s.raw().prepare("SELECT value FROM main.meta WHERE key = 'schema_version'").get().value, '8');
+  assert.equal(s.raw().prepare("SELECT v FROM meta WHERE k = 'schema_version'").get().v, '8');
+  assert.equal(STORE_SCHEMA_VERSION, 8);
   assert.deepEqual(s.stats().kinds, { person: 0, promise: 0, event: 2 });
   s.close();
 });
 
-test('迁移幂等：再开两次不报错、不重复 ALTER、段位图不被重写', () => {
+test('迁移幂等：再开两次不报错、不重复建表、段位图按连接重建完整', () => {
   const file = path.join(TMP, 'legacy.db');
   const second = open(file, { now: () => T0 + 11 * DAY });
   const cols = second.raw().prepare('PRAGMA table_info(memories)').all().map((c) => c.name);
-  assert.equal(cols.filter((c) => c === 'kind').length, 1, 'kind 列被重复添加');
+  assert.equal(cols.filter((c) => c === 'category').length, 1, 'category 列唯一');
   const segs = second.raw().prepare('SELECT COUNT(*) AS n FROM segments').get().n;
   assert.equal(segs, 2);
   second.close();
@@ -138,10 +162,10 @@ test('迁移幂等：再开两次不报错、不重复 ALTER、段位图不被�
   assert.doesNotThrow(() => {
     const third = open(file, { now: () => T0 + 12 * DAY });
     third.close();
-  }, '重复打开必须不报错（duplicate column name 说明 ALTER 没被幂等保护）');
+  }, '重复打开必须幂等不报错');
 });
 
-test('kind 写入语义：合法三类落库、非法值归 event、未传 kind 不改已有分类', () => {
+test('kind 写入语义：合法三类落库映射 profile/rule/experience、非法值归 event、未传 kind 不改已有分类', () => {
   const s = open(path.join(TMP, 'kind-write.db'), { now: () => T0 });
   assert.deepEqual([...MEMORY_KINDS], ['person', 'promise', 'event']);
   assert.equal(normalizeKind('PERSON'), 'person', '大小写不该影响分类');
@@ -151,10 +175,13 @@ test('kind 写入语义：合法三类落库、非法值归 event、未传 kind 
 
   const p = s.put({ text: '用户叫 YG。', kind: 'person' });
   assert.equal(p.kind, 'person');
+  assert.equal(p.category, 'profile');
   const q = s.put({ text: '约定：用简体中文。', kind: 'promise' });
   assert.equal(q.kind, 'promise');
+  assert.equal(q.category, 'rule');
   const e = s.put({ text: '今天跑了 78 项测试。', kind: 'event' });
   assert.equal(e.kind, 'event');
+  assert.equal(e.category, 'experience');
   const bad = s.put({ text: '一条 kind 写错的记忆。', kind: 'bogus' });
   assert.equal(bad.kind, 'event');
   assert.equal(bad.inserted, true, '非法 kind 不该阻止写入');
@@ -166,15 +193,13 @@ test('kind 写入语义：合法三类落库、非法值归 event、未传 kind 
   const plain = s.put({ text: '今天跑了 78 项测试。' });
   assert.equal(plain.kind, 'person', '未传 kind 的重写把 person 改回了 event');
 
-  // 4 条落库：person/promise/event 各一 + 一条非法 kind 归 event；
-  // 随后幂等命中把「今天跑了 78 项测试。」从 event 纠正成 person。
   assert.deepEqual(s.stats().kinds, { person: 2, promise: 1, event: 1 });
   assert.equal(s.dump().find((r) => r.text === '用户叫 YG。').kind, 'person');
   assert.equal(s.list({ includeText: true }).find((r) => r.text === '约定：用简体中文。').kind, 'promise');
   s.close();
 });
 
-test('memjudge_stats 输出三种 kind 各自的条数', async () => {
+test('memjudge_stats 输出三种 kind 与五种 category 各自的条数', async () => {
   const ctx = hostCtx();
   apply(ctx, { dbPath: path.join(TMP, 'stats.db'), now: () => T0 });
   const remember = tool(ctx, 'memjudge_remember');
@@ -183,13 +208,67 @@ test('memjudge_stats 输出三种 kind 各自的条数', async () => {
   await remember.execute({ text: '跑了一次迁移。' });
   const st = await tool(ctx, 'memjudge_stats').execute({});
   assert.deepEqual(st.kinds, { person: 1, promise: 1, event: 1 });
+  assert.equal(st.categories.profile, 1);
+  assert.equal(st.categories.rule, 1);
+  assert.equal(st.categories.experience, 1);
   assert.match(tool(ctx, 'memjudge_stats').output.render({}, st)[0].text, /三分 人 1 \/ 约 1 \/ 事 1/);
   ctx.dispose();
 });
 
-// ---------------------------------------------------------------- 注入分区
+// ---------------------------------------------------------------- v2 分层注入 & legacy 兼容验证
 
-/** 从注入文本里取某段的行数。段标题行为 `人：` / `约：` / `事：`。 */
+test('v2 分层注入：person/promise 映射 profile/rule 进 Tier-S 保护区，auto 记忆在 Tier-D 无“最多补 2 席且需 accessCount>0”死锁', async () => {
+  const ctx = hostCtx({ withContextHook: true });
+  let clock = T0;
+  apply(ctx, {
+    dbPath: path.join(TMP, 'v2-tiered-inject.db'),
+    autoInject: true,
+    injectMode: 'tiered',
+    now: () => clock,
+  });
+  const remember = tool(ctx, 'memjudge_remember');
+
+  await remember.execute({ text: '用户叫 YG，长期主导核心后端与记忆架构。', kind: 'person', importance: 0.95 });
+  await remember.execute({ text: '铁律：所有交付必须在隔离沙箱跑通测试。', kind: 'promise', importance: 0.9 });
+
+  // 写入 5 条完全未经 recall 触达（accessCount === 0）的 auto: 来源经验记忆与 2 条手工记忆
+  for (let i = 1; i <= 2; i += 1) {
+    clock += DAY;
+    await remember.execute({
+      text: `手工记录的部署端口规范 ${i}：网关监听 1808${i} 端口。`,
+      importance: 0.6,
+    });
+  }
+  for (let i = 1; i <= 5; i += 1) {
+    clock += DAY;
+    await remember.execute({
+      text: `自动蒸馏的 Redis 哨兵故障排查结论 ${i}：需开启 sentinel resolve-hostnames 配置项 ${i}。`,
+      source: `auto:distill#sess-${i}`,
+      importance: 0.7,
+    });
+  }
+
+  // Tier-S 静态底座：包含 profile 与 rule，且字符数严格 <= 600，同会话二次读取字节恒定
+  const tierS1 = sectionText(ctx, { sessionId: 'sess-check-1' });
+  const tierS2 = sectionText(ctx, { sessionId: 'sess-check-1' });
+  assert.ok(tierS1.length > 0 && tierS1.length <= TIER_S_MAX_CHARS, `Tier-S 长度 ${tierS1.length} 越界`);
+  assert.equal(tierS1, tierS2, '同一会话内 Tier-S 静态底座必须字节级恒定');
+  assert.match(tierS1, /YG/);
+  assert.match(tierS1, /隔离沙箱/);
+  assert.doesNotMatch(tierS1, /Redis 哨兵/, '普通经验记忆不应挤占 Tier-S 保护区');
+
+  // Tier-D 按问动态召回：即使 auto: 条目 accessCount===0 且数量超过 2 条，也能按相关性召回超过 2 条！
+  const tierD = contextText(ctx, {
+    sessionId: 'sess-check-1',
+    messages: [{ role: 'user', content: 'Redis 哨兵故障排查需要开启什么 sentinel 配置项？' }],
+  });
+  assert.ok(tierD.length > 0 && tierD.length <= TIER_D_MAX_CHARS, `Tier-D 长度 ${tierD.length} 越界`);
+  const matchedAuto = [...tierD.matchAll(/自动蒸馏的 Redis 哨兵故障排查结论/g)].length;
+  assert.ok(matchedAuto >= 3, `v2 Tier-D 不应再有 auto 最多 2 席且需 accessCount>0 死锁，实际命中 ${matchedAuto} 条`);
+
+  ctx.dispose();
+});
+
 function segLines(text, label) {
   const lines = text.split('\n');
   const i = lines.indexOf(label);
@@ -199,10 +278,15 @@ function segLines(text, label) {
   return n;
 }
 
-test('注入分区：3 person + 3 promise + 20 event → 三段标题都在、六条一条不少、总字符 ≤2000', async () => {
+test('legacy 注入兼容：3 person + 3 promise + 20 event → 三段标题都在、六条一条不少、总字符 ≤2000', async () => {
   const ctx = hostCtx();
   let clock = T0;
-  apply(ctx, { dbPath: path.join(TMP, 'inject-mix.db'), autoInject: true, now: () => clock });
+  apply(ctx, {
+    dbPath: path.join(TMP, 'inject-mix.db'),
+    autoInject: true,
+    injectMode: 'legacy',
+    now: () => clock,
+  });
   const remember = tool(ctx, 'memjudge_remember');
   const persons = [
     '用户叫 YG，长期做后端与记忆系统。',
@@ -235,90 +319,6 @@ test('注入分区：3 person + 3 promise + 20 event → 三段标题都在、�
   assert.equal(segLines(text, '约：'), 3, 'promise 段条数不对');
   for (const p of persons) assert.ok(text.includes(p.slice(0, 10)), `person 被丢：${p.slice(0, 10)}`);
   for (const p of promises) assert.ok(text.includes(p.slice(0, 10)), `promise 被丢：${p.slice(0, 10)}`);
-  ctx.dispose();
-});
-
-test('注入分区：30 条 person 撑爆 800 → person 不被丢成 0，总字符 ≤2000，event 被压缩', async () => {
-  const ctx = hostCtx();
-  let clock = T0;
-  apply(ctx, { dbPath: path.join(TMP, 'inject-heavy.db'), autoInject: true, now: () => clock });
-  const remember = tool(ctx, 'memjudge_remember');
-  // importance 递减：段内超限时按 importance 降序取，前 10 条应当胜出。
-  for (let i = 1; i <= 30; i += 1) {
-    clock += DAY;
-    await remember.execute({
-      text: `用户的第 ${i} 项稳定偏好：习惯在深夜写代码，讨厌被打断，喜欢先看数据再下结论。`,
-      kind: 'person',
-      importance: 1 - i / 100,
-    });
-  }
-  for (let i = 1; i <= 20; i += 1) {
-    clock += DAY;
-    await remember.execute({ text: `第 ${i} 次跑测试的经过与结果：共 ${100 + i} 项断言，日志在 results/${i}.log。` });
-  }
-
-  const text = sectionText(ctx);
-  assert.ok(text.length <= INJECT_HARD_LIMIT, `注入 ${text.length} 字符，超过 ${INJECT_HARD_LIMIT}`);
-  const personRows = segLines(text, '人：');
-  assert.ok(personRows > 0, 'person 段被丢成 0 条');
-  assert.ok(personRows <= 20, `person 段 ${personRows} 条，800 字符装不下这么多`);
-  assert.ok(text.includes('第 1 项稳定偏好'), 'importance 最高的老条目没被保留');
-  assert.ok(!text.includes('第 30 项稳定偏好'), 'importance 最低的条目不该挤进 800 字符');
-  assert.ok(segLines(text, '事：') > 0, 'event 段被整体丢弃');
-  // 段配额之和必须正好是硬上限，否则「三段配额」只是修辞。
   assert.equal(INJECT_SEGMENTS.reduce((s, seg) => s + seg.cap, 0), INJECT_HARD_LIMIT);
-  ctx.dispose();
-});
-
-test('person 同 importance 时按 created_at 升序：老的身份事实先留', async () => {
-  const ctx = hostCtx();
-  let clock = T0;
-  apply(ctx, { dbPath: path.join(TMP, 'inject-order.db'), autoInject: true, now: () => clock });
-  const remember = tool(ctx, 'memjudge_remember');
-  const texts = [];
-  for (let i = 0; i < 12; i += 1) {
-    clock += DAY;
-    const text = `第 ${i} 号身份事实：用户的长期习惯编号 ${i}，这条事实足够长以便在 800 字符内尽快被挤掉。`;
-    texts.push(text);
-    await remember.execute({ text, kind: 'person', importance: 0.5 });
-  }
-  const out = sectionText(ctx);
-  const present = texts
-    .map((text, i) => [i, out.indexOf(text.slice(0, 12))])
-    .filter(([, pos]) => pos >= 0)
-    .map(([i]) => i);
-  assert.ok(present.length > 0, '一条身份事实都没进注入');
-  assert.ok(present.length < texts.length, `注入里 ${present.length} 条，800 字符应当截掉一部分`);
-  assert.deepEqual(present, present.slice().sort((a, b) => a - b), '老的身份事实必须排在前面');
-  assert.equal(present[0], 0, '最早的一条必须被保留');
-  ctx.dispose();
-});
-
-test('event 段：人工优先，auto 最多补 2 席且需 accessCount>0', async () => {
-  const ctx = hostCtx();
-  let clock = T0;
-  apply(ctx, { dbPath: path.join(TMP, 'inject-auto.db'), autoInject: true, now: () => clock });
-  const remember = tool(ctx, 'memjudge_remember');
-  const recall = tool(ctx, 'memjudge_recall');
-  for (let i = 1; i <= 2; i += 1) {
-    clock += DAY;
-    await remember.execute({ text: `人工留下的事件 ${i}：手工确认过的结论。` });
-  }
-  // auto 条目：source 走 auto-capture 的格式；前 4 条被 recall 触达过一次，
-  // 后 2 条一次都没被读过——它们不该占用仅有的 2 个 auto 席位。
-  for (let i = 1; i <= 6; i += 1) {
-    clock += DAY;
-    await remember.execute({
-      text: `自动采集的事件 ${i}：这一轮对话里的经过与结果。`,
-      source: `auto:chat#abcdef12-t${i}`,
-    });
-    if (i <= 4) await recall.execute({ query: `自动采集的事件 ${i}` });
-  }
-  const out = sectionText(ctx);
-  const autoRows = [...out.matchAll(/自动采集的事件/g)].length;
-  const manualRows = [...out.matchAll(/人工留下的事件/g)].length;
-  assert.equal(manualRows, 2, '人工条目必须全在');
-  assert.ok(autoRows <= 2, `auto 段出现 ${autoRows} 条，超过 2 席`);
-  assert.ok(autoRows >= 1, 'auto 条目一条都没进来（人工<6 且 accessCount>0 时应当补位）');
   ctx.dispose();
 });

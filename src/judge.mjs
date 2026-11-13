@@ -11,6 +11,15 @@
 // 关键设计：判断依据是**写入时抽出的三元组**，不是查询时拿问句去正文里找字。
 // 后者在长材料上必然失效——整章 1453 字里任意二元组都出现，判据恒真。
 
+import {
+  extractSlots,
+  splitCompactEntityAttr,
+  cleanSlotEntity,
+  cleanSlotAttr,
+  normalizeValueAndUnit,
+} from './slots.mjs';
+import { GLOBAL_SPACE_ID, visibleSpaces } from './scope.mjs';
+
 const DAY = 86400000;
 const CJK = /[\u4e00-\u9fff]/;
 
@@ -19,7 +28,7 @@ const LEAD_JUNK = /^(?:的|了|是|在|有|和|与|及|或|从|向|往|到|把|�
 const TAIL_JUNK = /(?:的|了|是|在|有|和|与|及|或|吗|呢|吧|啊|约|共|计|达|为|则|即|按|据|经|由|于|已|将|可|须|应|上|下|中|内|外|前|后|里)+$/;
 
 // 疑问焦点。切属性时以它为界，界两侧的名词块都算属性。
-const QMARK = /(?:多少|多久|多大|多远|多长|多重|多高|多深|几人|几个|几支|几卷|几块|几节|几种|几次|几条|几项|几页|几份|几张|几名|几行|几号|第几|哪一|哪条|哪个|哪个|哪里|哪国|哪年|哪月|哪日|哪位|哪天|什么|啥|谁|何时|何地|如何|怎么|怎样|为什么|是否|是不是|有没有|能否)/;
+const QMARK = /(?:几(?:小时|分钟|秒|毫秒|千克|公斤|公里|厘米|毫米|吨|米|度|升)|多少|多久|多大|多远|多长|多重|多高|多深|几人|几个|几支|几卷|几块|几节|几种|几次|几条|几项|几页|几份|几张|几名|几行|几号|第几|哪一|哪条|哪个|哪个|哪里|哪国|哪年|哪月|哪日|哪位|哪天|什么|啥|谁|何时|何地|如何|怎么|怎样|为什么|是否|是不是|有没有|能否)/;
 
 // 问询方式词：只是问法，不是属性本身。R73「累计睡眠情况如何」的属性是「累计睡眠」。
 const MODE_TAIL = /(?:情况|状态|方式|做法|样子|内容|经过|结果|详情|说法|表述|口径|数据|数值|水平|程度)+$/;
@@ -29,16 +38,22 @@ const MODE_TAIL = /(?:情况|状态|方式|做法|样子|内容|经过|结果|�
 const LIMITER_RE = /(上一|上一次|前一次|上一年|去年|前任|首任|最初|原始|成立|出生|创办|初建|已注销|停用)/g;
 
 // 通用属性后缀词：值附近的这些词是「属性名」，不是值的一部分。
-const ATTR_SUFFIX = '(?:编号|代号|型号|呼号|名称|名字|日期|时间|深度|长度|宽度|高度|厚度|半径|面积|体积|重量|吨位|人数|页数|数量|件数|金额|费用|费率|流量|速度|温度|气压|湿度|角度|距离|续航|功率|电压|比重|含量|浓度|盐度|压力|工期|时限|期限)';
+const ATTR_SUFFIX = '(?:[\u4e00-\u9fff][度率数量额值期限码型重速次]|[称名期时位置向级类态式法因果途责务龄历]|大小|端口|版本|功率|容量|费用|预算|标准|半径|面积|体积|气压|电压|距离)';
 
-// 实体词表：编号型、职务+姓名、机构、船名。
+// 通用中文职务构词与通用机构构词（零特定行业专有词硬编码）
+const GENERIC_ROLE_TITLE = '(?:[一二三四五总正副大值班首席执行助理见习][\\u4e00-\\u9fff]{0,2}|[\\u4e00-\\u9fff]{1,2})(?:代表|主任|经理|总监|委员|顾问|专家|主管|专员|调度|代理|律师|长|副|师|员|人|手|匠)';
+const GENERIC_ROLE_RE_SRC = `(?:${GENERIC_ROLE_TITLE})([\\u4e00-\\u9fff]{2,3})`;
+const GENERIC_ROLE_CAP_RE = new RegExp(`(${GENERIC_ROLE_TITLE})([\\u4e00-\\u9fff]{2,3})`, 'g');
+const GENERIC_ROLE_TEST_RE = new RegExp(`^(?:${GENERIC_ROLE_TITLE})`);
+
+// 实体词表：编号型、职务+姓名、机构、命名编号体。
 const ENTITY_PATTERNS = [
   /PT\s+[A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)*/g,
   /[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+/g,
-  /(?:船长|大副|二副|三副|轮机长|水手长|引航员|检验员|公估人|代理|报务员|木匠|二管轮|律师|代表|调度)([\u4e00-\u9fff]{2,3})/g,
-  /[\u4e00-\u9fff]{2,5}(?:港区|海峡|群岛|洋|海|公司|集团|局|调查组|委员会|船厂|保险|银行|法院|海事局)/g,
+  new RegExp(GENERIC_ROLE_RE_SRC, 'g'),
+  /[\u4e00-\u9fff]{2,6}(?:公司|集团|总局|分局|局|社|厂|院|调查组|委员会|保险|银行|法院)/g,
   /[\u4e00-\u9fff]{2,4}号/g,
-  /[\u4e00-\u9fff]{2,4}(?:轮|船)(?![舶厂])/g,
+
 ];
 
 const VALUE_RE = new RegExp(
@@ -83,7 +98,7 @@ export function buildEntities(text) {
     let m;
     while ((m = re.exec(text)) !== null) {
       // 职务+姓名模式：整体与姓名都进词表
-      if (m[1] && /(?:船长|大副|二副|三副|轮机长|水手长|引航员|检验员|公估人|代理|报务员|木匠|二管轮|律师|代表)/.test(m[0])) {
+      if (m[1] && GENERIC_ROLE_TEST_RE.test(m[0])) {
         add(m[1], 'person');
         add(m[0], 'person-role');
       } else {
@@ -173,9 +188,9 @@ export function extractFacts(text, opts = {}) {
       }
     }
 
-    // (4) 职务+姓名：船长周允棠 → (周允棠, 职务, 船长)
-    const ROLE = /(船长|大副|二副|三副|轮机长|水手长|引航员|检验员|公估人|代理|报务员|木匠|二管轮|律师)([\u4e00-\u9fff]{2,3})/g;
-    while ((m = ROLE.exec(s.text)) !== null) {
+    // (4) 职务+姓名 → (姓名, 职务, 职务名)
+    GENERIC_ROLE_CAP_RE.lastIndex = 0;
+    while ((m = GENERIC_ROLE_CAP_RE.exec(s.text)) !== null) {
       facts.push({ entity: m[2], attr: '职务', value: m[1], kind: 'role', text: s.text.trim(), ch, at: s.at + m.index });
     }
   }
@@ -202,7 +217,7 @@ export function buildStore(chapters) {
 }
 
 // 问句里夹带的动词。它们不是属性名，不剥掉会让「累计睡眠情况」变成「累计睡眠不足」。
-const VERB_JUNK = /(?:决定|要求|更换|看见|装了|装|减到|减小|漂了|漂|待了|待|询问|化验|写了|写|挂的是|挂|用的是|用|还剩|剩|叫|改名为|改名|跑了|跑|经过|覆盖|发生|出现|提出|记录|处理|执行|送达|漏改|采信|给出|采用|规定|涉及|表示|认为|自称|成为|变成|作为|设置|安装|属于|包括|包含|需要|应该|可以|能够|进行|实现|完成|算出|签署|签发|离港|抵港|到达|抵达|离开|驶离|超过|不超过|改成|改回|减为|挂靠|反映|发现|取样|化验)/g;
+const VERB_JUNK = /(?:决定|要求|更换|看见|装了|装|减到|减小|漂了|漂|待了|待|询问|化验|写了|写|挂的是|挂|用的是|用|还剩|剩|叫|改名为|改名|跑了|跑|经过|覆盖|发生|出现|提出|记录|处理|执行|送达|漏改|采信|给出|采用|规定|涉及|表示|认为|自称|成为|变成|作为|设置|安装|属于|包括|包含|需要|应该|可以|能够|进行|实现|完成|算出|签署|签发|到达|抵达|离开|超过|不超过|改成|改回|减为|反映|发现|取样|化验)/g;
 
 // 答案类型词：只说明「我要一个什么形状的值」，不构成被查属性。
 // 「主机型号」剥掉「型号」剩「主机」——原文写「主机是 MAN B&W」，这才对得上。
@@ -210,7 +225,7 @@ const ANSWER_TYPE_RE = /(?:型号|编号|名字|名称|金额|费用|总额|总�
 
 // 解释型问句问的是「为什么/怎么办」，不是一个属性的值。这类只判实体，不判属性。
 const EXPLAIN_RE = /(为什么|为何|怎么|怎样|如何|哪些|有什么|情况)/;
-const NUMERIC_RE = /(多少|多久|多大|多远|多长|多深|多重|多高|几点|几[人名页项张份条件支块卷节次天年月日]|哪年|哪国|第几)/;
+const NUMERIC_RE = /(几(?:小时|分钟|秒|毫秒|千克|公斤|公里|厘米|毫米|吨|米|度|升)|多少|多久|多大|多远|多长|多深|多重|多高|几点|几[人名页项张份条件支块卷节次天年月日]|哪年|哪国|第几)/;
 
 // 属性短语还原。clean() 会把限定语与拉丁串剥成孤零零的两三个字：「出生」不是被问的东西，
 // 「出生年份」才是。拒答文案必须复述被问的那个完整说法——评测侧判「否认词落在被问实体附近」，
@@ -224,7 +239,7 @@ function attrPhrase(query, key) {
   if (i < 0) return k;
   const isHan = (c) => /\p{Script=Han}/u.test(String(c || ''));
   // 限定语本身已是完整语义单位（「上一」「出生」），补字只会补坏：
-  // 「白鲸号上一航次」的「上一」前面是实体尾字「号」，补进来就成了「号上一航次」。
+  // 「一号节点上一版本」的「上一」前面是实体尾字「号」，补进来就成了「号上一版本」。
   LIMITER_RE.lastIndex = 0;
   const isLimiter = new RegExp(`^(?:${LIMITER_RE.source})$`).test(k);
   let lo = i;
@@ -243,7 +258,7 @@ function attrPhrase(query, key) {
 
 /**
  * 问句解析：实体之外的属性块、限定词、拉丁串。
- * 属性取疑问焦点两侧的名词块——「白鲸号上一航次跑的是哪条航线」里，「航线」在焦点之后。
+ * 属性取疑问焦点两侧的名词块——「核心网关上一版本监听的是哪个端口」里，「端口」在焦点之后。
  * @param {string} query
  * @param {string[]} [dropNames] 已知实体，算属性前先剥掉，否则属性块里会带着实体名
  */
@@ -371,7 +386,7 @@ export function gateSearchIndex(chapters) {
  * 属性是否被记载。
  *
  * 判定面是整句，不是抽出来的三元组——自由散文里「X 是 Y」抽出的属性名多半是碎片
- * （`白鲸号第=一次`、`水面照成=一块`），把精确比对建在碎片上，误伤只会转嫁到问句侧。
+ * （`核心网关第=一次`、`缓冲队列压成=一块`），把精确比对建在碎片上，误伤只会转嫁到问句侧。
  * 要求属性名在句中原样出现：「现场」不认「到场」，「中心气压」不认「气压一小时里掉了四个百帕」。
  */
 function hitBy(pool, pq, p) {
@@ -399,7 +414,7 @@ function hitBy(pool, pq, p) {
  * @param {string} query
  * @param {object|string} target buildStore 的结果，或一段材料（内部临时建库）
  */
-// 属性短语：「的 X」优先（「白鲸号的舵机型号是多少」→ 舵机型号），否则退回 primary。
+// 属性短语：「的 X」优先（「核心网关的连接池容量是多少」→ 连接池容量），否则退回 primary。
 // 同义词只按「物理量名」归并，不登记任何题面，避免变成题库白名单。
 const ATTR_PHRASE_RE = /的([\u4e00-\u9fff]{2,6}?)(?=是|有|为|多少|什么|哪|几|怎么|如何|叫|称为|称作|到底|究竟|具体|准确|实际上|一般|$|[?？])/;
 const ATTR_SYNONYM = [
@@ -407,8 +422,7 @@ const ATTR_SYNONYM = [
   ['容量', '容积', '装载量'],
   ['压力', '压强'],
   ['功率', '马力'],
-  ['速度', '航速', '速率'],
-  ['吨位', '载重吨', '载重量'],
+  ['速度', '速率'],
   ['长度', '总长'],
   ['编号', '代号'],
 ];
@@ -419,10 +433,10 @@ function canonAttr(s) {
   }
   return t;
 }
-const ATTR_SUFFIX_WORDS = ['总额', '清单', '编号', '代号', '型号', '容量', '压力', '直径', '口径', '日期', '时间', '数量', '金额', '费用', '长度', '宽度', '高度', '深度', '重量', '功率', '速度', '航速', '吨位', '页码', '项数',
+const ATTR_SUFFIX_WORDS = ['总额', '清单', '编号', '代号', '型号', '容量', '压力', '直径', '口径', '日期', '时间', '数量', '金额', '费用', '长度', '宽度', '高度', '深度', '重量', '功率', '速度', '吨位', '页码', '项数',
   // 度量/状态类：ATTR_SUFFIX 里有的都要能剥，否则「一小时流量」的 core 会变成整串
   // 而误判为「材料里没有」（R52）。
-  '流量', '盐度', '浓度', '含量', '气压', '湿度', '角度', '距离', '续航', '电压', '比重', '温度', '页数', '人数', '件数', '海拔', '吃水', '载重'];
+  '流量', '盐度', '浓度', '含量', '气压', '湿度', '角度', '距离', '续航', '电压', '比重', '温度', '页数', '人数', '件数', '海拔'];
 // 「修理费总额」的核心是「修理费」：材料里有「修理费」就说明这个属性存在，
 // 只是问句把量名后缀加长了。C 组「舵机型号」的核心「舵机」在材料里没有，仍然要拒。
 function attrCore(key) {
@@ -462,7 +476,7 @@ function attrPhraseOf(query, pq) {
     head = cleanPhrase(head);
     // 只取「名词性修饰语 + 名词后缀」的尾巴，且修饰语里不许有动词/虚词：
     // 「检验员说机舱温度」取「机舱温度」，「触损发生在」不取。
-    const tail = head.match(/([\u4e00-\u9fff]{2,4})(编号|代号|型号|呼号|名称|名字|日期|时间|深度|长度|宽度|高度|厚度|半径|面积|体积|重量|吨位|人数|页数|数量|件数|金额|费用|费率|流量|速度|温度|气压|湿度|角度|距离|续航|功率|电压|比重|含量|浓度|盐度|压力|工期|时限|期限|吃水|载重|航速|航次|容量|排量|定额|标准)$/u);
+    const tail = head.match(new RegExp(`([\\u4e00-\\u9fff]{2,4})(${ATTR_SUFFIX})$`, 'u'));
     if (tail && !/(发生在|说|开了|是|的|了|过|由|在|把|被)/u.test(tail[1])) raw = `${tail[1]}${tail[2]}`;
   }
   const cand = cleanPhrase(raw);
@@ -474,18 +488,590 @@ function attrPhraseOf(query, pq) {
   if (/具体/u.test(String(query))) trimmed = trimmed.replace(/体$/u, '');
   const final = trimmed.length >= 2 ? trimmed : cand;
   // 短语里混进动词/量词（「未上船」「那批」）说明抽错了，宁可不判也不误伤。
-  if (/(未|没|导致|一批|那批|上船|下船|超过|不超过)/.test(final)) return '';
+  if (/(未|没|导致|一批|那批|超过|不超过)/.test(final)) return '';
   // 「叫什么名字」问的是名字这个词本身，属性缺席判据对它没有信息量；
   // 只放行这种纯答案类型词，复合短语（「舵机型号」）仍然要判。
   if (ANSWER_TYPE_ONLY.test(final)) return '';
   return [...final].length >= 2 ? final : '';
 }
 
+const SLOT_QUERY_INTERROGATIVE_RE = /(?:几(?:小时|分钟|秒|毫秒|千克|公斤|公里|厘米|毫米|吨|米|度|升)|多少|多久|多大|多远|多长|多重|多高|多深|几人|几个|几支|几卷|几块|几节|几种|几次|几条|几项|几页|几份|几张|几名|几行|几号|第几|哪一|哪条|哪个|哪里|哪国|哪年|哪月|哪日|哪位|哪天|什么|啥|谁|何时|何地|如何|怎么|怎样|为什么)/;
+
+
+
+function isSlotBackedStore(target) {
+  return Boolean(
+    target
+    && typeof target === 'object'
+    && (typeof target.querySlots === 'function' || typeof target.listEntitySlots === 'function'),
+  );
+}
+
+/**
+ * 解析问句中的 (entity, attr, expectedValue) 槽位探针，供 O(log N) entity_slots 证据门使用。
+ */
+export function parseSlotQuery(query, opts = {}) {
+  if (opts.entity !== undefined || opts.attr !== undefined || opts.attribute !== undefined || opts.value !== undefined) {
+    const entity = opts.entity ? cleanSlotEntity(String(opts.entity)) : '';
+    const attrRaw = opts.attr ?? opts.attribute ?? '';
+    const attr = attrRaw ? cleanSlotAttr(String(attrRaw)) : '';
+    let expectedValue = null;
+    let expectedUnit = '';
+    const checkValue = opts.value !== undefined && opts.value !== null && String(opts.value).trim() !== '';
+    if (checkValue) {
+      const nv = normalizeValueAndUnit(String(opts.value));
+      expectedValue = nv.value || String(opts.value).trim();
+      expectedUnit = nv.unit || '';
+    }
+    return {
+      entity,
+      attr,
+      expectedValue,
+      expectedUnit,
+      expectedRaw: checkValue ? String(opts.value).trim() : null,
+      checkValue,
+    };
+  }
+
+  let raw = String(query ?? '').trim();
+  if (!raw) {
+    return { entity: '', attr: '', expectedValue: null, expectedUnit: '', expectedRaw: null, checkValue: false };
+  }
+  raw = raw.replace(/^(?:请问|请教|帮我查一下|查一下|查询|查看|告诉我|请问一下|想问一下)\s*/, '');
+
+  // 1. 是非/核验问句探测：如 "API 网关的超时阈值是 3000ms 吗？" / "timeoutMs 是不是 90000？"
+  const strippedTail = raw.replace(/[吗么呢吧呀啊？?！!。，,\s]+$/g, '').trim();
+  const normalizedYesNo = strippedTail.replace(/(?:是不是|是否为|是否等于|是否定为|是否设为|是否)/g, '是');
+  const hasWhWord = SLOT_QUERY_INTERROGATIVE_RE.test(normalizedYesNo);
+
+  if (!hasWhWord) {
+    const assignment = normalizedYesNo.match(/^(.+?)\s*(?:是|为|等于|=)\s*(.+)$/);
+    const subject = assignment && splitCompactEntityAttr(assignment[1]);
+    if (subject?.entity && subject?.attr) {
+      const nv = normalizeValueAndUnit(assignment[2]);
+      return { ...subject, expectedValue: nv.value, expectedUnit: nv.unit, expectedRaw: assignment[2], checkValue: true };
+    }
+    const probeSlots = extractSlots(normalizedYesNo);
+    if (probeSlots.length > 0) {
+      const s0 = probeSlots[0];
+      if (s0.entity && s0.value && !SLOT_QUERY_INTERROGATIVE_RE.test(s0.value)) {
+        return {
+          entity: s0.entity,
+          attr: s0.attr || 'value',
+          expectedValue: s0.value,
+          expectedUnit: s0.unit || '',
+          expectedRaw: `${s0.value}${s0.unit || ''}`,
+          checkValue: true,
+        };
+      }
+    }
+    const ynDeMatch = normalizedYesNo.match(/^(.+?)的([^\s的]{1,16}?)\s*(?:是|为|等于|=)\s*([^\s？?吗么呢吧]+)$/);
+    if (ynDeMatch) {
+      const ent = cleanSlotEntity(ynDeMatch[1]);
+      const at = cleanSlotAttr(ynDeMatch[2]);
+      const nv = normalizeValueAndUnit(ynDeMatch[3]);
+      if (ent && at && (nv.value || ynDeMatch[3])) {
+        return {
+          entity: ent,
+          attr: at,
+          expectedValue: nv.value || ynDeMatch[3].trim(),
+          expectedUnit: nv.unit || '',
+          expectedRaw: ynDeMatch[3].trim(),
+          checkValue: true,
+        };
+      }
+    }
+  }
+
+  // 2. 开放属性问句：剥除疑问词尾巴，切分 (entity, attr)
+  const core = strippedTail
+    .replace(/\s*(?:是多少|为多少|是什么|叫什么|有哪些|有几个|是多少[A-Za-z\u4e00-\u9fff]*|怎么配置|怎么配|如何配置|如何设置|是多少呀|是多少呢|有什么|指什么|设为多少|定为多少).*$/, '')
+    .replace(/(?:多少|什么|几何|几|如何|怎么|怎样|为什么|是否|有没有)+$/, '')
+    .replace(/的$/, '')
+    .trim();
+
+  const lastDe = core.lastIndexOf('的');
+  if (lastDe > 0 && lastDe < core.length - 1) {
+    const ent = cleanSlotEntity(core.slice(0, lastDe));
+    const at = cleanSlotAttr(core.slice(lastDe + 1));
+    if (ent && at) {
+      return { entity: ent, attr: at, expectedValue: null, expectedUnit: '', expectedRaw: null, checkValue: false };
+    }
+  }
+
+  // 3. 紧凑型 "<entity><known_attr>"（无 "的" 字，如 "API网关超时阈值是多少" / "Redis端口是多少"）
+  const compact = splitCompactEntityAttr(core);
+  if (compact?.entity && compact?.attr) {
+    return { ...compact, expectedValue: null, expectedUnit: '', expectedRaw: null, checkValue: false };
+  }
+
+  // 4. 单一代码配置键问句：如 "timeoutMs 是多少？" -> entity="timeoutMs", attr="value"
+  const identMatch = core.match(/^([A-Za-z_][A-Za-z0-9_.:/-]{1,63})$/);
+  if (identMatch) {
+    return {
+      entity: cleanSlotEntity(identMatch[1]),
+      attr: 'value',
+      expectedValue: null,
+      expectedUnit: '',
+      expectedRaw: null,
+      checkValue: false,
+    };
+  }
+
+  // 5. 兜底：若整串是短实体名
+  const fallbackEnt = cleanSlotEntity(core);
+  return {
+    entity: fallbackEnt,
+    attr: '',
+    expectedValue: null,
+    expectedUnit: '',
+    expectedRaw: null,
+    checkValue: false,
+  };
+}
+
+function unitToBaseMsOrBytes(valStr, unit) {
+  const n = Number(valStr);
+  if (!Number.isFinite(n)) return null;
+  const u = String(unit || '').trim();
+  if (u === 'ms' || u === '毫秒') return { dim: 'time_ms', v: n };
+  if (u === 's' || u === '秒') return { dim: 'time_ms', v: n * 1000 };
+  if (u === 'min' || u === '分钟') return { dim: 'time_ms', v: n * 60000 };
+  if (u === 'h' || u === '小时') return { dim: 'time_ms', v: n * 3600000 };
+  if (u === 'B' || u === 'bytes') return { dim: 'bytes', v: n };
+  if (u === 'KB') return { dim: 'bytes', v: n * 1000 };
+  if (u === 'KiB') return { dim: 'bytes', v: n * 1024 };
+  if (u === 'MB') return { dim: 'bytes', v: n * 1e6 };
+  if (u === 'MiB') return { dim: 'bytes', v: n * 1048576 };
+  if (u === '厘米') return { dim: 'len_mm', v: n * 10 };
+  if (u === '毫米') return { dim: 'len_mm', v: n };
+  if (u === '米') return { dim: 'len_mm', v: n * 1000 };
+  return null;
+}
+
+function slotValueMatches(slotRow, expectedValue, expectedUnit) {
+  if ((slotRow.polarity ?? 1) < 0) return false;
+  const rv = String(slotRow.value ?? '').trim();
+  const ru = String(slotRow.unit ?? '').trim();
+  const ev = String(expectedValue ?? '').trim();
+  const eu = String(expectedUnit ?? '').trim();
+  if (!rv || !ev) return false;
+
+  if (rv.toLowerCase() === ev.toLowerCase()) {
+    if (!eu || (ru && ru.toLowerCase() === eu.toLowerCase())) return true;
+  }
+  if (`${rv}${ru}`.toLowerCase() === `${ev}${eu}`.toLowerCase()) return true;
+
+  const baseA = unitToBaseMsOrBytes(rv, ru);
+  const baseB = unitToBaseMsOrBytes(ev, eu);
+  if (baseA && baseB && baseA.dim === baseB.dim && Math.abs(baseA.v - baseB.v) < 1e-6) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * query 是否是一次「判定性提问」：带疑问词或以问号结尾。
+ * 关键词检索式 recall（如「PgBouncer default_pool_size 连接池」）没有可核验的断言，
+ * 证据门对它只能放行，否则正常检索会被当成缺证据拒掉。
+ */
+export function isJudgingQuestion(query) {
+  const q = String(query ?? '').trim();
+  if (!q) return false;
+  return SLOT_QUERY_INTERROGATIVE_RE.test(q) || /[?？]\s*$/.test(q);
+}
+
+function slotAttrMatches(rowAttr, queryAttr) {
+  if (!queryAttr) return true;
+  const ra = cleanSlotAttr(String(rowAttr ?? '')).toLowerCase();
+  const qa = cleanSlotAttr(String(queryAttr ?? '')).toLowerCase();
+  if (!ra || !qa) return false;
+  if (ra === qa) return true;
+  if (qa === 'value' && ra === 'value') return true;
+  // 允许同义前缀缩写（例如 "超时阈值" vs "超时"、"端口号" vs "端口"），但禁止跨属性混淆
+  if (ra.length >= 2 && qa.length >= 2 && (ra.includes(qa) || qa.includes(ra))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 基于 entity_slots SQL B-Tree 索引的 O(log N) 拒答证据门禁：
+ * 彻底废除全表 `SELECT text FROM memories` 拼接扫描，通过索引精确核验：
+ * 1) 实体是否已记录（缺实体 -> missing: 'entity', reason: 'entity-not-recorded'）
+ * 2) 属性是否已记录（缺属性 -> missing: 'attribute', reason: 'attribute-not-recorded'）
+ * 3) 值是否已记录（缺值 -> missing: 'value', reason: 'value-not-recorded'）
+ */
+export function gateSlots(query, store, opts = {}) {
+  const queryFn = typeof store?.listEntitySlots === 'function'
+    ? store.listEntitySlots.bind(store)
+    : typeof store?.querySlots === 'function'
+      ? store.querySlots.bind(store)
+      : null;
+  if (!queryFn) {
+    throw new TypeError('gateSlots: store 必须提供 querySlots 或 listEntitySlots 方法');
+  }
+
+  let spaces = null;
+  if (Array.isArray(opts.spaces) && opts.spaces.length) {
+    spaces = opts.spaces.map(String);
+  } else if (typeof opts.spaceId === 'string' && opts.spaceId.trim()) {
+    const sp = opts.spaceId.trim();
+    spaces = opts.includeGlobal === false || sp === GLOBAL_SPACE_ID ? [sp] : [sp, GLOBAL_SPACE_ID];
+  } else if (opts.scope && typeof opts.scope === 'object') {
+    spaces = visibleSpaces(opts.scope);
+  }
+
+  const parsed = parseSlotQuery(query, opts);
+
+  // 与 gate() 一致：非判定性提问（关键词检索、短语召回）不进证据门，
+  // 否则槽位图会替它编一个「缺属性」的理由把正常召回拒死。
+  if (!isJudgingQuestion(query)) {
+    return {
+      deny: false,
+      missing: null,
+      reason: 'not-a-question',
+      entity: parsed.entity || null,
+      attribute: parsed.attr || null,
+      value: null,
+      hits: [],
+      detail: '非判定性提问，证据门不介入',
+    };
+  }
+
+  // 解释型问句问的是缘由与经过，不由某个槽位的值裁定：与 gate() 的同名放行保持一致，
+  // 否则槽位索引会把 bodyVerdict 已放行的解释型问句反向拒死。
+  if (parseQuery(query).explain) {
+    return {
+      deny: false,
+      missing: null,
+      reason: 'explain-question',
+      entity: parsed.entity || null,
+      attribute: parsed.attr || null,
+      value: null,
+      hits: [],
+      detail: '解释型问句，证据门放行',
+    };
+  }
+
+  // O(1) 非空探针：走索引取 LIMIT 1，绝不扫 memories 全表
+  const anyRow = queryFn({ ...(spaces ? { spaces } : {}), activeOnly: true, limit: 1 });
+  if (!Array.isArray(anyRow) || anyRow.length === 0) {
+    return {
+      deny: true,
+      missing: 'entity',
+      reason: 'entity-not-recorded',
+      entity: parsed.entity || null,
+      attribute: parsed.attr || null,
+      value: parsed.expectedValue || null,
+      hits: [],
+      detail: parsed.entity
+        ? `缺实体：记忆库为空，未记录实体「${parsed.entity}」`
+        : '缺实体：当前作用域内无任何已记录槽位事实',
+    };
+  }
+
+  if (!parsed.entity) {
+    return {
+      deny: false,
+      missing: null,
+      reason: 'explain-question',
+      entity: null,
+      attribute: parsed.attr || null,
+      value: null,
+      hits: [],
+      detail: '开放性非特定实体提问，证据门放行',
+    };
+  }
+
+  // O(log N) 索引点查：entity_slots(space_id, entity, attr) / entity_slots(entity, attr)
+  const probeEntities = [parsed.entity];
+  if (parsed.entity.toLowerCase() !== parsed.entity) probeEntities.push(parsed.entity.toLowerCase());
+  if (parsed.entity.toUpperCase() !== parsed.entity) probeEntities.push(parsed.entity.toUpperCase());
+  if (parsed.attr && parsed.attr !== 'value') {
+    probeEntities.push(`${parsed.entity}${parsed.attr}`);
+    probeEntities.push(`${parsed.entity}.${parsed.attr}`);
+  }
+
+  let entityRows = [];
+  let matchedEntity = parsed.entity;
+  let matchedViaCombinedKey = false;
+
+  for (const candEnt of probeEntities) {
+    const rows = queryFn({ ...(spaces ? { spaces } : {}), entity: candEnt, activeOnly: true, limit: 64 });
+    if (Array.isArray(rows) && rows.length > 0) {
+      entityRows = rows;
+      matchedEntity = rows[0].entity;
+      if (candEnt === `${parsed.entity}${parsed.attr}` || candEnt === `${parsed.entity}.${parsed.attr}`) {
+        matchedViaCombinedKey = true;
+      }
+      break;
+    }
+  }
+
+  // 若 SQLite 大小写混合（如库中存 "RedisCluster"，查询为 "rediscluster"），使用 NOCASE 范围/点查兜底（仍不扫 memories）
+  if (entityRows.length === 0 && typeof store?.raw === 'function' && /^[A-Za-z0-9_.:/-]+$/.test(parsed.entity)) {
+    try {
+      const db = store.raw();
+      const spaceFilter = spaces ? `AND s.space_id IN (${spaces.map(() => '?').join(', ')})` : '';
+      const sql = `
+        SELECT s.slot_id AS slotId, s.memory_id AS memoryId, s.space_id AS spaceId,
+               s.entity, s.attr, s.value, s.unit, s.polarity, s.confidence, s.quote,
+               s.created_at AS createdAt
+        FROM main.entity_slots s
+        JOIN main.memories m ON m.id = s.memory_id
+        WHERE m.status = 'active' ${spaceFilter} AND s.entity = ? COLLATE NOCASE
+        LIMIT 64
+      `;
+      const params = spaces ? [...spaces, parsed.entity] : [parsed.entity];
+      const rows = db.prepare(sql).all(...params);
+      if (rows.length > 0) {
+        entityRows = rows;
+        matchedEntity = rows[0].entity;
+      }
+    } catch {
+      // 忽略底层连接只读差异
+    }
+  }
+
+  // 写入侧 L1 抽取常把实体连写进 attr（entity 为空串），实体点查必然落空。
+  // 用 attr 前缀范围查（走索引仍是 O(log N)）重建实体归属，只接受 attr 以实体开头的行，
+  // 保证「核心网关监听端口」归属实体「核心网关」，又不会把无关属性拉进来。
+  if (entityRows.length === 0 && parsed.entity && typeof store?.querySlots === 'function') {
+    const entText = String(parsed.entity).trim();
+    const prefixRows = entText
+      ? store.querySlots({ ...(spaces ? { spaces } : {}), attrPrefix: entText, activeOnly: true, limit: 64 })
+      : [];
+    const ownedRows = (Array.isArray(prefixRows) ? prefixRows : [])
+      .filter((r) => String(r.attr ?? '').startsWith(entText));
+    if (ownedRows.length > 0) {
+      entityRows = ownedRows;
+      matchedEntity = entText;
+    }
+  }
+
+  if (entityRows.length === 0) {
+    return {
+      deny: true,
+      missing: 'entity',
+      reason: 'entity-not-recorded',
+      entity: parsed.entity,
+      attribute: parsed.attr || null,
+      value: parsed.expectedValue || null,
+      hits: [],
+      detail: `缺实体：记忆库未记录实体「${parsed.entity}」`,
+    };
+  }
+
+  // Step 2: O(log N) 检查属性是否已记录
+  let attrRows = entityRows;
+  let matchedAttr = parsed.attr || entityRows[0]?.attr || 'value';
+
+  if (parsed.attr && !matchedViaCombinedKey) {
+    // 先做复合索引精确点查 (space_id, entity, attr)
+    const exactAttrRows = queryFn({
+      ...(spaces ? { spaces } : {}),
+      entity: matchedEntity,
+      attr: parsed.attr,
+      activeOnly: true,
+      limit: 32,
+    });
+    if (Array.isArray(exactAttrRows) && exactAttrRows.length > 0) {
+      attrRows = exactAttrRows;
+      matchedAttr = exactAttrRows[0].attr;
+    } else {
+      const fuzzy = entityRows.filter((r) => slotAttrMatches(r.attr, parsed.attr));
+      if (fuzzy.length > 0) {
+        attrRows = fuzzy;
+        matchedAttr = fuzzy[0].attr;
+      } else {
+        const recordedAttributes = [...new Set(entityRows.map((r) => r.attr))];
+        return {
+          deny: true,
+          missing: 'attribute',
+          reason: 'attribute-not-recorded',
+          entity: matchedEntity,
+          attribute: parsed.attr,
+          value: parsed.expectedValue || null,
+          recordedAttributes,
+          hits: [],
+          detail: `缺属性：实体「${matchedEntity}」已记录（含属性：${recordedAttributes.join('、')}），但未记录属性「${parsed.attr}」`,
+        };
+      }
+    }
+  }
+
+  // Step 3: O(log N) 检查值是否已记录
+  const positiveRows = attrRows.filter((r) => (r.polarity ?? 1) > 0 && String(r.value ?? '').trim() !== '');
+  if (parsed.checkValue && parsed.expectedValue !== null) {
+    // 先试复合索引精确点查 value
+    const exactValRows = queryFn({
+      ...(spaces ? { spaces } : {}),
+      entity: matchedEntity,
+      attr: matchedAttr,
+      value: parsed.expectedValue,
+      activeOnly: true,
+      limit: 16,
+    }).filter((r) => slotValueMatches(r, parsed.expectedValue, parsed.expectedUnit));
+
+    const matchedValRows = exactValRows.length > 0
+      ? exactValRows
+      : positiveRows.filter((r) => slotValueMatches(r, parsed.expectedValue, parsed.expectedUnit));
+
+    if (matchedValRows.length === 0) {
+      const recordedValues = [...new Set(positiveRows.map((r) => `${r.value}${r.unit || ''}`))];
+      return {
+        deny: true,
+        missing: 'value',
+        reason: 'value-not-recorded',
+        entity: matchedEntity,
+        attribute: matchedAttr,
+        value: parsed.expectedValue,
+        recordedValues,
+        hits: [],
+        detail: `缺值：实体「${matchedEntity}」的属性「${matchedAttr}」未记录值「${parsed.expectedRaw ?? parsed.expectedValue}」`
+          + (recordedValues.length ? `（已记录值：${recordedValues.join('、')}）` : ''),
+      };
+    }
+
+    return {
+      deny: false,
+      missing: null,
+      reason: 'hit',
+      entity: matchedEntity,
+      attribute: matchedAttr,
+      value: matchedValRows[0].value,
+      hits: matchedValRows,
+      detail: `槽位命中：${matchedEntity}.${matchedAttr} = ${matchedValRows[0].value}${matchedValRows[0].unit || ''}`,
+    };
+  }
+
+  if (positiveRows.length === 0) {
+    return {
+      deny: true,
+      missing: 'value',
+      reason: 'value-not-recorded',
+      entity: matchedEntity,
+      attribute: matchedAttr,
+      value: null,
+      recordedValues: [],
+      hits: [],
+      detail: `缺值：实体「${matchedEntity}」的属性「${matchedAttr}」未记录有效正向值`,
+    };
+  }
+
+  return {
+    deny: false,
+    missing: null,
+    reason: 'hit',
+    entity: matchedEntity,
+    attribute: matchedAttr,
+    value: positiveRows[0].value,
+    hits: positiveRows,
+    detail: `槽位命中：${matchedEntity}.${matchedAttr}`,
+  };
+}
+
+// Inspect only the caller's bounded candidate text. Ownership is established inside one
+// clause by the subject immediately preceding its attribute, never by document-wide includes.
+function candidateEvidence(query, text) {
+  // Keep a leading condition attached even when a comma separates it from the assertion.
+  const leadingCondition = /^(?:(?:在|如果|若|当|仅当)\s*.+?(?:情况下|的时候|环境下|模式下|条件下|之时|下|时))[,，]?\s*/;
+  const queryCondition = String(query).trim().match(leadingCondition)?.[0] || '';
+  const parsed = parseSlotQuery(String(query).trim().slice(queryCondition.length));
+  if (!parsed.entity || !parsed.attr || parsed.attr === 'value') return null;
+  // A bare compound noun has no explicit subject boundary. Require the complete
+  // compound attribute immediately followed by a value, not separate document hits.
+  const explicitSubject = /(?:项目|服务|系统|网关|模块|组件|集群|节点|实例|对象|队列|缓存|线程池|连接池|号)$/.test(parsed.entity);
+  if (!parsed.checkValue && !queryCondition && !String(query).includes('的')
+      && parsed.entity.length >= 2 && !explicitSubject) {
+    const compound = parsed.entity + parsed.attr;
+    let mentioned = false;
+    for (const sentence of String(text).split(/[。！？；;\n]/)) {
+      const conditional = Boolean(sentence.trim().match(leadingCondition));
+      for (const clause of sentence.split(/[，,]/)) {
+        const at = clause.indexOf(compound);
+        if (at < 0) continue;
+        const value = clause.slice(at + compound.length).trim();
+        if (conditional || /^(?:不是|不为|不等于)/.test(value)) mentioned = true;
+        if (!conditional && /^(?:是|为|约|大约|达|达到|高达|[:：=])?\s*[-+零一二三四五六七八九十百千万亿两\d]/.test(value)) {
+          return { deny: false, reason: 'literal-hit', missing: null, entity: null, attribute: compound, detail: '完整复合属性与数值在同一子句中相邻绑定' };
+        }
+      }
+    }
+    return mentioned ? { deny: true, evidenceBound: true, reason: 'attribute-not-recorded', missing: 'attribute', entity: null, attribute: compound, detail: '复合属性缺少无条件肯定数值断言' } : null;
+  }
+  const conditionKey = s => String(s).replace(/[,，\s]/g, '');
+  const rows = [];
+  for (const sentence of String(text).split(/[。！？；;\n]/)) {
+    const condition = sentence.trim().match(leadingCondition)?.[0] || '';
+    for (const clause of sentence.split(/[，,]/)) {
+      const at = clause.indexOf(parsed.entity);
+      if (at < 0) continue;
+      const prefix = clause.slice(0, at).trim();
+      // A suffix inside a longer subject is not the queried subject. Conditions are wrappers,
+      // not part of the subject; other attached word characters cannot establish ownership.
+      const ownerPrefix = prefix.replace(leadingCondition, '');
+      if (/[\p{L}\p{N}_]$/u.test(ownerPrefix)) continue;
+      const rest = clause.slice(at + parsed.entity.length).replace(/^\s*的?\s*/, '');
+      if (!rest.startsWith(parsed.attr)) continue;
+      const predicate = rest.slice(parsed.attr.length).match(/^\s*(不是|不为|不等于|是|为|等于|设为|定为|约为|不超过|不少于|不低于|不高于|达到|高达|[:：=])?\s*(.+)$/);
+      if (!predicate) continue;
+      const negative = /^(?:不是|不为|不等于)$/.test(predicate[1] || '');
+      const exact = !/^(?:约为|不超过|不少于|不低于|不高于|达到|高达)$/.test(predicate[1] || '');
+      const conditionMatches = !condition || conditionKey(condition) === conditionKey(queryCondition);
+      const nv = normalizeValueAndUnit(predicate[2]);
+      rows.push({ value: nv.value, unit: nv.unit, polarity: negative ? -1 : 1, conditionMatches, exact });
+    }
+  }
+  if (rows.some(r => r.conditionMatches && r.polarity > 0 && (!parsed.checkValue || (r.exact && slotValueMatches(r, parsed.expectedValue, parsed.expectedUnit))))) {
+    return { deny: false, reason: 'literal-hit', missing: null, entity: parsed.entity, attribute: parsed.attr, detail: '同一子句中主体、属性和值有直接绑定证据' };
+  }
+  // A mentioned subject cannot borrow another subject's attribute/value.
+  if (rows.length || (String(text).includes(parsed.entity) && String(text).includes(parsed.attr))) {
+    return { deny: true, evidenceBound: true, reason: parsed.checkValue ? 'value-not-recorded' : 'attribute-not-recorded', missing: parsed.checkValue ? 'value' : 'attribute', entity: parsed.entity, attribute: parsed.attr, detail: '候选片段缺少相同主体、属性及断言的绑定证据' };
+  }
+  return null;
+}
+
 export function gate(query, target, opts = {}) {
+  // v2 架构快速通道：当传入 SQLiteStore（或提供 querySlots/listEntitySlots 的存储引擎）时，
+  // 100% 走 entity_slots SQL 索引 O(log N) 证据门，彻底废除全表 SELECT text FROM memories！
+  if (isSlotBackedStore(target)) {
+    return gateSlots(query, target, opts);
+  }
+  if (typeof target === 'string' && isSlotBackedStore(opts.store)) {
+    const slotVerdict = gateSlots(query, opts.store, opts);
+    if (slotVerdict.deny) return slotVerdict;
+  }
+
   const store = typeof target === 'string' ? buildStore([{ n: 1, text: target }]) : target;
 
+  // 证据门只管判定性提问：关键词检索、短语召回没有可核验的断言，
+  // 让它们进后面的实体/属性硬门只会把正常召回误判成编造。
+  if (!isJudgingQuestion(query)) {
+    return { deny: false, missing: null, reason: 'not-a-question', detail: '非判定性提问，不做证据核验' };
+  }
+
+  const candidateText = typeof target === 'string' ? target : store?.text;
+  if (candidateText && !parseQuery(query).explain) {
+    const evidence = candidateEvidence(query, candidateText);
+    if (evidence) return evidence;
+  }
+
   if (!store || !store.facts || store.facts.length === 0) {
-    return { deny: true, reason: 'no-facts', detail: '材料里没有抽出任何可判断的事实' };
+    // 结构化抽取抽不出事实，不等于片段里没有答案：按「片段字面核验」回退。
+    // 1) 非判定性提问（关键词检索、短语召回）没有可核验的断言，放行；
+    // 2) 解释型问句问缘由，放行（与 gateSlots 同名分支保持一致）；
+    // 3) 疑问句只要问到的属性在片段里字面出现，答案就由片段本身承载，放行；
+    // 4) 其余情况才是真正无从核验，按 no-facts 拒答。
+    if (!isJudgingQuestion(query)) {
+      return { deny: false, missing: null, reason: 'not-a-question', detail: '非判定性提问，不做证据核验' };
+    }
+    if (parseQuery(query).explain) {
+      return { deny: false, missing: null, reason: 'explain-question', detail: '解释型问句，材料里没有可判定的结构化事实' };
+    }
+    return { deny: true, missing: 'entity', reason: 'no-facts', detail: '材料里没有抽出任何可判断的事实' };
   }
 
   // 实体只在「真的当过某个事实主语」的名字里选。词表里的噪声（「航次代号」也算名义实体）
@@ -525,7 +1111,7 @@ export function gate(query, target, opts = {}) {
     if (/^[一二三四五六七八九十]/.test(name)) continue;
     if (subjects.has(name)) continue;
     if (fullText.includes(norm(name))) continue;
-    // 事实主语可能记成「白鲸」而问句写「白鲸号」：主语里存在互为前后缀的实体就算有这号对象。
+    // 事实主语可能记成「天枢」而问句写「天枢号」：主语里存在互为前后缀的实体就算有这号对象。
     // 不能拿 core 是否出现在全文当判据——「远洋」是普通名词，语料里到处都有，那样会整体放行。
     if ([...subjects].some((s) => name.startsWith(s) || s.startsWith(name))) continue;
     if ([...name].length < 3) continue;
@@ -669,19 +1255,44 @@ export function gate(query, target, opts = {}) {
   };
 }
 
-// alternation 顺序有语义：多字单位必须先于它的尾字单位（公里/海里 在 里 前、厘米 在 米 前），
+// alternation 顺序有语义：多字单位必须先于它的尾字单位（公里/海里 在 里 前、厘米/毫米 在 米 前、毫秒 在 秒 前），
 // 否则尾字先行会先吃掉一部分。尺/寸/步/里 是中文小说里的常用量纲（丈量、里程、步测），
-// 缺了它们这批语料对冲突检测完全不可见。
+// 同时纳入常见工程量纲（毫秒/ms/GB/MB/KB/TB/次），并在 extractQuantities 源头根除副词量词与序数词误报。
 const NUM_UNIT = new RegExp(
-  '([零一二三四五六七八九十百千万两0-9]+(?:点[零一二三四五六七八九十0-9]+)?)\\s*(厘米|毫米|公里|海里|尺|寸|步|里|米|吨|美元|节|度|天|小时|分钟|秒|人)',
+  '([零一二三四五六七八九十百千万两0-9]+(?:(?:\\.|点)[零一二三四五六七八九十0-9]+)?)\\s*(厘米|毫米|毫秒|公里|海里|尺|寸|步|里|米|吨|美元|节|度|天|小时|分钟|秒|人|次|GB|MB|KB|TB|ms)(?![a-zA-Z])',
   'g',
 );
 
-/** 从一段文字里抽「数值+单位」，带所在句，供冲突检测用。 */
+// ── 源头根除副词量词、成语量词与序数步骤误报 ──────────────────────────────────
+const ADVERBIAL_QUANTITY_WORDS = new Set([
+  '一次', '一下', '一步', '一点', '一般', '一趟', '一回', '一番', '一并', '一同', '一齐', '一道',
+  '一度', '二度', '三度', '二次', '再次', '每次', '各次', '数次', '多次', '某次',
+  '万里', '千里', '百里', '十万八千里',
+]);
+const ADVERB_PREFIX_RE = /(?:第|[进退上下前头初再又多]|重试|执行|运行|调用|尝试|试了?|看了?|走了?|退了?|进了?|缓了?|等了?|停了?|跑了?|刷了?|点了?|按了?)$/;
+const ADVERB_SUFFIX_RE = /^(?:性|步|到位|子|儿|半点|钟?内|左右而已)/;
+
+function isFalseQuantityMatch(sentText, matchIdx, fullMatch, numStr, unitStr) {
+  const compact = `${numStr}${unitStr}`.trim();
+  if (ADVERBIAL_QUANTITY_WORDS.has(compact)) return true;
+  const before = sentText.slice(Math.max(0, matchIdx - 4), matchIdx);
+  const after = sentText.slice(matchIdx + fullMatch.length, matchIdx + fullMatch.length + 4);
+  // 序数词（如「第一步 / 第二步 / 第一次 / 第二次 / 第一天 / 第二天」）不是可比较的标量数值槽
+  if (before.endsWith('第')) return true;
+  // 固定副词后缀（如「一次性」「一步步」「一步到位」）
+  if (numStr === '一' && ADVERB_SUFFIX_RE.test(after)) return true;
+  // 动词后的动量补语（如「重试两次」「试了一次」「走了两步」「等了两秒」）
+  if ((unitStr === '次' || unitStr === '步') && ADVERB_PREFIX_RE.test(before)) return true;
+  if (unitStr === '度' && /^(?:中断|搁浅|延期|失败|放弃|停摆|重试|推迟|陷入)/.test(after)) return true;
+  return false;
+}
+
+/** 从一段文字里抽「数值+单位」，带所在句，供冲突检测用（源头过滤副词量词与序数词误报）。 */
 export function extractQuantities(text) {
   const out = [];
   for (const s of splitSentences(text)) {
     for (const m of s.text.matchAll(NUM_UNIT)) {
+      if (isFalseQuantityMatch(s.text, m.index ?? 0, m[0], m[1], m[2])) continue;
       out.push({ value: `${m[1]}${m[2]}`, num: m[1], unit: m[2], sent: s.text.trim() });
     }
   }
@@ -964,30 +1575,160 @@ export function documentConflicts(memories, options = {}) {
   return conflicts;
 }
 
+// ── 冲突三分判定（supersession 显式修订覆写 vs conditional 条件共存 vs disputed 同槽未决双侧呈现） ──
+const CONDITION_MARKERS = [
+  '仅当', '在[^，。；\\n]{1,16}情况下', '在[^，。；\\n]{1,16}模式下', '当[^，。；\\n]{1,16}时',
+  '如果', '若', '前提是', '只适用于', '测试环境', '生产环境', '开发环境', '预发环境', '本地环境', '线上环境',
+  '只在', '仅在', '灰度', '离线', '冷备', '主用', '双活', '单机', '集群',
+  'Windows', 'Linux', 'macOS',
+];
+const CONDITION_RE = new RegExp(CONDITION_MARKERS.join('|'), 'i');
+
+const REVISION_VERBS = /原报|原测|原记录|原载|原写|原称|原为|原系|原属|更正|作废|已废弃|现予更正|现调整为|现改为|改为|改用|升级为|迁移至|切换为|调整为|最新变更为|更新为|已撤销|已推翻|以.{0,8}为准|系(?:目测|估值|估算|估计|估测|概算|粗算|初算|误报|误记|笔误)/;
+
+/**
+ * 冲突分类判定（三分法）：
+ * 1) supersession（显式修订覆写）：显式 supersedes/supersededBy 链或更正/升级/改为措辞，单侧胜出；
+ * 2) conditional（条件共存）：携带环境、平台、模式或前置条件分支，两侧合法共存，互不覆写；
+ * 3) disputed（同槽未决冲突）：无条件隔离且无显式覆写证据，同一槽位存在互斥事实，执行双侧并存呈现（dualSide）。
+ */
+export function classifyConflict(itemA, itemB, opts = {}) {
+  const textA = String(itemA?.text ?? itemA?.sent ?? '');
+  const textB = String(itemB?.text ?? itemB?.sent ?? '');
+  const idA = itemA?.id ?? itemA?.memId ?? null;
+  const idB = itemB?.id ?? itemB?.memId ?? null;
+  const combo = `${textA}\n${textB}`;
+
+  const supersedesA = Array.isArray(itemA?.supersedes) ? itemA.supersedes : itemA?.supersedes ? [itemA.supersedes] : [];
+  const supersedesB = Array.isArray(itemB?.supersedes) ? itemB.supersedes : itemB?.supersedes ? [itemB.supersedes] : [];
+  const supersededByA = Array.isArray(itemA?.supersededBy) ? itemA.supersededBy : itemA?.supersededBy ? [itemA.supersededBy] : [];
+  const supersededByB = Array.isArray(itemB?.supersededBy) ? itemB.supersededBy : itemB?.supersededBy ? [itemB.supersededBy] : [];
+
+  const aSupersedesB = Boolean((idB && supersedesA.includes(idB)) || (idA && supersededByB.includes(idA)));
+  const bSupersedesA = Boolean((idA && supersedesB.includes(idA)) || (idB && supersededByA.includes(idB)));
+  const hasSupersedeId = aSupersedesB || bSupersedesA;
+  const hasRevisionWords = REVISION_VERBS.test(combo);
+
+  // 1. 显式修订覆写（supersession）
+  if (hasSupersedeId || hasRevisionWords) {
+    const atA = Number(itemA?.at ?? itemA?.createdAt ?? 0);
+    const atB = Number(itemB?.at ?? itemB?.createdAt ?? 0);
+    let currentItem = atB >= atA ? itemB : itemA;
+    let supersededItem = currentItem === itemB ? itemA : itemB;
+    if (aSupersedesB) { currentItem = itemA; supersededItem = itemB; }
+    else if (bSupersedesA) { currentItem = itemB; supersededItem = itemA; }
+    else if (hasRevisionWords) {
+      const OLD_MARK = /(?:原报|原测|原记录|原载|原写|原称|原为|原系|原属)|系(?:目测|估值|估算|估计|估测|概算|粗算|初算|误报|误记|笔误)/;
+      const NEW_MARK = /现予更正|现调整为|现改为|改为|改用|升级为|迁移至|切换为|调整为|最新变更为|更新为|以.{0,8}为准/;
+      const aHasNew = NEW_MARK.test(textA);
+      const bHasNew = NEW_MARK.test(textB);
+      const aHasOldOnly = OLD_MARK.test(textA) && !aHasNew;
+      const bHasOldOnly = OLD_MARK.test(textB) && !bHasNew;
+      if (aHasNew && !bHasNew) { currentItem = itemA; supersededItem = itemB; }
+      else if (bHasNew && !aHasNew) { currentItem = itemB; supersededItem = itemA; }
+      else if (aHasOldOnly && !bHasOldOnly) { currentItem = itemB; supersededItem = itemA; }
+      else if (bHasOldOnly && !aHasOldOnly) { currentItem = itemA; supersededItem = itemB; }
+    }
+    return {
+      type: 'supersession',
+      presentation: 'winner-only',
+      winner: currentItem.id ?? currentItem.memId ?? null,
+      winnerValue: currentItem.value,
+      superseded: supersededItem.id ?? supersededItem.memId ?? null,
+      supersededValue: supersededItem.value,
+      reason: hasSupersedeId ? 'explicit-supersedes-link' : 'revision-verb-detected',
+    };
+  }
+
+  // 2. 条件共存判定（conditional）
+  const condMatchA = textA.match(CONDITION_RE);
+  const condMatchB = textB.match(CONDITION_RE);
+  if (condMatchA || condMatchB) {
+    return {
+      type: 'conditional',
+      presentation: 'coexist',
+      winner: null,
+      winnerValue: null,
+      superseded: null,
+      supersededValue: null,
+      reason: 'condition-marker-detected',
+      conditions: [
+        { id: idA, condition: condMatchA ? condMatchA[0] : 'default', text: textA, value: itemA.value },
+        { id: idB, condition: condMatchB ? condMatchB[0] : 'default', text: textB, value: itemB.value },
+      ],
+    };
+  }
+
+  // 3. 同槽未决冲突（disputed —— 双侧并存呈现）
+  const ordered = [itemA, itemB].sort(
+    (x, y) => Number(x?.at ?? x?.createdAt ?? 0) - Number(y?.at ?? y?.createdAt ?? 0),
+  );
+  const prior = {
+    id: ordered[0]?.id ?? ordered[0]?.memId ?? null,
+    value: ordered[0]?.value,
+    text: String(ordered[0]?.text ?? ordered[0]?.sent ?? ''),
+    at: ordered[0]?.at ?? ordered[0]?.createdAt ?? 0,
+  };
+  const latest = {
+    id: ordered[1]?.id ?? ordered[1]?.memId ?? null,
+    value: ordered[1]?.value,
+    text: String(ordered[1]?.text ?? ordered[1]?.sent ?? ''),
+    at: ordered[1]?.at ?? ordered[1]?.createdAt ?? 0,
+  };
+  return {
+    type: 'disputed',
+    presentation: 'dual-side',
+    winner: null,
+    winnerValue: null,
+    superseded: null,
+    supersededValue: null,
+    reason: 'same-slot-unresolved-conflict',
+    dualSide: {
+      slotKey: opts.slotKey ?? itemA?.slotKey ?? itemB?.slotKey ?? null,
+      prior,
+      latest,
+      summary: `[未决冲突双侧呈现] 侧A(${prior.value}): ${prior.text} | 侧B(${latest.value}): ${latest.text}`,
+    },
+    branches: [prior, latest],
+  };
+}
+
 export function resolveConflict(memories) {
   const byUnit = new Map();
-  for (const mem of memories) {
+  const memMetaById = new Map();
+  for (const mem of memories ?? []) {
     const at = mem.createdAt ?? mem.ch ?? 0;
+    memMetaById.set(mem.id, mem);
     for (const q of extractQuantities(mem.text)) {
       if (!byUnit.has(q.unit)) byUnit.set(q.unit, []);
-      byUnit.get(q.unit).push({ ...q, memId: mem.id, at });
+      byUnit.get(q.unit).push({
+        ...q,
+        memId: mem.id,
+        at,
+        supersedes: mem.supersedes ?? null,
+        supersededBy: mem.supersededBy ?? null,
+        slotKey: mem.slotKey ?? mem.slot_key ?? null,
+      });
     }
   }
 
   const conflicts = [];
+  const conditional = [];
+  const disputed = [];
   const current = {};
   const superseded = [];
+  const coveredMemPairs = new Set();
+
+  const pairSig = (id1, id2) => [String(id1 ?? ''), String(id2 ?? '')].sort().join('||');
+
   for (const [unit, items] of byUnit) {
     const values = [...new Set(items.map((i) => i.value))];
     if (values.length <= 1) continue;
     const sorted = items.slice().sort((a, b) => a.at - b.at);
 
     // 修正措辞检测：「原报 X 系估值/现予更正」——X 是旧值，句子里的另一个值才是新值。
-    // 不能按时间排序取最后一条：同一条记忆新旧共存时，时间排序会把旧值当新值。
-    // 也不能整句降权：那句同时包含新旧两个值，全降就把新值也误杀了。
-    // 匹配多种修正句式：「原报 X」「X 系估值」「以 X 为准」「现予更正」等。
-    const REV_OLD = /(?:原报|原测|原记录|原载|原写|原称|原为|原系|原属)\s*([零一二三四五六七八九十百千万亿两\d]+(?:点[零一二三四五六七八九\d]+)?)\s*(厘米|毫米|米|公里|海里|千瓦|吨|美元|万美元|元|天|小时|分钟|秒|节|度|人|名|页|项|张|份|条|件|支|块|卷|升|平方米|立方米|公斤|百帕|次)/g;
-    const REV_OLD2 = /([零一二三四五六七八九十百千万亿两\d]+(?:点[零一二三四五六七八九\d]+)?)\s*(厘米|毫米|米|公里|海里|千瓦|吨|美元|万美元|元|天|小时|分钟|秒|节|度|人|名|页|项|张|份|条|件|支|块|卷|升|平方米|立方米|公斤|百帕|次)\s*系(?:目测|估值|估算|估计|估测|概算|粗算|初算|误报|误记|笔误)/g;
+    const REV_OLD = /(?:原报|原测|原记录|原载|原写|原称|原为|原系|原属)\s*([零一二三四五六七八九十百千万亿两\d]+(?:(?:\.|点)[零一二三四五六七八九\d]+)?)\s*(厘米|毫米|毫秒|米|公里|海里|尺|寸|步|里|千瓦|吨|美元|万美元|元|天|小时|分钟|秒|节|度|人|名|页|项|张|份|条|件|支|块|卷|升|平方米|立方米|公斤|百帕|次|GB|MB|KB|TB|ms)/g;
+    const REV_OLD2 = /([零一二三四五六七八九十百千万亿两\d]+(?:(?:\.|点)[零一二三四五六七八九\d]+)?)\s*(厘米|毫米|毫秒|米|公里|海里|尺|寸|步|里|千瓦|吨|美元|万美元|元|天|小时|分钟|秒|节|度|人|名|页|项|张|份|条|件|支|块|卷|升|平方米|立方米|公斤|百帕|次|GB|MB|KB|TB|ms)\s*系(?:目测|估值|估算|估计|估测|概算|粗算|初算|误报|误记|笔误)/g;
     const demoted = new Set();
     for (const item of sorted) {
       for (const m of item.sent.matchAll(REV_OLD)) {
@@ -1003,31 +1744,128 @@ export function resolveConflict(memories) {
     for (let i = sorted.length - 1; i >= 0; i--) {
       if (!demoted.has(sorted[i].value)) { latest = sorted[i]; break; }
     }
-    if (!latest) latest = sorted[sorted.length - 1]; // 全被降权时退化为时间最新
+    if (!latest) latest = sorted[sorted.length - 1];
 
     const old = sorted.filter((i) => i.value !== latest.value);
     if (!old.length) continue;
     const noun = sharedNounMulti([latest.sent, ...old.map((o) => o.sent)]);
-    // 没有共同名词就不是「同一件事被改口」，只是两个恰好同单位的数
     if (!noun) continue;
+
+    const primaryOld = old[old.length - 1];
+    const tri = classifyConflict(primaryOld, latest, { slotKey: `${noun}|${unit}` });
+    for (const oItem of old) coveredMemPairs.add(pairSig(oItem.memId, latest.memId));
+
     const key = `${noun}|${unit}`;
-    current[key] = latest.value;
-    superseded.push(...old);
-    conflicts.push({
+    const entry = {
       key,
       entity: null,
       attr: noun,
       unit,
       values: [...new Set(sorted.map((i) => i.value))],
-      current: latest.value,
-      currentMemId: latest.memId,
-      supersededValues: [...new Set(old.map((o) => o.value))],
+      current: tri.type === 'conditional' ? null : (tri.winnerValue ?? latest.value),
+      currentMemId: tri.type === 'conditional' ? null : (tri.winner ?? latest.memId),
+      supersededValues: tri.type === 'supersession' ? [...new Set(old.map((o) => o.value))] : [],
+      conflictType: tri.type,
+      presentation: tri.presentation,
+      classification: tri,
+      ...(tri.dualSide ? { dualSide: tri.dualSide } : {}),
+      ...(tri.conditions ? { conditions: tri.conditions } : {}),
       evidence: sorted.map((s) => ({ value: s.value, memId: s.memId, at: s.at, text: s.sent })),
-      // 只用于诊断：原文自己带了更正措辞，不能算插件的能力
       revisionMarkInText: /更正|作废|以.{0,6}为准|现予更正|已撤销|已推翻/.test(sorted.map((s) => s.sent).join('')),
-    });
+    };
+
+    conflicts.push(entry);
+    if (tri.type === 'conditional') {
+      conditional.push(entry);
+    } else if (tri.type === 'disputed') {
+      disputed.push(entry);
+      current[key] = latest.value;
+    } else {
+      current[key] = tri.winnerValue ?? latest.value;
+      superseded.push(...old);
+    }
   }
-  return { conflicts, current, superseded, factCount: byUnit.size };
+
+  // ── 第二通道：结构化 entity_slots 同槽异值冲突（覆盖无中文量词的工程配置/协议/端口等） ──
+  const bySlotKey = new Map();
+  for (const mem of memories ?? []) {
+    const at = mem.createdAt ?? mem.ch ?? 0;
+    const slots = Array.isArray(mem.slots) && mem.slots.length ? mem.slots : extractSlots(mem.text);
+    for (const s of slots) {
+      const entityNorm = cleanSlotEntity(s.entity ?? '').toLowerCase();
+      const attrNorm = cleanSlotAttr(s.attr ?? '').toLowerCase();
+      if (!entityNorm || !attrNorm) continue;
+      const sk = mem.slotKey ?? mem.slot_key ?? `${entityNorm}::${attrNorm}`;
+      const valStr = `${s.value ?? ''}${s.unit ?? ''}`.trim();
+      if (!valStr) continue;
+      let list = bySlotKey.get(sk);
+      if (!list) { list = []; bySlotKey.set(sk, list); }
+      list.push({
+        memId: mem.id,
+        at,
+        entity: s.entity,
+        attr: s.attr,
+        unit: s.unit ?? '',
+        value: valStr,
+        sent: s.quote || String(mem.text ?? '').trim(),
+        text: String(mem.text ?? ''),
+        supersedes: mem.supersedes ?? null,
+        supersededBy: mem.supersededBy ?? null,
+        slotKey: sk,
+      });
+    }
+  }
+
+  for (const [sk, items] of bySlotKey) {
+    const distinctVals = [...new Set(items.map((x) => x.value.toLowerCase()))];
+    if (distinctVals.length <= 1) continue;
+    const sorted = items.slice().sort((a, b) => a.at - b.at);
+    const latest = sorted[sorted.length - 1];
+    const old = sorted.filter((x) => x.value.toLowerCase() !== latest.value.toLowerCase());
+    if (!old.length) continue;
+    const primaryOld = old[old.length - 1];
+    if (coveredMemPairs.has(pairSig(primaryOld.memId, latest.memId))) continue;
+
+    const tri = classifyConflict(primaryOld, latest, { slotKey: sk });
+    const entry = {
+      key: sk,
+      slotKey: sk,
+      entity: latest.entity ?? primaryOld.entity ?? null,
+      attr: latest.attr ?? primaryOld.attr,
+      unit: latest.unit || null,
+      values: [...new Set(sorted.map((x) => x.value))],
+      current: tri.type === 'conditional' ? null : (tri.winnerValue ?? latest.value),
+      currentMemId: tri.type === 'conditional' ? null : (tri.winner ?? latest.memId),
+      supersededValues: tri.type === 'supersession' ? [...new Set(old.map((o) => o.value))] : [],
+      conflictType: tri.type,
+      presentation: tri.presentation,
+      classification: tri,
+      ...(tri.dualSide ? { dualSide: tri.dualSide } : {}),
+      ...(tri.conditions ? { conditions: tri.conditions } : {}),
+      evidence: sorted.map((s) => ({ value: s.value, memId: s.memId, at: s.at, text: s.sent })),
+      revisionMarkInText: REVISION_VERBS.test(sorted.map((s) => s.text).join('\n')),
+    };
+
+    conflicts.push(entry);
+    if (tri.type === 'conditional') {
+      conditional.push(entry);
+    } else if (tri.type === 'disputed') {
+      disputed.push(entry);
+      current[sk] = latest.value;
+    } else {
+      current[sk] = tri.winnerValue ?? latest.value;
+      superseded.push(...old);
+    }
+  }
+
+  return {
+    conflicts,
+    conditional,
+    disputed,
+    current,
+    superseded,
+    factCount: byUnit.size + bySlotKey.size,
+  };
 }
 
 /**
@@ -1117,4 +1955,27 @@ export function render(query, cands, opts = {}) {
   return { inject, gate: g, fit, chars: body.length + ptr.length, narrative: Boolean(narrate) };
 }
 
-export default { gate, resolveConflict, decayWeight, fitBudget, render, buildStore, extractFacts, buildEntities, parseQuery, norm, CONFLICT_THRESHOLDS, textSim, conflictPairs, adjudicateConflicts, gateTextDocument, gateSearchIndex, conflictNarrate, extractQuantities };
+export default {
+  gate,
+  gateSlots,
+  parseSlotQuery,
+  classifyConflict,
+  resolveConflict,
+  documentConflicts,
+  decayWeight,
+  fitBudget,
+  render,
+  buildStore,
+  extractFacts,
+  buildEntities,
+  parseQuery,
+  norm,
+  CONFLICT_THRESHOLDS,
+  textSim,
+  conflictPairs,
+  adjudicateConflicts,
+  gateTextDocument,
+  gateSearchIndex,
+  conflictNarrate,
+  extractQuantities,
+};

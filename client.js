@@ -46,6 +46,7 @@ window.__ModuleLoader__.load({
       bad: 'var(--dsw-alias-state-error-primary)',
       fill: 'var(--dsw-alias-button-primary-fill)',
       onFill: 'var(--dsw-alias-label-primary-foreground)',
+      accent: 'var(--dsw-static-accent-500, var(--dsw-alias-button-primary-fill))',
       mono: 'var(--ds-font-family-code, ui-monospace, SFMono-Regular, Consolas, monospace)',
       radius: 'var(--dsw-radius-xl)',
       radiusSm: 'calc(var(--dsw-radius-xl) / 2)',
@@ -190,16 +191,270 @@ window.__ModuleLoader__.load({
      * order/total 之后才可能是「最新」。文案必须与实际排序一致，不能默认说「最近」。
      * total 优先端点回传，退 status.stats.memories，都缺才退 rows.length。
      */
-    function countLabel(mems, stats) {
-      const rows = (mems && mems.rows) || [];
-      const n = rows.length;
+    function countLabel(mems, stats, shownCount) {
+      const list = (mems && (Array.isArray(mems.items) ? mems.items : mems.rows)) || [];
+      const n = Number.isFinite(shownCount) ? shownCount : list.length;
       const total = (mems && Number.isFinite(mems.total)) ? mems.total
         : (stats && Number.isFinite(stats.memories)) ? stats.memories : n;
       const desc = !!(mems && mems.order === 'desc');
       if (n === 120 && total > 120) {
         return (desc ? '最新 120 条' : '显示最早 120 条') + ' · 共 ' + fmt(total) + ' 条';
       }
+      if (total > n && n >= 0) {
+        return '显示 ' + fmt(n) + ' / 共 ' + fmt(total) + ' 条';
+      }
       return fmt(n) + ' 条';
+    }
+
+    // ----------------------------------------------------- v2 范畴、层级与空间元数据
+
+    const CATEGORIES = [
+      { id: 'rule', label: '铁律', short: '铁律', en: 'rule', color: C.bad, borderColor: C.bad, desc: '不可违背的硬约束与约定（L0 常驻）' },
+      { id: 'profile', label: '画像', short: '画像', en: 'profile', color: C.accent, borderColor: C.accent, desc: '用户身份、习惯偏好与环境底座（L0 常驻）' },
+      { id: 'decision', label: '决策', short: '决策', en: 'decision', color: C.warn, borderColor: C.warn, desc: '架构选型、技术取舍与项目裁决' },
+      { id: 'experience', label: '经验', short: '经验', en: 'experience', color: C.fg2, borderColor: C.line3, desc: '实践教训、排障记录与一般事件' },
+      { id: 'state', label: '单活状态', short: '单活状态', en: 'state', color: C.ok, borderColor: C.ok, desc: '按 slotKey 原地覆写的当前活跃状态（L0 常驻）' },
+    ];
+
+    const CATEGORY_MAP = (() => {
+      const out = {};
+      for (const c of CATEGORIES) out[c.id] = c;
+      return out;
+    })();
+
+    const LAYERS = [
+      { id: 'L0', num: 0, label: 'L0', name: '恒温', color: C.bad, borderColor: C.bad, desc: 'L0 核心恒温层：铁律/画像/单活状态，豁免衰减' },
+      { id: 'L1', num: 1, label: 'L1', name: '活跃', color: C.ok, borderColor: C.ok, desc: 'L1 温水原子层：近期活跃，动态检索直命中' },
+      { id: 'L2', num: 2, label: 'L2', name: '知识', color: C.warn, borderColor: C.warn, desc: 'L2 聚类知识层：沉淀编译进持久化 Wiki 页' },
+      { id: 'L3', num: 3, label: 'L3', name: '归档', color: C.fg3, borderColor: C.line3, desc: 'L3 冷压缩层：多对一高倍浓缩归档' },
+    ];
+
+    const LAYER_MAP = (() => {
+      const out = {};
+      for (const l of LAYERS) out[l.id] = l;
+      return out;
+    })();
+
+    function resolveItemCategory(r) {
+      if (!r || typeof r !== 'object') return null;
+      if (typeof r.category === 'string' && CATEGORY_MAP[r.category]) return r.category;
+      if (r.kind === 'promise') return 'rule';
+      if (r.kind === 'person') return 'profile';
+      if (r.kind === 'event') return 'experience';
+      return null;
+    }
+
+    function resolveItemLayer(r) {
+      if (!r || typeof r !== 'object') return null;
+      if (typeof r.layer === 'string') {
+        const up = r.layer.trim().toUpperCase();
+        if (LAYER_MAP[up]) return up;
+      }
+      if (Number.isInteger(r.lTier) && r.lTier >= 0 && r.lTier <= 3) return 'L' + r.lTier;
+      if (Number.isInteger(r.tier) && r.tier >= 0 && r.tier <= 3) return 'L' + r.tier;
+      return null;
+    }
+
+    function canDemoteMemory(r) {
+      if (!r || typeof r !== 'object' || !r.id) return false;
+      const cat = resolveItemCategory(r);
+      const layer = resolveItemLayer(r);
+      if (layer === 'L0') return true;
+      if (cat && cat !== 'experience') return true;
+      if (r.kind === 'person' || r.kind === 'promise') return true;
+      return false;
+    }
+
+    /** 提取工作区友好路径标签：优先可读目录尾段，避免裸露 workspace:hex 哈希。 */
+    function friendlyPathTail(rawPath) {
+      const s = typeof rawPath === 'string' ? rawPath.trim().replace(/\\/g, '/').replace(/\/+$/, '') : '';
+      if (!s) return '';
+      const parts = s.split('/').filter(Boolean);
+      if (parts.length === 0) return s;
+      if (parts.length === 1) return parts[0];
+      const last2 = parts.slice(-2).join('/');
+      return last2.length <= 36 ? last2 : parts[parts.length - 1];
+    }
+
+    function friendlySpaceLabel(sp) {
+      if (!sp) return '全局';
+      if (typeof sp === 'string') {
+        if (sp === 'all') return '全部空间';
+        if (sp === 'global') return '全局';
+        if (/^workspace:/i.test(sp)) {
+          const tail = sp.slice('workspace:'.length);
+          return '工作区 ' + (tail.length > 8 ? tail.slice(0, 8) + '…' : tail);
+        }
+        return sp;
+      }
+      const id = String(sp.spaceId || sp.id || '');
+      if (!id || id === 'global') return '全局';
+      if (id === 'all') return '全部空间';
+      const fromRoot = friendlyPathTail(sp.rootPath);
+      if (fromRoot) return fromRoot;
+      const lbl = typeof sp.label === 'string' ? sp.label.trim() : '';
+      if (lbl && lbl.toLowerCase() !== id.toLowerCase()) {
+        const fromLbl = friendlyPathTail(lbl);
+        return fromLbl || lbl;
+      }
+      if (/^workspace:/i.test(id)) {
+        const tail = id.slice('workspace:'.length);
+        return '工作区 ' + (tail.length > 8 ? tail.slice(0, 8) + '…' : tail);
+      }
+      return id;
+    }
+
+    function buildSpaceOptions(rawSpaces, stats, allItems, activeSpace) {
+      const list = Array.isArray(rawSpaces) ? rawSpaces : [];
+      const seen = new Set();
+      let globalEntry = null;
+      const workspaces = [];
+      let sumKnown = 0;
+
+      for (const raw of list) {
+        if (!raw || typeof raw !== 'object') continue;
+        const id = String(raw.spaceId || raw.id || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const cnt = Number.isFinite(Number(raw.memoryCount)) ? Number(raw.memoryCount) : null;
+        if (cnt !== null) sumKnown += cnt;
+        if (id === 'global') {
+          globalEntry = {
+            id: 'global',
+            kind: 'global',
+            label: '全局 (global)',
+            shortLabel: '全局',
+            rootPath: '',
+            count: cnt,
+          };
+        } else {
+          const friendly = friendlySpaceLabel(raw);
+          workspaces.push({
+            id: id,
+            kind: raw.kind || (id.indexOf('workspace:') === 0 ? 'workspace' : 'custom'),
+            label: friendly,
+            shortLabel: friendly,
+            rootPath: typeof raw.rootPath === 'string' ? raw.rootPath : '',
+            rawLabel: typeof raw.label === 'string' ? raw.label : '',
+            count: cnt,
+          });
+        }
+      }
+
+      if (Array.isArray(allItems)) {
+        for (const it of allItems) {
+          const spId = it && typeof it.spaceId === 'string' ? it.spaceId.trim() : '';
+          if (spId && spId !== 'global' && !seen.has(spId)) {
+            seen.add(spId);
+            workspaces.push({
+              id: spId,
+              kind: spId.indexOf('workspace:') === 0 ? 'workspace' : 'custom',
+              label: friendlySpaceLabel(spId),
+              shortLabel: friendlySpaceLabel(spId),
+              rootPath: '',
+              rawLabel: '',
+              count: null,
+            });
+          }
+        }
+      }
+
+      if (activeSpace && activeSpace !== 'all' && activeSpace !== 'global' && !seen.has(activeSpace)) {
+        workspaces.push({
+          id: activeSpace,
+          kind: activeSpace.indexOf('workspace:') === 0 ? 'workspace' : 'custom',
+          label: friendlySpaceLabel(activeSpace),
+          shortLabel: friendlySpaceLabel(activeSpace),
+          rootPath: '',
+          rawLabel: '',
+          count: null,
+        });
+      }
+
+      const totalCount = (stats && Number.isFinite(Number(stats.memories)))
+        ? Number(stats.memories)
+        : (list.length > 0 ? sumKnown : null);
+
+      const out = [
+        { id: 'all', kind: 'all', label: '全部空间', shortLabel: '全部空间', rootPath: '', count: totalCount },
+        globalEntry || { id: 'global', kind: 'global', label: '全局 (global)', shortLabel: '全局', rootPath: '', count: null },
+      ];
+      for (const ws of workspaces) out.push(ws);
+      return out;
+    }
+
+    /** 将行内 `code` 拆分为安全的 React 节点序列，零 HTML 注入风险。 */
+    function renderInlineCode(line, keyPrefix) {
+      const s = String(line == null ? '' : line);
+      if (s.indexOf('`') < 0) return s;
+      const parts = s.split(/(`[^`]+`)/g);
+      const out = [];
+      for (let i = 0; i < parts.length; i += 1) {
+        const seg = parts[i];
+        if (!seg) continue;
+        if (seg.length >= 2 && seg.charAt(0) === '`' && seg.charAt(seg.length - 1) === '`') {
+          out.push(h('code', {
+            key: keyPrefix + ':c' + i,
+            style: {
+              fontFamily: C.mono, fontSize: 12, padding: '1px 5px',
+              background: C.layer1, border: '1px solid ' + C.line2, borderRadius: 4, color: C.fg,
+            },
+          }, seg.slice(1, -1)));
+        } else {
+          out.push(seg);
+        }
+      }
+      return out;
+    }
+
+    /** 安全渲染 Wiki 知识页结构化摘要 / Markdown 正文（纯 createElement，严禁 innerHTML）。 */
+    function renderStructuredMarkdown(raw) {
+      const text = typeof raw === 'string' ? raw.trim() : '';
+      if (!text) return h(Hint, null, '（暂无摘要正文）');
+      const lines = text.split(/\r?\n/);
+      const nodes = [];
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (!trimmed) {
+          nodes.push(h('div', { key: 'sp' + i, style: { height: 6 } }));
+          continue;
+        }
+        const hMatch = /^(#{1,4})\s+(.+)$/.exec(trimmed);
+        if (hMatch) {
+          const lvl = hMatch[1].length;
+          nodes.push(h('div', {
+            key: 'h' + i,
+            style: {
+              fontSize: lvl <= 2 ? 13 : 12,
+              fontWeight: 600,
+              color: C.fg,
+              marginTop: i === 0 ? 0 : 8,
+              marginBottom: 3,
+              lineHeight: '1.45',
+            },
+          }, renderInlineCode(hMatch[2], 'h' + i)));
+          continue;
+        }
+        const bMatch = /^[-*•]\s+(.+)$/.exec(trimmed);
+        if (bMatch) {
+          nodes.push(h('div', {
+            key: 'b' + i,
+            style: {
+              display: 'flex', alignItems: 'flex-start', gap: 6,
+              fontSize: 13, lineHeight: '1.55', color: C.fg, marginTop: 2, wordBreak: 'break-word',
+            },
+          },
+            h('span', { 'aria-hidden': 'true', style: { color: C.fg2, flex: '0 0 auto' } }, '•'),
+            h('span', { style: { flex: '1 1 auto', minWidth: 0 } }, renderInlineCode(bMatch[1], 'b' + i))));
+          continue;
+        }
+        nodes.push(h('div', {
+          key: 'p' + i,
+          style: { fontSize: 13, lineHeight: '1.55', color: C.fg, marginTop: 2, wordBreak: 'break-word' },
+        }, renderInlineCode(trimmed, 'p' + i)));
+      }
+      return h('div', { className: 'mj-wikibody' }, nodes);
     }
 
     // ----------------------------------------------------- 注入 CSS（§10）
@@ -213,6 +468,7 @@ window.__ModuleLoader__.load({
       '.mj-sec{margin-top:20px}',
       '.mj-card{padding:14px 16px;box-sizing:border-box}',
       '.mj-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}',
+      '.mj-budgetgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}',
       '.mj-num{font-size:20px;line-height:1.2;font-weight:600;font-variant-numeric:tabular-nums}',
       '.mj-modrow{display:flex;align-items:center;gap:10px;padding:8px 0}',
       '.mj-modname{flex:0 0 96px;width:96px;min-width:0}',
@@ -221,7 +477,12 @@ window.__ModuleLoader__.load({
       '.mj-keyrow{display:flex;align-items:center;gap:8px}',
       '.mj-keyinput{flex:1 1 auto;min-width:0;position:relative;display:flex}',
       '.mj-keyact{display:flex;align-items:center;gap:8px}',
-      '.mj-meta{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}',
+      '.mj-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.mj-pillbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+      '.mj-pill{display:inline-flex;align-items:center;gap:5px;min-height:28px;padding:0 10px;box-sizing:border-box}',
+      '.mj-pill:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.mj-memcard{border-bottom:1px solid var(--dsw-alias-border-l1);padding:6px 0}',
+      '.mj-memcard:last-child{border-bottom:none}',
       // 凭证分组之间的分隔线由 CSS 承担：内联值优先级高于 @container，窄档就收不紧了。
       '.mj-credgroup+.mj-credgroup,.mj-globalblock{margin-top:12px;padding-top:12px;'
         + 'border-top:1px solid var(--dsw-alias-border-l1)}',
@@ -246,7 +507,7 @@ window.__ModuleLoader__.load({
       '.mj-text:focus-visible{outline:2px solid var(--dsw-static-accent-500,var(--dsw-alias-label-primary));outline-offset:1px}',
       '.mj-btn:focus-visible,.mj-primary:focus-visible,.mj-icon:focus-visible,'
         + '.mj-link:focus-visible,.mj-switch:focus-visible,.mj-memrow:focus-visible,'
-        + '.mj-fold:focus-visible{outline:2px solid var(--dsw-alias-label-primary);outline-offset:2px}',
+        + '.mj-pill:focus-visible,.mj-fold:focus-visible{outline:2px solid var(--dsw-alias-label-primary);outline-offset:2px}',
       '.mj-scroll{scrollbar-width:thin;overscroll-behavior:contain}',
       '.mj-scroll::-webkit-scrollbar{width:8px;height:8px}',
       '.mj-scroll::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l3);border-radius:999px}',
@@ -255,6 +516,7 @@ window.__ModuleLoader__.load({
         + '.mj-sec{margin-top:12px}'
         + '.mj-card{padding:10px 12px}'
         + '.mj-grid{grid-template-columns:repeat(2,minmax(0,1fr))}'
+        + '.mj-budgetgrid{grid-template-columns:minmax(0,1fr)}'
         + '.mj-keyrow{flex-wrap:wrap}'
         + '.mj-keyinput{flex:1 1 100%}'
         + '.mj-keyact{margin-left:auto}'
@@ -561,7 +823,7 @@ window.__ModuleLoader__.load({
       rerankBaseUrl: '',
       rerankModel: 'Qwen/Qwen3-Reranker-8B',
       dims: '64',
-      storageLimitBytes: '2048',
+      storageLimitBytes: '10240',
       maxChars: '0',
     };
 
@@ -768,35 +1030,42 @@ window.__ModuleLoader__.load({
       conflicts: { cap: 40 },
     };
 
-    function useEndpoint(rpc, endpoint) {
+    function useEndpoint(rpc, endpoint, customPayload, depsKey) {
       const [state, setState] = useState({ phase: 'loading', data: null, error: '' });
       const alive = useRef(true);
+      const payloadRef = useRef(customPayload || ENDPOINT_PAYLOAD[endpoint]);
+      payloadRef.current = customPayload || ENDPOINT_PAYLOAD[endpoint];
       // 重新挂载时必须把标记置回 true，否则 StrictMode 下第一次 cleanup 之后
       // 所有落地回调都被丢弃，面板永远停在「读取中…」。
       useEffect(() => {
         alive.current = true;
         return () => { alive.current = false; };
       }, []);
-      const load = useCallback(() => {
+      const load = useCallback((overridePayload) => {
         setState((prev) => ({ phase: 'loading', data: prev.data, error: '' }));
+        const reqPayload = (overridePayload && typeof overridePayload === 'object' && !overridePayload.nativeEvent)
+          ? overridePayload
+          : payloadRef.current;
         let p;
         try {
-          p = rpc(endpoint, ENDPOINT_PAYLOAD[endpoint]);
+          p = rpc(endpoint, reqPayload);
         } catch (e) {
           p = Promise.reject(e);
         }
         return Promise.resolve(p).then((res) => {
-          if (!alive.current) return;
+          if (!alive.current) return null;
           if (res && res.ok) {
             setState({ phase: 'ready', data: res.value || null, error: '' });
-            return;
+            return res.value || null;
           }
           setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError(res) : errMsg(res) });
+          return null;
         }, (e) => {
-          if (!alive.current) return;
+          if (!alive.current) return null;
           setState({ phase: 'error', data: null, error: endpoint === 'status' ? modelError() : (e && e.message ? String(e.message) : String(e)) });
+          return null;
         });
-      }, [rpc, endpoint]);
+      }, [rpc, endpoint, depsKey || '']);
       useEffect(() => { load(); }, [load]);
       return [state, load, setState];
     }
@@ -806,17 +1075,87 @@ window.__ModuleLoader__.load({
     function MemjudgePanel({ rpc }) {
       ensureCss();
 
-      const [statusSt, reloadStatus, setStatusSt] = useEndpoint(rpc, 'status');
-      const [memsSt, reloadMems] = useEndpoint(rpc, 'memories');
-      const [confSt, reloadConf] = useEndpoint(rpc, 'conflicts');
+      // ---- v2 作用域、五类范畴、代谢层级、视图与治理状态（全部顶层固定槽位）
+      const [activeSpace, setActiveSpace] = useState('all');
+      const [activeCategory, setActiveCategory] = useState('all');
+      const [activeLayer, setActiveLayer] = useState('all');
+      const [searchQuery, setSearchQuery] = useState('');
+      const [viewTab, setViewTab] = useState('all');
+      const [openMems, setOpenMems] = useState({});
+      const [openRevs, setOpenRevs] = useState({});
+      const [revCache, setRevCache] = useState({});
+      const [openWikis, setOpenWikis] = useState({});
+      const [wikiSnapOverride, setWikiSnapOverride] = useState(null);
+      const [confirmForgetId, setConfirmForgetId] = useState('');
+      const [govBusy, setGovBusy] = useState('');
+      const [govFeedback, setGovFeedback] = useState(null);
+      const forgetArmTimer = useRef(null);
+      const govTimer = useRef(null);
+
+      useEffect(() => () => {
+        if (forgetArmTimer.current) clearTimeout(forgetArmTimer.current);
+        if (govTimer.current) clearTimeout(govTimer.current);
+      }, []);
+
+      const trimmedQuery = searchQuery.trim();
+      const statusPayload = activeSpace !== 'all' ? { spaceId: activeSpace } : ENDPOINT_PAYLOAD.status;
+      const memPayload = (() => {
+        if (activeSpace === 'all' && activeCategory === 'all' && activeLayer === 'all' && !trimmedQuery) {
+          return ENDPOINT_PAYLOAD.memories;
+        }
+        const out = { limit: 120, order: 'desc', v2: true, withRevisions: true };
+        if (activeSpace !== 'all') out.spaceId = activeSpace;
+        if (activeCategory !== 'all') out.category = activeCategory;
+        if (activeLayer !== 'all') out.layer = activeLayer;
+        if (trimmedQuery) out.q = trimmedQuery;
+        return out;
+      })();
+      const confPayload = activeSpace !== 'all'
+        ? { cap: 40, spaceId: activeSpace }
+        : ENDPOINT_PAYLOAD.conflicts;
+
+      const statusDepsKey = activeSpace;
+      const memDepsKey = activeSpace + '|' + activeCategory + '|' + activeLayer + '|' + trimmedQuery;
+      const confDepsKey = activeSpace;
+
+      const [statusSt, reloadStatus, setStatusSt] = useEndpoint(rpc, 'status', statusPayload, statusDepsKey);
+      const [memsSt, reloadMems] = useEndpoint(rpc, 'memories', memPayload, memDepsKey);
+      const [confSt, reloadConf] = useEndpoint(rpc, 'conflicts', confPayload, confDepsKey);
 
       const reloadAll = useCallback(() => {
+        setWikiSnapOverride(null);
         reloadStatus(); reloadMems(); reloadConf();
       }, [reloadStatus, reloadMems, reloadConf]);
 
-      const cfg = statusSt.data && statusSt.data.config ? statusSt.data.config : null;
-      const stats = statusSt.data && statusSt.data.stats ? statusSt.data.stats : null;
-      const rows = (memsSt.data && Array.isArray(memsSt.data.rows)) ? memsSt.data.rows : null;
+      const statusData = statusSt.data;
+      const memData = memsSt.data;
+      const cfg = statusData && statusData.config ? statusData.config : null;
+      const stats = statusData && statusData.stats ? statusData.stats : null;
+      const rawMemList = memData
+        ? (Array.isArray(memData.items)
+          ? memData.items
+          : (Array.isArray(memData.rows) ? memData.rows : null))
+        : null;
+      const rows = rawMemList ? rawMemList.filter((r) => {
+        if (!r || typeof r !== 'object') return false;
+        if (activeSpace !== 'all' && typeof r.spaceId === 'string' && r.spaceId && r.spaceId !== activeSpace) {
+          return false;
+        }
+        if (activeCategory !== 'all') {
+          if (resolveItemCategory(r) !== activeCategory) return false;
+        }
+        if (activeLayer !== 'all') {
+          if (resolveItemLayer(r) !== activeLayer) return false;
+        }
+        if (trimmedQuery) {
+          const qLower = trimmedQuery.toLowerCase();
+          const hay = [r.text, r.fullText, r.slotKey, r.source, r.id]
+            .map((x) => String(x || '').toLowerCase())
+            .join('\n');
+          if (hay.indexOf(qLower) < 0) return false;
+        }
+        return true;
+      }) : null;
       const conflicts = (confSt.data && Array.isArray(confSt.data.conflicts)) ? confSt.data.conflicts : null;
 
       // ---- 密钥区状态（§4）——三组各一套，不乐观更新，一切以 status 回读为准
@@ -873,7 +1212,8 @@ window.__ModuleLoader__.load({
       }, [patchSlot]);
 
       const pullStatus = useCallback(() => {
-        return Promise.resolve(rpc('status', {})).then((res) => {
+        const req = activeSpace !== 'all' ? { spaceId: activeSpace } : {};
+        return Promise.resolve(rpc('status', req)).then((res) => {
           if (res && res.ok) { setStatusSt({ phase: 'ready', data: res.value || null, error: '' }); return res.value; }
           setStatusSt({ phase: 'error', data: null, error: modelError(res) });
           return null;
@@ -881,7 +1221,7 @@ window.__ModuleLoader__.load({
           setStatusSt({ phase: 'error', data: null, error: modelError() });
           return null;
         });
-      }, [rpc, setStatusSt]);
+      }, [rpc, setStatusSt, activeSpace]);
 
       /** 保存一组的密钥：payload 带 group，成功后只重读 status（回读为准），并清掉该组输入。 */
       const saveKeyFor = useCallback((group) => {
@@ -1139,6 +1479,248 @@ window.__ModuleLoader__.load({
       // 同一组件会同时挂在设置页和右栏，aria-controls 的 id 必须按实例唯一。
       const memBodyId = useRef('mj-mem-body-' + Math.random().toString(36).slice(2, 8));
 
+      // ---- v2 治理动作与交互回调
+      const showGovMsg = useCallback((kind, text, fadeMs) => {
+        setGovFeedback({ kind, text });
+        if (govTimer.current) clearTimeout(govTimer.current);
+        govTimer.current = null;
+        if (fadeMs) {
+          govTimer.current = setTimeout(() => {
+            govTimer.current = null;
+            setGovFeedback(null);
+          }, fadeMs);
+        }
+      }, [setGovFeedback]);
+
+      const selectSpace = useCallback((nextSpace) => {
+        const sp = nextSpace || 'all';
+        setActiveSpace(sp);
+        setConfirmForgetId('');
+        setWikiSnapOverride(null);
+      }, [setActiveSpace, setConfirmForgetId, setWikiSnapOverride]);
+
+      const refreshWikiView = useCallback((spOverride) => {
+        const sp = typeof spOverride === 'string' ? spOverride : activeSpace;
+        const req = { action: 'wiki' };
+        if (sp && sp !== 'all') req.spaceId = sp;
+        return Promise.resolve(rpc('memories', req)).then((res) => {
+          if (res && res.ok && res.value && typeof res.value === 'object') {
+            setWikiSnapOverride(res.value);
+            return res.value;
+          }
+          return null;
+        }, () => null);
+      }, [rpc, activeSpace, setWikiSnapOverride]);
+
+      const switchViewTab = useCallback((nextTab) => {
+        setViewTab(nextTab);
+        if (nextTab === 'wiki') {
+          refreshWikiView(activeSpace);
+        }
+      }, [setViewTab, refreshWikiView, activeSpace]);
+
+      const triggerCompile = useCallback(() => {
+        if (govBusy) return;
+        setGovBusy('compile');
+        setGovFeedback(null);
+        const req = { action: 'compile' };
+        if (activeSpace !== 'all') req.spaceId = activeSpace;
+        Promise.resolve(rpc('memories', req)).then((res) => {
+          if (!(res && res.ok)) {
+            showGovMsg('err', '知识页编译失败：' + errMsg(res), 0);
+            return null;
+          }
+          const val = res.value || {};
+          setWikiSnapOverride(val);
+          const cr = val.compileResult || {};
+          const compiled = Number.isFinite(Number(cr.compiled)) ? Number(cr.compiled) : (Array.isArray(val.wiki_pages) ? val.wiki_pages.length : 0);
+          showGovMsg('ok', '知识页编译完成 · 共更新 ' + fmt(compiled) + ' 页。', 5000);
+          reloadAll();
+          return null;
+        }, () => {
+          showGovMsg('err', '知识页编译请求失败，请重试。', 0);
+        }).then(() => { setGovBusy(''); });
+      }, [govBusy, rpc, activeSpace, reloadAll, showGovMsg]);
+
+      const triggerMetabolism = useCallback(() => {
+        if (govBusy) return;
+        setGovBusy('metabolism');
+        setGovFeedback(null);
+        const req = { action: 'metabolism' };
+        if (activeSpace !== 'all') req.spaceId = activeSpace;
+        Promise.resolve(rpc('memories', req)).then((res) => {
+          if (!(res && res.ok)) {
+            showGovMsg('err', '执行代谢失败：' + errMsg(res), 0);
+            return null;
+          }
+          const val = res.value || {};
+          setWikiSnapOverride(val);
+          const acts = (val.metabolism && val.metabolism.actions) || {};
+          const l2n = Number(acts.l1DemotedToL2 ?? acts.l2Demoted ?? 0);
+          const l3n = Number(acts.l3Archived ?? 0);
+          const wn = Number(acts.wikiPagesUpdated ?? acts.wikiCompiled ?? 0);
+          const cn = Number(acts.compacted ?? 0);
+          showGovMsg(
+            'ok',
+            '生命周期代谢完成 · L2 沉淀 ' + fmt(l2n) + ' · Wiki 编译 ' + fmt(wn) + ' · L3 归档 ' + fmt(l3n)
+              + (cn > 0 ? ' · 压缩 ' + fmt(cn) : '')
+              + (acts.vacuumed ? ' · VACUUM' : '') + '。',
+            5000,
+          );
+          reloadAll();
+          return null;
+        }, () => {
+          showGovMsg('err', '执行代谢请求失败，请重试。', 0);
+        }).then(() => { setGovBusy(''); });
+      }, [govBusy, rpc, activeSpace, reloadAll, showGovMsg]);
+
+      const triggerReindex = useCallback(() => {
+        if (govBusy) return;
+        setGovBusy('reindex');
+        setGovFeedback(null);
+        Promise.resolve(rpc('status', { action: 'reindex' })).then((res) => {
+          if (!(res && res.ok)) {
+            showGovMsg('err', '重建索引失败：' + errMsg(res), 0);
+            return null;
+          }
+          const val = res.value || {};
+          const rx = val.reindex || {};
+          showGovMsg('ok', '检索索引已重建' + (Number.isFinite(Number(rx.docs)) ? ' · ' + fmt(rx.docs) + ' 条文档' : '') + '。', 5000);
+          reloadAll();
+          return null;
+        }, () => {
+          showGovMsg('err', '重建索引请求失败，请重试。', 0);
+        }).then(() => { setGovBusy(''); });
+      }, [govBusy, rpc, reloadAll, showGovMsg]);
+
+      const toggleMemOpen = useCallback((id) => {
+        if (!id) return;
+        setOpenMems((prev) => Object.assign({}, prev, { [id]: !prev[id] }));
+      }, [setOpenMems]);
+
+      const toggleWikiOpen = useCallback((key) => {
+        if (!key) return;
+        setOpenWikis((prev) => Object.assign({}, prev, { [key]: prev[key] === false }));
+      }, [setOpenWikis]);
+
+      const toggleRevisions = useCallback((item) => {
+        if (!item || !item.id) return;
+        const id = String(item.id);
+        const nextOpen = !openRevs[id];
+        setOpenRevs((prev) => Object.assign({}, prev, { [id]: nextOpen }));
+        if (!nextOpen) return;
+        if (Array.isArray(item.revisions) && item.revisions.length > 0) return;
+        if (revCache[id] && (revCache[id].loading || Array.isArray(revCache[id].items))) return;
+        setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: true, items: null, error: '' } }));
+        Promise.resolve(rpc('memories', { id, withRevisions: true })).then((res) => {
+          if (res && res.ok && res.value) {
+            const found = res.value.item || (Array.isArray(res.value.items) ? res.value.items[0] : null);
+            const revs = found && Array.isArray(found.revisions) ? found.revisions : [];
+            setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: false, items: revs, error: '' } }));
+          } else {
+            setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: false, items: [], error: '无法读取修订记录' } }));
+          }
+        }, () => {
+          setRevCache((prev) => Object.assign({}, prev, { [id]: { loading: false, items: [], error: '无法读取修订记录' } }));
+        });
+      }, [openRevs, revCache, rpc]);
+
+      const manualReload = useCallback(() => {
+        setWikiSnapOverride(null);
+        reloadAll();
+      }, [setWikiSnapOverride, reloadAll]);
+
+      const demoteItem = useCallback((item) => {
+        if (!item || !item.id || govBusy) return;
+        const id = String(item.id);
+        setGovBusy('demote:' + id);
+        setGovFeedback(null);
+        Promise.resolve(rpc('memories', { action: 'demote', id })).then((res) => {
+          if (!(res && res.ok)) {
+            showGovMsg('err', '降级失败：' + errMsg(res), 0);
+            return null;
+          }
+          setWikiSnapOverride(null);
+          showGovMsg('ok', '已将记忆 ' + id + ' 降级为普通经验事件（移出常驻底座）。', 4500);
+          reloadAll();
+          return null;
+        }, () => {
+          showGovMsg('err', '降级请求失败，请重试。', 0);
+        }).then(() => { setGovBusy(''); });
+      }, [govBusy, rpc, reloadAll, showGovMsg, setWikiSnapOverride]);
+
+      const armOrRunForget = useCallback((item) => {
+        if (!item || !item.id || govBusy) return;
+        const id = String(item.id);
+        if (confirmForgetId !== id) {
+          setConfirmForgetId(id);
+          if (forgetArmTimer.current) clearTimeout(forgetArmTimer.current);
+          forgetArmTimer.current = setTimeout(() => {
+            forgetArmTimer.current = null;
+            setConfirmForgetId('');
+          }, 5000);
+          return;
+        }
+        if (forgetArmTimer.current) clearTimeout(forgetArmTimer.current);
+        forgetArmTimer.current = null;
+        setConfirmForgetId('');
+        setGovBusy('forget:' + id);
+        setGovFeedback(null);
+        const req = { action: 'forget', id };
+        if (item.spaceId && item.spaceId !== 'all') req.spaceId = item.spaceId;
+        Promise.resolve(rpc('memories', req)).then((res) => {
+          if (!(res && res.ok)) {
+            showGovMsg('err', '物理遗忘失败：' + errMsg(res), 0);
+            return null;
+          }
+          setWikiSnapOverride(null);
+          showGovMsg('ok', '已物理遗忘记忆 ' + id + '。', 4500);
+          reloadAll();
+          return null;
+        }, () => {
+          showGovMsg('err', '物理遗忘请求失败，请重试。', 0);
+        }).then(() => { setGovBusy(''); });
+      }, [govBusy, confirmForgetId, rpc, reloadAll, showGovMsg, setWikiSnapOverride]);
+
+      const cancelForget = useCallback(() => {
+        if (forgetArmTimer.current) clearTimeout(forgetArmTimer.current);
+        forgetArmTimer.current = null;
+        setConfirmForgetId('');
+      }, [setConfirmForgetId]);
+
+      const resetFilters = useCallback(() => {
+        setActiveCategory('all');
+        setActiveLayer('all');
+        setSearchQuery('');
+      }, [setActiveCategory, setActiveLayer, setSearchQuery]);
+
+      // ---- v2 能力探测与归一化视图（旧版 v1/v7 缺省字段时自动平滑降级）
+      const isV2 = Boolean(
+        (statusData && (
+          Number(statusData.schemaVersion) >= 8
+          || Array.isArray(statusData.spaces)
+          || (statusData.categories && typeof statusData.categories === 'object')
+          || (statusData.layers && typeof statusData.layers === 'object')
+          || Array.isArray(statusData.wiki_pages)
+          || Array.isArray(statusData.pages)
+          || Array.isArray(statusData.states)
+          || statusData.tierS
+          || statusData.tierD
+          || statusData.inject
+        ))
+        || (memData && Array.isArray(memData.items)),
+      );
+
+      const spaceOptions = isV2
+        ? buildSpaceOptions(statusData && statusData.spaces, stats, rawMemList, activeSpace)
+        : [];
+      const spaceLabelMap = (() => {
+        const map = { all: '全部空间', global: '全局' };
+        for (const sp of spaceOptions) map[sp.id] = sp.shortLabel || sp.label;
+        return map;
+      })();
+      const currentSpaceObj = spaceOptions.find((s) => s.id === activeSpace) || null;
+
       // ---- 头部状态行（§2 三态）
       const allFailed = statusSt.phase === 'error' && memsSt.phase === 'error' && confSt.phase === 'error';
       const anyLoading = statusSt.phase === 'loading' || memsSt.phase === 'loading' || confSt.phase === 'loading';
@@ -1148,17 +1730,29 @@ window.__ModuleLoader__.load({
       const statusLine = allFailed
         ? '读取失败：' + (statusSt.error || '宿主 RPC 未响应')
         : firstLoad ? '正在读取记忆库…'
-          : anyLoading ? '刷新中…' : '已连接宿主 RPC';
+          : anyLoading ? '刷新中…'
+            : '已连接宿主 RPC' + (isV2 && statusData && statusData.schemaVersion ? ' · v2 (schema v' + statusData.schemaVersion + ')' : '');
 
       const header = h('div', { style: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' } },
         h('div', { style: { minWidth: 0 } },
           h('div', { style: { fontSize: 20, lineHeight: '1.3', fontWeight: 600, color: C.fg } }, '记忆库'),
           h('div', { style: { fontSize: 13, lineHeight: '1.5', color: C.fg2, marginTop: 2 } }, statusLine)),
-        h(Btn, {
-          onClick: reloadAll,
-          disabled: anyLoading,
-          title: '重新拉取库体、记忆与冲突',
-        }, anyLoading ? '刷新中…' : '↻ 刷新'));
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+          isV2 ? h(Btn, {
+            onClick: triggerCompile,
+            disabled: !!govBusy || anyLoading,
+            title: '将当前空间的活跃聚类编译为持久化 L2 知识页',
+          }, govBusy === 'compile' ? '编译中…' : '编译知识页') : null,
+          isV2 ? h(Btn, {
+            onClick: triggerMetabolism,
+            disabled: !!govBusy || anyLoading,
+            title: '执行 L1→L2 沉淀、脏知识页编译与 L3 归档代谢',
+          }, govBusy === 'metabolism' ? '代谢中…' : '执行代谢') : null,
+          h(Btn, {
+            onClick: manualReload,
+            disabled: anyLoading,
+            title: '重新拉取库体、记忆与冲突',
+          }, anyLoading ? '刷新中…' : '↻ 刷新')));
 
       const rootStyle = {
         containerType: 'inline-size',
@@ -1183,12 +1777,258 @@ window.__ModuleLoader__.load({
             h(Btn, { primary: true, onClick: reloadAll }, '重试')));
       }
 
+      // ==================================================== 空间切换与治理反馈条
+      const scopeSection = isV2 ? h('div', {
+        className: 'mj-sec',
+        'data-section': 'scope-switcher',
+        style: { marginTop: 14 },
+      },
+        h(Card, { style: { padding: '10px 14px' } },
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' },
+          },
+            h('div', {
+              className: 'mj-pillbar',
+              role: 'group',
+              'aria-label': '记忆空间切换',
+            },
+              spaceOptions.map((sp) => {
+                const selected = activeSpace === sp.id;
+                const countTxt = sp.count !== null && Number.isFinite(sp.count) ? ' (' + fmt(sp.count) + ')' : '';
+                const prefix = sp.kind === 'workspace' ? '工作区 · ' : '';
+                const fullTitle = sp.rootPath
+                  ? sp.rootPath + ' [' + sp.id + ']'
+                  : (sp.id === 'all' ? '查看所有空间的记忆' : sp.id);
+                return h('button', {
+                  key: sp.id,
+                  type: 'button',
+                  className: 'mj-pill',
+                  'data-space': sp.id,
+                  'aria-pressed': selected ? 'true' : 'false',
+                  title: fullTitle,
+                  onClick: () => selectSpace(sp.id),
+                  style: {
+                    borderRadius: 999,
+                    fontSize: 12,
+                    lineHeight: '1.4',
+                    fontFamily: 'inherit',
+                    fontWeight: selected ? 600 : 400,
+                    cursor: 'pointer',
+                    background: selected ? C.fill : C.layer2,
+                    color: selected ? C.onFill : C.fg,
+                    border: '1px solid ' + (selected ? C.fill : C.line2),
+                  },
+                }, prefix + sp.label + countTxt);
+              })),
+            h('div', { className: 'mj-pillbar', role: 'group', 'aria-label': '视图模式' },
+              [
+                { id: 'all', label: '综合视图' },
+                { id: 'memories', label: '仅看记忆' },
+                { id: 'wiki', label: '知识页 (Wiki)' },
+              ].map((vt) => {
+                const active = viewTab === vt.id;
+                return h('button', {
+                  key: vt.id,
+                  type: 'button',
+                  className: 'mj-pill',
+                  'data-view-tab': vt.id,
+                  'aria-pressed': active ? 'true' : 'false',
+                  onClick: () => switchViewTab(vt.id),
+                  style: {
+                    borderRadius: C.radiusSm,
+                    fontSize: 12,
+                    lineHeight: '1.4',
+                    fontFamily: 'inherit',
+                    fontWeight: active ? 600 : 400,
+                    cursor: 'pointer',
+                    background: active ? C.layer2 : 'transparent',
+                    color: active ? C.fg : C.fg2,
+                    border: '1px solid ' + (active ? C.line3 : C.line1),
+                  },
+                }, vt.label);
+              }))),
+          currentSpaceObj && currentSpaceObj.rootPath
+            ? h(Hint, { mono: true, style: { marginTop: 8, wordBreak: 'break-all' } },
+              '当前工作区：' + currentSpaceObj.rootPath + ' (' + currentSpaceObj.id + ')')
+            : null,
+          govFeedback
+            ? h('div', {
+              'aria-live': 'polite',
+              'data-gov-feedback': govFeedback.kind,
+              style: {
+                marginTop: 8, paddingTop: 8, borderTop: '1px solid ' + C.line1,
+                fontSize: 12, lineHeight: '1.5',
+                color: govFeedback.kind === 'err' ? C.bad : govFeedback.kind === 'ok' ? C.ok : C.fg2,
+              },
+            }, govFeedback.text)
+            : null)) : null;
+
       // ============================================================ 概览 A
       const overviewError = statusSt.phase === 'error';
       const overviewEmpty = !!stats && Number(stats.memories) === 0;
 
+      const scopedUnfilteredMems = (isV2 && activeSpace !== 'all' && activeCategory === 'all' && activeLayer === 'all' && !searchQuery.trim() && rawMemList)
+        ? rawMemList.filter((it) => it && (!it.spaceId || it.spaceId === activeSpace))
+        : null;
+
+      const catCounts = (() => {
+        if (scopedUnfilteredMems && (!memData || !Number.isFinite(Number(memData.total)) || Number(memData.total) <= rawMemList.length)) {
+          const acc = { rule: 0, profile: 0, decision: 0, experience: 0, state: 0 };
+          for (const it of scopedUnfilteredMems) {
+            const c = resolveItemCategory(it);
+            if (c && acc[c] !== undefined) acc[c] += 1;
+          }
+          return acc;
+        }
+        const base = statusData && statusData.categories && typeof statusData.categories === 'object'
+          ? statusData.categories
+          : null;
+        if (base) return base;
+        if (!isV2 || !rawMemList) return null;
+        const acc = { rule: 0, profile: 0, decision: 0, experience: 0, state: 0 };
+        for (const it of rawMemList) {
+          const c = resolveItemCategory(it);
+          if (c && acc[c] !== undefined) acc[c] += 1;
+        }
+        return acc;
+      })();
+
+      const layerCounts = (() => {
+        if (scopedUnfilteredMems && (!memData || !Number.isFinite(Number(memData.total)) || Number(memData.total) <= rawMemList.length)) {
+          const acc = { L0: 0, L1: 0, L2: 0, L3: 0 };
+          for (const it of scopedUnfilteredMems) {
+            const l = resolveItemLayer(it);
+            if (l && acc[l] !== undefined) acc[l] += 1;
+          }
+          return acc;
+        }
+        const base = (statusData && statusData.layers && typeof statusData.layers === 'object')
+          ? statusData.layers
+          : (stats && stats.lTiers && typeof stats.lTiers === 'object' ? stats.lTiers : null);
+        if (base) return base;
+        if (!isV2 || !rawMemList) return null;
+        const acc = { L0: 0, L1: 0, L2: 0, L3: 0 };
+        for (const it of rawMemList) {
+          const l = resolveItemLayer(it);
+          if (l && acc[l] !== undefined) acc[l] += 1;
+        }
+        return acc;
+      })();
+
+      const dualBudgetBlock = (() => {
+        if (!isV2 || !statusData) return null;
+        const tS = statusData.tierS && typeof statusData.tierS === 'object' ? statusData.tierS : null;
+        const tD = statusData.tierD && typeof statusData.tierD === 'object' ? statusData.tierD : null;
+        const inj = statusData.inject && typeof statusData.inject === 'object' ? statusData.inject : null;
+        if (!tS && !tD && !inj) return null;
+
+        const sBudget = Number(tS && tS.budget != null ? tS.budget : (inj && inj.tierSBudget != null ? inj.tierSBudget : 1200));
+        const sMax = Number(tS && tS.maxChars != null ? tS.maxChars : sBudget);
+        const dBudget = Number(tD && tD.budget != null ? tD.budget : (inj && inj.tierDBudget != null ? inj.tierDBudget : 2000));
+        const dMax = Number(tD && tD.maxChars != null ? tD.maxChars : dBudget);
+        const totalBudget = Number((inj && (inj.totalBudget || inj.injectBudget)) || (sBudget + dBudget) || 3200);
+
+        const sRawUsed = tS && (tS.usedChars ?? tS.used) != null ? Number(tS.usedChars ?? tS.used)
+          : (inj && (inj.tierSUsed ?? inj.tierSChars) != null ? Number(inj.tierSUsed ?? inj.tierSChars) : null);
+        const dRawUsed = tD && (tD.usedChars ?? tD.used) != null ? Number(tD.usedChars ?? tD.used)
+          : (inj && (inj.tierDUsed ?? inj.tierDChars) != null ? Number(inj.tierDUsed ?? inj.tierDChars) : null);
+
+        const sHasUsed = sRawUsed !== null && Number.isFinite(sRawUsed);
+        const dHasUsed = dRawUsed !== null && Number.isFinite(dRawUsed);
+        const sPct = sHasUsed ? pctOf(sRawUsed, sBudget || sMax) : pctOf(sBudget, totalBudget);
+        const dPct = dHasUsed ? pctOf(dRawUsed, dBudget || dMax) : pctOf(dBudget, totalBudget);
+        const l0Count = layerCounts && Number.isFinite(Number(layerCounts.L0)) ? Number(layerCounts.L0) : 0;
+        const l12Count = layerCounts
+          ? (Number(layerCounts.L1 || 0) + Number(layerCounts.L2 || 0))
+          : 0;
+        const wikiTotal = Number.isFinite(Number(statusData.wikiCount))
+          ? Number(statusData.wikiCount)
+          : (stats && Number.isFinite(Number(stats.wikiCount)) ? Number(stats.wikiCount) : 0);
+        const pendingJobs = Number(statusData.pendingIngestJobs ?? (stats && stats.pendingIngestJobs) ?? 0);
+
+        return h('div', {
+          'data-section': 'dual-budget',
+          style: { marginTop: 12, paddingTop: 12, borderTop: '1px solid ' + C.line1 },
+        },
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', marginBottom: 8 },
+          },
+            h('span', { style: { fontSize: 12, fontWeight: 600, color: C.fg } }, '双层注入预算（Tier-S / Tier-D）'),
+            h(Hint, null,
+              (inj ? ('自动注入：' + (inj.enabled ? '开启' : '关闭') + ' · 模式 ' + (inj.mode || 'auto') + ' · ') : '')
+              + '总预算 ' + fmt(totalBudget) + ' 字符'
+              + (pendingJobs > 0 ? ' · 待消化队列 ' + fmt(pendingJobs) : ''))),
+          h('div', { className: 'mj-budgetgrid' },
+            h('div', {
+              'data-budget-tier': 'tierS',
+              style: { background: C.layer2, border: '1px solid ' + C.line2, borderRadius: C.radiusSm, padding: '8px 10px' },
+            },
+              h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 6, fontSize: 12 } },
+                h('span', { style: { fontWeight: 600, color: C.fg } }, 'Tier-S 静态底座'),
+                h('span', { style: { fontFamily: C.mono, color: C.fg2 } },
+                  sHasUsed ? (fmt(sRawUsed) + ' / ' + fmt(sBudget) + ' 字') : ('预算 ' + fmt(sBudget) + ' 字'))),
+              h('div', { style: { height: 6, background: C.layer1, borderRadius: 999, overflow: 'hidden', marginTop: 6 } },
+                h('div', {
+                  style: {
+                    height: '100%', width: sPct.toFixed(1) + '%',
+                    background: sHasUsed ? usageColor(sPct) : C.accent,
+                  },
+                })),
+              h(Hint, { style: { marginTop: 4 } },
+                'L0 铁律 / 画像 / 状态常驻（上限 ' + fmt(sMax) + ' 字 · 当前 L0 ' + fmt(l0Count) + ' 条）')),
+            h('div', {
+              'data-budget-tier': 'tierD',
+              style: { background: C.layer2, border: '1px solid ' + C.line2, borderRadius: C.radiusSm, padding: '8px 10px' },
+            },
+              h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 6, fontSize: 12 } },
+                h('span', { style: { fontWeight: 600, color: C.fg } }, 'Tier-D 动态召回'),
+                h('span', { style: { fontFamily: C.mono, color: C.fg2 } },
+                  dHasUsed ? (fmt(dRawUsed) + ' / ' + fmt(dBudget) + ' 字') : ('预算 ' + fmt(dBudget) + ' 字'))),
+              h('div', { style: { height: 6, background: C.layer1, borderRadius: 999, overflow: 'hidden', marginTop: 6 } },
+                h('div', {
+                  style: {
+                    height: '100%', width: dPct.toFixed(1) + '%',
+                    background: dHasUsed ? usageColor(dPct) : C.ok,
+                  },
+                })),
+              h(Hint, { style: { marginTop: 4 } },
+                'L1 原子 + L2 Wiki 按需检索（上限 ' + fmt(dMax) + ' 字 · L1/L2 ' + fmt(l12Count) + ' 条 · Wiki ' + fmt(wikiTotal) + ' 页）'))));
+      })();
+
+      const taxonomySummaryBlock = (isV2 && (catCounts || layerCounts)) ? h('div', {
+        style: { marginTop: 12, paddingTop: 10, borderTop: '1px solid ' + C.line1, display: 'flex', flexDirection: 'column', gap: 8 },
+      },
+        catCounts ? h('div', { className: 'mj-pillbar' },
+          h(Hint, { style: { marginRight: 2 } }, '五类范畴：'),
+          CATEGORIES.map((cat) => h(CategoryBadge, {
+            key: cat.id,
+            categoryId: cat.id,
+            count: Number(catCounts[cat.id] || 0),
+            interactive: true,
+            selected: activeCategory === cat.id,
+            onClick: () => setActiveCategory(activeCategory === cat.id ? 'all' : cat.id),
+          }))) : null,
+        layerCounts ? h('div', { className: 'mj-pillbar' },
+          h(Hint, { style: { marginRight: 2 } }, '代谢层级：'),
+          LAYERS.map((lay) => h(LayerBadge, {
+            key: lay.id,
+            layerId: lay.id,
+            count: Number(layerCounts[lay.id] || 0),
+            interactive: true,
+            selected: activeLayer === lay.id,
+            onClick: () => setActiveLayer(activeLayer === lay.id ? 'all' : lay.id),
+          }))) : null) : null;
+
       const sectionA = h('div', { className: 'mj-sec' },
-        h(SectionTitle, null, '概览'),
+        h(SectionTitle, {
+          right: isV2 ? h(Btn, {
+            onClick: triggerReindex,
+            disabled: !!govBusy || anyLoading,
+            minHeight: 26,
+            style: { minHeight: 26, padding: '0 10px', fontSize: 12 },
+            title: '重建倒排检索索引',
+          }, govBusy === 'reindex' ? '索引重建中…' : '重建索引') : null,
+        }, '概览'),
         overviewError
           ? h(Card, null,
             h(ErrorBlock, { title: '读不到库体数据', detail: statusSt.error, onRetry: reloadStatus }))
@@ -1196,7 +2036,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mj-grid' }, stats ? [
               h(Stat, {
                 key: 'm', label: '记忆条目', value: fmt(stats.memories),
-                sub: fmt(stats.segments) + ' 段',
+                sub: fmt(stats.segments) + ' 段' + (Number.isFinite(Number(stats.wikiCount)) ? ' · Wiki ' + fmt(stats.wikiCount) + ' 页' : ''),
               }),
               h(Stat, {
                 key: 'f', label: '三元组', value: fmt(stats.facts),
@@ -1220,6 +2060,8 @@ window.__ModuleLoader__.load({
               }),
             ] : emptyStats()),
             stats ? h(Bar, { used: stats.bytes, limit: stats.limitBytes }) : null,
+            dualBudgetBlock,
+            taxonomySummaryBlock,
             rows && rows.length ? h(ImportanceBar, { buckets: importantBuckets(rows) }) : null,
             overviewEmpty
               ? h(Hint, { style: { marginTop: 10 } }, '库里还没有记忆。在对话里用 memjudge_remember 写入第一条。')
@@ -1605,11 +2447,301 @@ window.__ModuleLoader__.load({
         h('div', { style: { height: 10 } }),
         h(Card, { title: '增强模块' }, moduleListBlock()));
 
+      // ================================================ 项目状态白板（单活 state）
+      const activeStates = (() => {
+        if (!isV2) return [];
+        const fromSnap = wikiSnapOverride && Array.isArray(wikiSnapOverride.states)
+          ? wikiSnapOverride.states
+          : null;
+        const fromStatus = statusData && Array.isArray(statusData.states)
+          ? statusData.states
+          : null;
+        const base = fromSnap || fromStatus || (rawMemList
+          ? rawMemList.filter((it) => resolveItemCategory(it) === 'state')
+          : []);
+        return base.filter((st) => {
+          if (!st || typeof st !== 'object') return false;
+          if (activeSpace !== 'all' && st.spaceId && st.spaceId !== activeSpace) return false;
+          return true;
+        });
+      })();
+
+      const stateSection = (isV2 && viewTab !== 'wiki') ? h('div', {
+        className: 'mj-sec',
+        'data-section': 'state-whiteboard',
+      },
+        h(SectionTitle, {
+          right: h(Hint, null, fmt(activeStates.length) + ' 个活跃槽位'),
+        }, '项目状态白板'),
+        h(Card, null,
+          activeStates.length === 0
+            ? h(Hint, null, '当前空间暂无活跃单活状态（state）。写入带 slotKey 的状态记忆后会自动在此置顶追踪。')
+            : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+              activeStates.map((st, idx) => {
+                const sid = String(st.id || ('state-' + idx));
+                const slot = st.slotKey || 'default';
+                const revCount = Array.isArray(st.revisions)
+                  ? Math.max(Number(st.revisionCount || 0), st.revisions.length)
+                  : Number(st.revisionCount || 0);
+                const revOpen = !!openRevs[sid];
+                const cachedRev = revCache[sid] || null;
+                const revs = Array.isArray(st.revisions) && st.revisions.length > 0
+                  ? st.revisions
+                  : (cachedRev && Array.isArray(cachedRev.items) ? cachedRev.items : null);
+                const updatedTs = Number(st.accessed || st.created);
+                const spLabel = st.spaceId ? (spaceLabelMap[st.spaceId] || friendlyPathTail(st.spaceId)) : '';
+                const isArmedForget = confirmForgetId === sid;
+                const rowBusy = govBusy === ('demote:' + sid) || govBusy === ('forget:' + sid);
+
+                return h('div', {
+                  key: sid,
+                  'data-state-card': sid,
+                  'data-slot-key': slot,
+                  style: {
+                    background: C.layer2,
+                    border: '1px solid ' + C.line2,
+                    borderRadius: C.radiusSm,
+                    padding: '10px 12px',
+                  },
+                },
+                  h('div', {
+                    style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' },
+                  },
+                    h('div', { className: 'mj-pillbar' },
+                      h('span', {
+                        'data-slot-badge': slot,
+                        style: {
+                          display: 'inline-flex', alignItems: 'center',
+                          padding: '1px 7px', borderRadius: C.radiusSm,
+                          fontFamily: C.mono, fontSize: 12, fontWeight: 600,
+                          color: C.fg, background: C.layer1, border: '1px solid ' + C.line3,
+                        },
+                      }, slot),
+                      h(CategoryBadge, { categoryId: 'state' }),
+                      h(LayerBadge, { layerId: resolveItemLayer(st) || 'L0' }),
+                      (activeSpace === 'all' && spLabel)
+                        ? h('span', {
+                          style: {
+                            fontSize: 12, lineHeight: '1.4', color: C.fg2,
+                            padding: '1px 6px', borderRadius: C.radiusSm, border: '1px solid ' + C.line1,
+                          },
+                        }, spLabel)
+                        : null),
+                    h(Hint, {
+                      title: Number.isFinite(updatedTs) ? absTime(updatedTs) : '',
+                    }, '更新于 ' + relTime(updatedTs))),
+                  h('div', {
+                    style: {
+                      marginTop: 8, fontSize: 13, lineHeight: '1.55',
+                      color: C.fg, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                    },
+                  }, st.text || '（空状态值）'),
+                  h('div', {
+                    style: {
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      gap: 8, flexWrap: 'wrap', marginTop: 8, paddingTop: 6, borderTop: '1px solid ' + C.line1,
+                    },
+                  },
+                    h('div', { className: 'mj-pillbar' },
+                      revCount > 0 || (revs && revs.length > 0)
+                        ? h('button', {
+                          type: 'button',
+                          'data-action': 'toggle-revisions',
+                          'aria-expanded': revOpen ? 'true' : 'false',
+                          onClick: () => toggleRevisions(st),
+                          style: {
+                            border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
+                            background: revOpen ? C.layer1 : 'transparent', color: C.fg2,
+                            fontSize: 12, lineHeight: '1.4', padding: '2px 8px', cursor: 'pointer', fontFamily: 'inherit',
+                          },
+                        }, revOpen ? ('收起修订历史 (' + fmt(revCount || revs.length) + ')') : ('查看修订历史 (' + fmt(revCount || revs.length) + ')'))
+                        : h(Hint, null, '初版状态 · 尚无覆写记录')),
+                    st.id ? h('div', { className: 'mj-pillbar' },
+                      h('button', {
+                        type: 'button',
+                        'data-action': 'demote',
+                        'aria-label': '降级记忆 ' + sid,
+                        disabled: !!govBusy,
+                        onClick: () => demoteItem(st),
+                        title: '将该单活状态降级为普通经验事件（L1）',
+                        style: {
+                          border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
+                          background: 'transparent', color: C.fg2, fontSize: 12, lineHeight: '1.4',
+                          padding: '2px 8px', cursor: govBusy ? 'not-allowed' : 'pointer', fontFamily: 'inherit',
+                          opacity: rowBusy ? 0.6 : 1,
+                        },
+                      }, govBusy === ('demote:' + sid) ? '降级中…' : '降级为经验'),
+                      h('button', {
+                        type: 'button',
+                        'data-action': isArmedForget ? 'confirm-forget' : 'forget',
+                        'aria-label': (isArmedForget ? '确认遗忘记忆 ' : '遗忘记忆 ') + sid,
+                        disabled: !!govBusy,
+                        onClick: () => armOrRunForget(st),
+                        style: {
+                          border: '1px solid ' + (isArmedForget ? C.bad : C.line2),
+                          borderRadius: C.radiusSm,
+                          background: 'transparent',
+                          color: isArmedForget ? C.bad : C.fg2,
+                          fontWeight: isArmedForget ? 600 : 400,
+                          fontSize: 12, lineHeight: '1.4', padding: '2px 8px',
+                          cursor: govBusy ? 'not-allowed' : 'pointer', fontFamily: 'inherit',
+                        },
+                      }, govBusy === ('forget:' + sid) ? '遗忘中…' : (isArmedForget ? '确认遗忘' : '遗忘')),
+                      isArmedForget ? h('button', {
+                        type: 'button',
+                        'data-action': 'cancel-forget',
+                        onClick: cancelForget,
+                        style: {
+                          border: '1px solid ' + C.line1, borderRadius: C.radiusSm,
+                          background: 'transparent', color: C.fg2, fontSize: 12, lineHeight: '1.4',
+                          padding: '2px 8px', cursor: 'pointer', fontFamily: 'inherit',
+                        },
+                      }, '取消') : null) : null),
+                  revOpen ? h(RevisionTimeline, {
+                    currentText: st.text || '',
+                    revisions: revs,
+                    loading: !!(cachedRev && cachedRev.loading),
+                    error: cachedRev && cachedRev.error ? cachedRev.error : '',
+                  }) : null);
+              })))) : null;
+
+      // ========================================== L2 持久化知识页（wiki_pages）
+      const wikiPages = (() => {
+        if (!isV2) return [];
+        const src = (wikiSnapOverride && Array.isArray(wikiSnapOverride.wiki_pages))
+          ? wikiSnapOverride.wiki_pages
+          : (wikiSnapOverride && Array.isArray(wikiSnapOverride.pages))
+            ? wikiSnapOverride.pages
+            : (statusData && Array.isArray(statusData.wiki_pages))
+              ? statusData.wiki_pages
+              : (statusData && Array.isArray(statusData.pages))
+                ? statusData.pages
+                : [];
+        return src.filter((pg) => {
+          if (!pg || typeof pg !== 'object') return false;
+          if (activeSpace !== 'all' && pg.spaceId && pg.spaceId !== activeSpace) return false;
+          return true;
+        });
+      })();
+
+      const dirtyWikiCount = wikiPages.filter((pg) => !!pg.dirty).length;
+
+      const wikiSection = (isV2 && viewTab !== 'memories') ? h('div', {
+        className: 'mj-sec',
+        'data-section': 'wiki-pages',
+      },
+        h(SectionTitle, {
+          right: h('div', { className: 'mj-pillbar' },
+            h(Hint, null,
+              fmt(wikiPages.length) + ' 页'
+              + (dirtyWikiCount > 0 ? ' · ' + fmt(dirtyWikiCount) + ' 页待重编' : '')),
+            h(Btn, {
+              'data-action': 'compile-wiki',
+              onClick: triggerCompile,
+              disabled: !!govBusy || anyLoading,
+              minHeight: 26,
+              style: { minHeight: 26, padding: '0 10px', fontSize: 12 },
+            }, govBusy === 'compile' ? '编译中…' : '编译知识页'),
+            h(Btn, {
+              'data-action': 'run-metabolism',
+              onClick: triggerMetabolism,
+              disabled: !!govBusy || anyLoading,
+              minHeight: 26,
+              style: { minHeight: 26, padding: '0 10px', fontSize: 12 },
+            }, govBusy === 'metabolism' ? '代谢中…' : '执行代谢')),
+        }, '知识页（Wiki）'),
+        h(Card, null,
+          wikiPages.length === 0
+            ? h(Hint, null, '当前空间尚无持久化知识页。积累多条同主题 L2 记忆后，点击「编译知识页」或「执行代谢」即可生成结构化摘要页。')
+            : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+              wikiPages.map((pg, idx) => {
+                const wKey = String(pg.pageId || pg.id || ((pg.spaceId || 'sp') + '::' + (pg.slug || idx)));
+                const expanded = openWikis[wKey] !== false;
+                const srcCount = Array.isArray(pg.sourceIds) ? pg.sourceIds.length : null;
+                const spLabel = pg.spaceId ? (spaceLabelMap[pg.spaceId] || friendlyPathTail(pg.spaceId)) : '';
+                const bodyMd = pg.markdown || pg.summary || '';
+                return h('div', {
+                  key: wKey,
+                  'data-wiki-card': wKey,
+                  'data-wiki-slug': pg.slug || '',
+                  style: {
+                    background: C.layer2,
+                    border: '1px solid ' + C.line2,
+                    borderRadius: C.radiusSm,
+                    padding: '10px 12px',
+                  },
+                },
+                  h('button', {
+                    type: 'button',
+                    'aria-expanded': expanded ? 'true' : 'false',
+                    onClick: () => toggleWikiOpen(wKey),
+                    style: {
+                      display: 'flex', width: '100%', alignItems: 'center', justifyContent: 'space-between',
+                      gap: 8, flexWrap: 'wrap', padding: 0, border: 'none', background: 'transparent',
+                      color: C.fg, fontFamily: 'inherit', textAlign: 'left', cursor: 'pointer',
+                    },
+                  },
+                    h('span', { className: 'mj-pillbar', style: { minWidth: 0 } },
+                      h(LayerBadge, { layerId: 'L2' }),
+                      h('span', { style: { fontSize: 13, fontWeight: 600, color: C.fg, wordBreak: 'break-word' } },
+                        pg.title || pg.slug || '未命名知识页'),
+                      pg.dirty
+                        ? h('span', {
+                          'data-wiki-dirty': 'true',
+                          style: {
+                            fontSize: 12, lineHeight: '1.3', color: C.warn,
+                            padding: '1px 6px', borderRadius: C.radiusSm, border: '1px solid ' + C.warn,
+                          },
+                        }, '待重编')
+                        : null,
+                      (activeSpace === 'all' && spLabel)
+                        ? h('span', {
+                          style: {
+                            fontSize: 12, lineHeight: '1.3', color: C.fg2,
+                            padding: '1px 6px', borderRadius: C.radiusSm, border: '1px solid ' + C.line1,
+                          },
+                        }, spLabel)
+                        : null),
+                    h('span', { className: 'mj-pillbar', style: { fontSize: 12, color: C.fg2 } },
+                      pg.version ? h('span', { style: { fontFamily: C.mono } }, 'v' + pg.version) : null,
+                      srcCount !== null ? h('span', null, fmt(srcCount) + ' 条源记忆') : null,
+                      pg.updatedAt ? h('span', { title: absTime(pg.updatedAt) }, '更新于 ' + relTime(pg.updatedAt)) : null,
+                      h('span', { style: { color: C.fg3 } }, expanded ? '▾' : '▸'))),
+                  expanded
+                    ? h('div', {
+                      'data-wiki-body': pg.slug || wKey,
+                      style: { marginTop: 8, paddingTop: 8, borderTop: '1px solid ' + C.line1 },
+                    }, renderStructuredMarkdown(bodyMd))
+                    : null);
+              })))) : null;
+
       // ========================================================== 记忆条目 C
-      const memCount = rows ? countLabel(memsSt.data, stats) : '';
+      const visibleRows = (() => {
+        if (!rows) return null;
+        if (!isV2) return rows;
+        const qNorm = searchQuery.trim().toLowerCase();
+        return rows.filter((r) => {
+          if (!r || typeof r !== 'object') return false;
+          if (activeSpace !== 'all' && r.spaceId && r.spaceId !== activeSpace) return false;
+          if (activeCategory !== 'all' && resolveItemCategory(r) !== activeCategory) return false;
+          if (activeLayer !== 'all' && resolveItemLayer(r) !== activeLayer) return false;
+          if (qNorm) {
+            const hay = [r.text, r.slotKey, r.source, r.id].filter(Boolean).join('\n').toLowerCase();
+            if (hay.indexOf(qNorm) < 0) return false;
+          }
+          return true;
+        });
+      })();
+
+      const hasActiveFilter = isV2 && (activeCategory !== 'all' || activeLayer !== 'all' || searchQuery.trim() !== '');
+      const memCount = visibleRows
+        ? (hasActiveFilter
+          ? ('筛选命中 ' + fmt(visibleRows.length) + ' 条')
+          : countLabel(Object.assign({}, memData || {}, { rows: visibleRows }), stats))
+        : '';
       const memRight = h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-        rows ? h(Hint, null, memCount) : null,
-        rows && rows.length
+        visibleRows ? h(Hint, null, memCount) : null,
+        visibleRows && visibleRows.length
           ? h(Btn, {
             className: 'mj-fold',
             onClick: () => setMemCollapsed((v) => !v),
@@ -1617,13 +2749,91 @@ window.__ModuleLoader__.load({
             'aria-controls': memBodyId.current,
             minHeight: 28,
             style: { minHeight: 24, padding: '0 8px' },
-          }, memCollapsed ? '展开 ' + rows.length + ' 条' : '收起')
+          }, memCollapsed ? '展开 ' + visibleRows.length + ' 条' : '收起')
           : null);
+
+      const filterToolbar = isV2 ? h(Card, {
+        'data-section': 'memory-filters',
+        style: { padding: '10px 12px', marginBottom: 10 },
+      },
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+          h('div', { className: 'mj-pillbar', role: 'group', 'aria-label': '按五类范畴筛选' },
+            h('button', {
+              type: 'button',
+              className: 'mj-pill',
+              'data-filter-category': 'all',
+              'aria-pressed': activeCategory === 'all' ? 'true' : 'false',
+              onClick: () => setActiveCategory('all'),
+              style: {
+                borderRadius: 999, fontSize: 12, lineHeight: '1.4', fontFamily: 'inherit',
+                fontWeight: activeCategory === 'all' ? 600 : 400, cursor: 'pointer',
+                background: activeCategory === 'all' ? C.fill : C.layer2,
+                color: activeCategory === 'all' ? C.onFill : C.fg2,
+                border: '1px solid ' + (activeCategory === 'all' ? C.fill : C.line2),
+              },
+            }, '全部范畴'),
+            CATEGORIES.map((cat) => h(CategoryBadge, {
+              key: cat.id,
+              categoryId: cat.id,
+              count: catCounts && catCounts[cat.id] != null ? Number(catCounts[cat.id]) : null,
+              interactive: true,
+              selected: activeCategory === cat.id,
+              filterAttr: cat.id,
+              onClick: () => setActiveCategory(activeCategory === cat.id ? 'all' : cat.id),
+            }))),
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' },
+          },
+            h('div', { className: 'mj-pillbar', role: 'group', 'aria-label': '按代谢层级筛选' },
+              h('button', {
+                type: 'button',
+                className: 'mj-pill',
+                'data-filter-layer': 'all',
+                'aria-pressed': activeLayer === 'all' ? 'true' : 'false',
+                onClick: () => setActiveLayer('all'),
+                style: {
+                  borderRadius: C.radiusSm, fontSize: 12, lineHeight: '1.4', fontFamily: 'inherit',
+                  fontWeight: activeLayer === 'all' ? 600 : 400, cursor: 'pointer',
+                  background: activeLayer === 'all' ? C.fill : C.layer2,
+                  color: activeLayer === 'all' ? C.onFill : C.fg2,
+                  border: '1px solid ' + (activeLayer === 'all' ? C.fill : C.line2),
+                },
+              }, '全部层级'),
+              LAYERS.map((lay) => h(LayerBadge, {
+                key: lay.id,
+                layerId: lay.id,
+                count: layerCounts && layerCounts[lay.id] != null ? Number(layerCounts[lay.id]) : null,
+                interactive: true,
+                selected: activeLayer === lay.id,
+                filterAttr: lay.id,
+                onClick: () => setActiveLayer(activeLayer === lay.id ? 'all' : lay.id),
+              }))),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: '1 1 180px', maxWidth: 320 } },
+              h('input', {
+                type: 'search',
+                value: searchQuery,
+                placeholder: '搜索记忆正文、slotKey 或来源…',
+                'aria-label': '搜索记忆正文或槽位',
+                onChange: (ev) => setSearchQuery(ev.target.value),
+                style: {
+                  width: '100%', minWidth: 0, minHeight: 28, boxSizing: 'border-box',
+                  padding: '4px 8px', fontSize: 12, lineHeight: '1.4', color: C.fg,
+                  background: C.layer2, border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
+                  fontFamily: 'inherit',
+                },
+              }),
+              hasActiveFilter
+                ? h(Btn, {
+                  onClick: resetFilters,
+                  minHeight: 28,
+                  style: { minHeight: 28, padding: '0 8px', fontSize: 12 },
+                }, '重置筛选')
+                : null)))) : null;
 
       let memBody;
       if (memsSt.phase === 'error') {
         memBody = h(ErrorBlock, { title: '记忆列表读取失败：' + (memsSt.error || '未知原因'), onRetry: reloadMems });
-      } else if (!rows) {
+      } else if (!visibleRows) {
         memBody = h('div', null, [0, 1, 2].map((i) => h('div', {
           key: 'sk' + i,
           style: {
@@ -1631,28 +2841,52 @@ window.__ModuleLoader__.load({
             border: '1px solid ' + C.line2, borderRadius: C.radiusSm, opacity: 0.55,
           },
         })));
-      } else if (rows.length === 0) {
+      } else if (visibleRows.length === 0) {
         memBody = h(Hint, { style: { padding: '10px 0' } },
-          '库里还没有记忆。在对话里用 memjudge_remember 写入第一条。');
+          hasActiveFilter || activeSpace !== 'all'
+            ? '当前筛选条件下没有匹配的记忆条目。'
+            : '库里还没有记忆。在对话里用 memjudge_remember 写入第一条。');
       } else {
-        memBody = h('div', { className: 'mj-scroll', style: { maxHeight: 320, overflowY: 'auto' } },
-          groupRows(rows).map((g) => h('div', { key: 'g:' + (g.chapter || '__none') },
+        memBody = h('div', { className: 'mj-scroll', style: { maxHeight: 420, overflowY: 'auto' } },
+          groupRows(visibleRows).map((g) => h('div', { key: 'g:' + (g.chapter || '__none') },
             h('div', {
               style: {
                 position: 'sticky', top: 0, zIndex: 1, background: C.layer1,
                 padding: '6px 0 4px', fontSize: 12, lineHeight: '1.5', color: C.fg2,
               },
             }, (g.chapter && g.chapter !== '0' ? '第 ' + g.chapter + ' 章' : '未标章') + ' · ' + g.rows.length + ' 条'),
-            h('div', null, g.rows.map((r) => h(MemoryRow, { key: r.id, r: r }))))));
+            h('div', null, g.rows.map((r) => {
+              const rid = String(r.id || '');
+              const cachedRev = rid ? (revCache[rid] || null) : null;
+              return h(MemoryRow, {
+                key: rid || Math.random().toString(36).slice(2),
+                r: r,
+                isV2: isV2,
+                open: !!openMems[rid],
+                onToggleOpen: () => toggleMemOpen(rid),
+                spaceLabel: (activeSpace === 'all' && r.spaceId)
+                  ? (spaceLabelMap[r.spaceId] || friendlyPathTail(r.spaceId))
+                  : '',
+                revOpen: !!openRevs[rid],
+                cachedRev: cachedRev,
+                onToggleRevisions: () => toggleRevisions(r),
+                onDemote: () => demoteItem(r),
+                isArmedForget: confirmForgetId === rid,
+                onForget: () => armOrRunForget(r),
+                onCancelForget: cancelForget,
+                govBusy: govBusy,
+              });
+            })))));
       }
 
-      const sectionC = h('div', { className: 'mj-sec' },
+      const sectionC = viewTab !== 'wiki' ? h('div', { className: 'mj-sec', 'data-section': 'memories-list' },
         h(SectionTitle, { right: memRight }, '记忆条目'),
+        filterToolbar,
         h('div', {
           id: memBodyId.current,
           className: 'mj-membody',
           'data-collapsed': memCollapsed ? '1' : '0',
-        }, memBody));
+        }, memBody)) : null;
 
       // ========================================================== 冲突候选 D
       let confBody;
@@ -1664,12 +2898,23 @@ window.__ModuleLoader__.load({
         confBody = h(Hint, { style: { padding: '8px 0' } },
           '没有冲突候选。只有同一属性出现过两个不同取值时才列在这里，现在是干净的。');
       } else {
-        confBody = h('div', null, conflicts.map((c) => h('div', { key: c.attr, className: 'mj-conf' },
+        confBody = h('div', null, conflicts.map((c, idx) => h('div', {
+          key: (c.key || c.attr || 'conf') + ':' + idx,
+          className: 'mj-conf',
+        },
           h('div', {
             className: 'mj-confattr',
             style: { fontFamily: C.mono, fontSize: 13, lineHeight: '1.55', color: C.fg, wordBreak: 'break-all' },
-          }, c.attr || '—'),
+          }, (c.entity ? c.entity + ' · ' : '') + (c.attr || '—')),
           h('div', { style: { flex: '1 1 auto', minWidth: 0, fontSize: 13, lineHeight: '1.55', color: C.fg2, wordBreak: 'break-word' } },
+            c.conflictType
+              ? h('span', {
+                style: {
+                  fontSize: 12, color: C.warn, marginRight: 6,
+                  padding: '0 5px', borderRadius: C.radiusSm, border: '1px solid ' + C.warn,
+                },
+              }, typeof c.conflictType === 'string' ? c.conflictType : (c.conflictType?.type || 'disputed'))
+              : null,
             (Array.isArray(c.values) ? c.values : []).join(' · ')))));
       }
 
@@ -1685,12 +2930,14 @@ window.__ModuleLoader__.load({
             fontSize: 12, lineHeight: '1.6', color: C.fg3, wordBreak: 'break-all',
           },
         },
-          h('div', null, '删除记忆请用对话里的 memjudge_forget；面板只读。'),
+          h('div', null, isV2
+            ? '支持按工作区、五类范畴与代谢层级治理；物理遗忘不可恢复，误判铁律/画像建议优先降级为经验。'
+            : '删除记忆请用对话里的 memjudge_forget；面板只读。'),
           cfg ? h('div', null, '配置文件 ' + cfg.configPath) : null,
           cfg ? h('div', null, '密钥文件 ' + cfg.secretsPath) : null));
 
       return h('div', { className: 'mj-panel', style: rootStyle },
-        header, sectionA, sectionB, sectionC, sectionD, sectionE);
+        header, scopeSection, sectionA, stateSection, wikiSection, sectionC, sectionD, sectionB, sectionE);
 
       // ------------------------------------------------------------ 内部渲染件
 
@@ -1701,6 +2948,160 @@ window.__ModuleLoader__.load({
         ];
         return labels.map((l, i) => h(Stat, { key: 'e' + i, label: l[0], value: '—', sub: '' }));
       }
+    }
+
+    /** 五类范畴彩色徽标（纯无状态组件，严禁内部使用 React Hooks）。 */
+    function CategoryBadge({ categoryId, count, interactive, selected, onClick, filterAttr }) {
+      const meta = CATEGORY_MAP[categoryId] || { id: categoryId || 'experience', label: categoryId || '经验', color: C.fg2, borderColor: C.line3, desc: '' };
+      const dotColor = meta.color || C.fg2;
+      const borderCol = meta.borderColor || dotColor;
+      const countSuffix = count !== undefined && count !== null && Number.isFinite(Number(count))
+        ? ' ' + fmt(count)
+        : '';
+      const commonStyle = {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+        borderRadius: 999,
+        padding: interactive ? '2px 9px' : '1px 7px',
+        fontSize: 12,
+        lineHeight: '1.4',
+        fontFamily: 'inherit',
+        fontWeight: selected ? 600 : 500,
+        background: selected ? C.layer1 : C.layer2,
+        color: selected ? dotColor : C.fg,
+        border: '1px solid ' + (selected ? borderCol : C.line2),
+        cursor: interactive ? 'pointer' : 'default',
+        boxSizing: 'border-box',
+      };
+      const dot = h('span', {
+        'aria-hidden': 'true',
+        style: { width: 6, height: 6, borderRadius: '50%', background: dotColor, flex: '0 0 6px' },
+      });
+      const labelNode = h('span', null, meta.label + countSuffix);
+      if (interactive) {
+        return h('button', {
+          type: 'button',
+          className: 'mj-pill',
+          'data-category-badge': meta.id,
+          'data-filter-category': filterAttr || undefined,
+          'aria-pressed': selected ? 'true' : 'false',
+          title: meta.label + ' (' + meta.id + ')' + (meta.desc ? ' — ' + meta.desc : ''),
+          onClick: onClick,
+          style: commonStyle,
+        }, dot, labelNode);
+      }
+      return h('span', {
+        'data-category-badge': meta.id,
+        title: meta.label + ' (' + meta.id + ')' + (meta.desc ? ' — ' + meta.desc : ''),
+        style: commonStyle,
+      }, dot, labelNode);
+    }
+
+    /** L0-L3 代谢层级角标（纯无状态组件，严禁内部使用 React Hooks）。 */
+    function LayerBadge({ layerId, count, interactive, selected, onClick, filterAttr }) {
+      const meta = LAYER_MAP[layerId] || { id: layerId || 'L1', label: layerId || 'L1', color: C.fg2, borderColor: C.line3, desc: '' };
+      const tone = meta.color || C.fg2;
+      const borderCol = meta.borderColor || tone;
+      const countSuffix = count !== undefined && count !== null && Number.isFinite(Number(count))
+        ? ' (' + fmt(count) + ')'
+        : '';
+      const style = {
+        display: 'inline-flex',
+        alignItems: 'center',
+        borderRadius: C.radiusSm,
+        padding: interactive ? '2px 8px' : '1px 6px',
+        fontSize: 12,
+        lineHeight: '1.35',
+        fontFamily: C.mono,
+        fontWeight: 600,
+        background: selected ? C.layer1 : 'transparent',
+        color: tone,
+        border: '1px solid ' + (selected ? borderCol : C.line2),
+        cursor: interactive ? 'pointer' : 'default',
+        boxSizing: 'border-box',
+      };
+      if (interactive) {
+        return h('button', {
+          type: 'button',
+          className: 'mj-pill',
+          'data-layer-badge': meta.id,
+          'data-filter-layer': filterAttr || undefined,
+          'aria-pressed': selected ? 'true' : 'false',
+          title: meta.id + (meta.desc ? ' · ' + meta.desc : ''),
+          onClick: onClick,
+          style: style,
+        }, meta.label + countSuffix);
+      }
+      return h('span', {
+        'data-layer-badge': meta.id,
+        title: meta.id + (meta.desc ? ' · ' + meta.desc : ''),
+        style: style,
+      }, meta.label + countSuffix);
+    }
+
+    /** 修订历史时间线：清晰展示何时从什么旧状态覆写为后续/当前状态（纯无状态组件）。 */
+    function RevisionTimeline({ currentText, revisions, loading, error }) {
+      if (loading) {
+        return h('div', {
+          'data-revisions-panel': 'loading',
+          style: { marginTop: 8, padding: '8px 10px', background: C.layer1, borderRadius: C.radiusSm, border: '1px solid ' + C.line1 },
+        }, h(Hint, null, '正在读取修订演化记录…'));
+      }
+      if (error) {
+        return h('div', {
+          'data-revisions-panel': 'error',
+          style: { marginTop: 8, padding: '8px 10px', background: C.layer1, borderRadius: C.radiusSm, border: '1px solid ' + C.line1 },
+        }, h('span', { style: { fontSize: 12, color: C.bad } }, error));
+      }
+      const list = Array.isArray(revisions) ? revisions : [];
+      if (list.length === 0) {
+        return h('div', {
+          'data-revisions-panel': 'empty',
+          style: { marginTop: 8, padding: '8px 10px', background: C.layer1, borderRadius: C.radiusSm, border: '1px solid ' + C.line1 },
+        }, h(Hint, null, '暂无历史修订记录。'));
+      }
+      const reasonLabels = {
+        'state-update': '单活状态覆写',
+        state_overwrite: '单活状态覆写',
+        supersede: '显式取代旧结论',
+        compact: '生命周期压缩',
+      };
+      return h('div', {
+        'data-revisions-panel': 'ready',
+        style: {
+          marginTop: 8, padding: '8px 10px', background: C.layer1,
+          borderRadius: C.radiusSm, border: '1px solid ' + C.line1,
+          display: 'flex', flexDirection: 'column', gap: 8,
+        },
+      },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: C.fg2 } },
+          '修订演化轨迹（共 ' + fmt(list.length) + ' 次历史变更）'),
+        list.map((rev, idx) => {
+          const nextVal = idx === 0 ? currentText : (list[idx - 1] && list[idx - 1].prevText ? list[idx - 1].prevText : currentText);
+          const reasonRaw = rev && rev.reason ? String(rev.reason) : 'state_overwrite';
+          const reasonTxt = reasonLabels[reasonRaw] ? (reasonLabels[reasonRaw] + ' (' + reasonRaw + ')') : reasonRaw;
+          const ts = Number(rev && rev.changedAt);
+          return h('div', {
+            key: String((rev && rev.revId) || idx),
+            'data-revision-item': String((rev && rev.revId) || idx),
+            style: {
+              paddingLeft: 8,
+              borderLeft: '2px solid ' + (idx === 0 ? C.accent : C.line3),
+              fontSize: 12,
+              lineHeight: '1.5',
+            },
+          },
+            h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', color: C.fg2 } },
+              h('span', { style: { fontWeight: 600 } }, reasonTxt),
+              h('span', { title: Number.isFinite(ts) ? absTime(ts) : '' }, relTime(ts))),
+            h('div', { style: { marginTop: 3, color: C.fg2, wordBreak: 'break-word' } },
+              h('span', { style: { color: C.fg3 } }, '旧值：'),
+              h('span', { style: { textDecoration: 'line-through' } }, (rev && rev.prevText) || '—')),
+            nextVal ? h('div', { style: { marginTop: 2, color: C.fg, wordBreak: 'break-word' } },
+              h('span', { style: { color: C.ok } }, idx === 0 ? '覆写为当前：' : '覆写为：'),
+              h('span', null, nextVal)) : null);
+        }));
     }
 
     /** 同章连续合并；chapter 为空串的归入末尾组「未标章」（§6）。 */
@@ -1726,11 +3127,14 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 单条记忆：2px 重要度竖条 + 正文（2 行 clamp，整行 button 展开）+ 元信息。
-     * 整行是 button，键盘可达（§8）；id 与绝对时间落在 title（memjudge_forget 需要 id）。
+     * 单条记忆卡片（纯无状态组件，展开态与治理动作由顶层传入，保证 Hook 游标绝对恒定）。
+     * v1/v7：保留原紧凑单行按钮；v2：叠加五类范畴徽标、L0-L3 角标、修订链展开、降级与确认遗忘。
      */
-    function MemoryRow({ r }) {
-      const [open, setOpen] = useState(false);
+    function MemoryRow({
+      r, isV2, open, onToggleOpen, spaceLabel,
+      revOpen, cachedRev, onToggleRevisions,
+      onDemote, isArmedForget, onForget, onCancelForget, govBusy,
+    }) {
       const tier = impTier(r.importance);
       const created = Number(r.created);
       const accessed = Number(r.accessed);
@@ -1739,15 +3143,17 @@ window.__ModuleLoader__.load({
       const src = sourceText(r.source);
       const impText = Number.isFinite(Number(r.importance)) && Number(r.importance) >= 0.3
         ? '重要 ' + Number(r.importance).toFixed(2) : '';
-      return h('button', {
+      const rid = String(r.id || '');
+
+      const bodyBtn = h('button', {
         type: 'button',
         className: 'mj-memrow',
-        onClick: () => setOpen((v) => !v),
+        onClick: onToggleOpen,
         'aria-expanded': open ? 'true' : 'false',
-        title: (r.id || '') + (Number.isFinite(created) ? '\n' + absTime(created) : ''),
+        title: rid + (Number.isFinite(created) ? '\n' + absTime(created) : ''),
         style: {
           display: 'flex', width: '100%', textAlign: 'left', gap: 8, alignItems: 'stretch',
-          padding: '8px 0', border: 'none', background: 'transparent',
+          padding: isV2 ? '4px 0 2px' : '8px 0', border: 'none', background: 'transparent',
           color: C.fg, fontFamily: 'inherit', cursor: 'pointer', borderRadius: C.radiusSm,
         },
       },
@@ -1781,6 +3187,114 @@ window.__ModuleLoader__.load({
                 },
               }, '· 来自 ' + src)
               : null)));
+
+      if (!isV2) return bodyBtn;
+
+      const catId = resolveItemCategory(r) || 'experience';
+      const layerId = resolveItemLayer(r) || 'L1';
+      const revCount = Array.isArray(r.revisions)
+        ? Math.max(Number(r.revisionCount || 0), r.revisions.length)
+        : Number(r.revisionCount || 0);
+      const revs = Array.isArray(r.revisions) && r.revisions.length > 0
+        ? r.revisions
+        : (cachedRev && Array.isArray(cachedRev.items) ? cachedRev.items : null);
+      const allowDemote = canDemoteMemory(r);
+
+      return h('div', {
+        className: 'mj-memcard',
+        'data-memory-card': rid,
+        'data-memory-category': catId,
+        'data-memory-layer': layerId,
+      },
+        h('div', {
+          style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', marginBottom: 4 },
+        },
+          h('div', { className: 'mj-pillbar' },
+            h(CategoryBadge, { categoryId: catId }),
+            h(LayerBadge, { layerId: layerId }),
+            r.slotKey
+              ? h('span', {
+                'data-slot-badge': r.slotKey,
+                style: {
+                  fontFamily: C.mono, fontSize: 12, lineHeight: '1.35', color: C.fg2,
+                  padding: '1px 6px', borderRadius: C.radiusSm, background: C.layer2, border: '1px solid ' + C.line2,
+                },
+              }, 'slot:' + r.slotKey)
+              : null,
+            spaceLabel
+              ? h('span', {
+                style: {
+                  fontSize: 12, lineHeight: '1.35', color: C.fg2,
+                  padding: '1px 6px', borderRadius: C.radiusSm, border: '1px solid ' + C.line1,
+                },
+              }, spaceLabel)
+              : null),
+          rid ? h('div', { className: 'mj-pillbar' },
+            (revCount > 0 || (revs && revs.length > 0))
+              ? h('button', {
+                type: 'button',
+                'data-action': 'toggle-revisions',
+                'aria-label': '查看记忆 ' + rid + ' 修订历史',
+                'aria-expanded': revOpen ? 'true' : 'false',
+                onClick: onToggleRevisions,
+                style: {
+                  border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
+                  background: revOpen ? C.layer2 : 'transparent', color: C.fg2,
+                  fontSize: 12, lineHeight: '1.4', padding: '1px 7px', cursor: 'pointer', fontFamily: 'inherit',
+                },
+              }, revOpen ? ('收起修订 (' + fmt(revCount || revs.length) + ')') : ('修订 (' + fmt(revCount || revs.length) + ')'))
+              : null,
+            allowDemote
+              ? h('button', {
+                type: 'button',
+                'data-action': 'demote',
+                'aria-label': '降级记忆 ' + rid,
+                disabled: !!govBusy,
+                onClick: onDemote,
+                title: '将误判的铁律/画像/常驻记忆降级为普通经验事件（L1）',
+                style: {
+                  border: '1px solid ' + C.line2, borderRadius: C.radiusSm,
+                  background: 'transparent', color: C.fg2, fontSize: 12, lineHeight: '1.4',
+                  padding: '1px 7px', cursor: govBusy ? 'not-allowed' : 'pointer', fontFamily: 'inherit',
+                },
+              }, govBusy === ('demote:' + rid) ? '降级中…' : '降级为经验')
+              : null,
+            h('button', {
+              type: 'button',
+              'data-action': isArmedForget ? 'confirm-forget' : 'forget',
+              'aria-label': (isArmedForget ? '确认遗忘记忆 ' : '遗忘记忆 ') + rid,
+              disabled: !!govBusy,
+              onClick: onForget,
+              title: isArmedForget ? '再次点击立即物理删除（不可恢复）' : '物理遗忘该条记忆（需二次确认）',
+              style: {
+                border: '1px solid ' + (isArmedForget ? C.bad : C.line2),
+                borderRadius: C.radiusSm,
+                background: 'transparent',
+                color: isArmedForget ? C.bad : C.fg2,
+                fontWeight: isArmedForget ? 600 : 400,
+                fontSize: 12, lineHeight: '1.4', padding: '1px 7px',
+                cursor: govBusy ? 'not-allowed' : 'pointer', fontFamily: 'inherit',
+              },
+            }, govBusy === ('forget:' + rid) ? '遗忘中…' : (isArmedForget ? '确认遗忘' : '遗忘')),
+            isArmedForget
+              ? h('button', {
+                type: 'button',
+                'data-action': 'cancel-forget',
+                onClick: onCancelForget,
+                style: {
+                  border: '1px solid ' + C.line1, borderRadius: C.radiusSm,
+                  background: 'transparent', color: C.fg2, fontSize: 12, lineHeight: '1.4',
+                  padding: '1px 7px', cursor: 'pointer', fontFamily: 'inherit',
+                },
+              }, '取消')
+              : null) : null),
+        bodyBtn,
+        revOpen ? h(RevisionTimeline, {
+          currentText: text,
+          revisions: revs,
+          loading: !!(cachedRev && cachedRev.loading),
+          error: cachedRev && cachedRev.error ? cachedRev.error : '',
+        }) : null);
     }
 
     // --------------------------------------------------------- 右栏 tab

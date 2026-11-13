@@ -110,10 +110,16 @@ function digest(query, docs) {
  */
 export async function rerank(query, docs, opts = {}) {
   const o = { ...RERANK_DEFAULTS, ...opts };
+  if (!Number.isFinite(o.timeoutMs) || o.timeoutMs <= 0) o.timeoutMs = RERANK_DEFAULTS.timeoutMs;
+  if (!Number.isInteger(o.topN) || o.topN < 1) o.topN = RERANK_DEFAULTS.topN;
+  if (!Number.isFinite(o.cacheTtlMs)) o.cacheTtlMs = RERANK_DEFAULTS.cacheTtlMs;
+  if (!Number.isInteger(o.cacheMax) || o.cacheMax < 1) o.cacheMax = RERANK_DEFAULTS.cacheMax;
+
   const q = String(query ?? '').trim();
   const list = (Array.isArray(docs) ? docs : []).map((d) => String(d ?? ''));
   if (!q || !list.length) return null;
-  if (!rerankEnabled()) return null;
+  const keyToken = typeof opts.apiKey === 'string' && opts.apiKey.trim() ? opts.apiKey.trim() : rerankKey();
+  if (!keyToken) return null;
 
   const key = digest(q, list);
   const useCache = o.cache !== false;
@@ -137,7 +143,7 @@ export async function rerank(query, docs, opts = {}) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${rerankKey()}`,
+        Authorization: `Bearer ${keyToken}`,
       },
       // 一次打包所有候选：逐条调用会把延迟与费用乘 20 倍
       body: JSON.stringify({ model: resolveRerankModel(opts.model), query: q, documents: list }),
@@ -213,4 +219,67 @@ export function applyRerank(items, ranked) {
   return { items: [...head, ...tail], moved: head.length, applied: true };
 }
 
-export default { rerank, applyRerank, rerankEnabled, rerankOptIn, clearRerankCache, rerankCacheSize, rerankStats, RERANK_DEFAULTS, RERANK_MODEL, rerankEndpoint, resolveRerankModel };
+/**
+ * 在线协同精排包装器：对三路 RRF 候选池的前 poolSize 条执行 rerank，
+ * 任何超时/无 key/HTTP 异常均优雅降级回退原 RRF 顺序，并暴露可观测诊断信息。
+ */
+export async function rerankCandidates(query, items, opts = {}) {
+  const list = Array.isArray(items) ? items.slice() : [];
+  if (!list.length || !String(query ?? '').trim()) {
+    return { items: list, used: false, degraded: 'empty', ms: 0, candidates: 0 };
+  }
+  const poolSize = Number.isInteger(opts.poolSize) && opts.poolSize > 0
+    ? Math.min(list.length, opts.poolSize)
+    : Math.min(list.length, Math.max(RERANK_DEFAULTS.topN, opts.topN ?? RERANK_DEFAULTS.topN) * 2);
+  const headPool = list.slice(0, poolSize);
+  const restPool = list.slice(poolSize);
+  const docs = headPool.map((it) => String(it?.doc?.text ?? it?.text ?? ''));
+  const rerankFn = typeof opts.rerankFn === 'function' ? opts.rerankFn : rerank;
+  const t0 = performance.now();
+  try {
+    const ranked = await rerankFn(query, docs, {
+      topN: opts.topN ?? poolSize,
+      timeoutMs: opts.timeoutMs,
+      cacheTtlMs: opts.cacheTtlMs,
+      model: opts.model,
+      fetchImpl: opts.fetchImpl,
+      cache: opts.cache,
+      apiKey: opts.apiKey,
+    });
+    const ms = Number((performance.now() - t0).toFixed(2));
+    if (!Array.isArray(ranked) || !ranked.length) {
+      const hasKey = Boolean((typeof opts.apiKey === 'string' && opts.apiKey.trim()) || rerankEnabled());
+      return { items: list, used: false, degraded: hasKey ? 'unavailable' : 'no-key', ms, candidates: poolSize };
+    }
+    const applied = applyRerank(headPool, ranked);
+    if (!applied.applied) {
+      return { items: list, used: false, degraded: 'empty', ms, candidates: poolSize };
+    }
+    const scoreByIdx = new Map(ranked.map((r) => [r.index, r.score]));
+    // 保持候选内部 score 单调递减，避免下游 fillFromScored 章内按 score 排序时又翻回旧序
+    const topBaseScore = Math.max(...headPool.map((x) => Number(x?.score ?? 0)), 1);
+    const reorderedHead = applied.items.map((item, rankIdx) => {
+      const origIdx = headPool.indexOf(item);
+      const rerankScore = scoreByIdx.get(origIdx) ?? null;
+      const monotonicScore = topBaseScore + (poolSize - rankIdx) * 1e-4;
+      return {
+        ...item,
+        rerankScore,
+        preRerankScore: item.score,
+        score: rerankScore !== null ? monotonicScore : item.score,
+      };
+    });
+    return {
+      items: [...reorderedHead, ...restPool],
+      used: true,
+      degraded: null,
+      ms,
+      candidates: poolSize,
+    };
+  } catch {
+    const ms = Number((performance.now() - t0).toFixed(2));
+    return { items: list, used: false, degraded: 'fallback-rrf', ms, candidates: poolSize };
+  }
+}
+
+export default { rerank, applyRerank, rerankCandidates, rerankEnabled, rerankOptIn, clearRerankCache, rerankCacheSize, rerankStats, RERANK_DEFAULTS, RERANK_MODEL, rerankEndpoint, resolveRerankModel };

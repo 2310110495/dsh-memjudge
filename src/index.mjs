@@ -1,128 +1,93 @@
-// memjudge — DSH 记忆插件外壳：apply(ctx) + 7 个工具 + 1 个注入 section。
+// dsh-memjudge 宿主插件入口（v2 终态架构）
 //
-// 三条宿主实测约束决定了这里的形状（mem-eval/reports/host-verify.txt）：
-//
-//   1. 工具名与 prompt section 名共用 NamedEntries 语义，重名直接抛错，且抛错的
-//      插件**整条不激活**（@deepseek-ai/dsh-scope/lib/index.js:29 的 insert）。
-//      所以工具名一律 memjudge_ 前缀：memory_read / memory_search / memory_save /
-//      memory_list 被 annkun 灵枢、soul-md、meow 三方争抢，memory 被
-//      LittleBlackTong 与 sage-mem 争抢。memjudge_* 在 24 个候选插件里零占用。
-//
-//   2. 注入是相加的，宿主没有总预算也没有去重。所以默认关闭（0 字符），开启时
-//      硬钳 2000 字符（SPEC 能力 8），且只注入索引不注入全文。
-//
-//   3. 卸载靠 disposer 幂等。所有 register()/section() 的返回值都收进 disposers，
-//      由 ctx.effect 的清理函数逆序调用一次，最后关库。
-//
-// 零运行时依赖：只用 node:sqlite / node:fs / node:path，可直接
-// `dsh plugin --profile <p> add file:<本目录>` 安装，不需要 peerDependencies。
+// 核心接线：
+//   1. 8 个 Agent 工具（memjudge_remember / recall / read / forget / demote / conflicts / stats / wiki）
+//   2. 双边闭合轮采集（ctx.inject(['sessions']) 优先 + ctx.on('session/event') 回退，拦截子代理，TurnCollector -> Distiller）
+//   3. 保 Prefix KV Cache 两段式动态注入（Tier-S <= 600 chars 单会话冻结热底座 + Tier-D <= 900 chars 按问动态召回，总计 <= 1500 chars）
+//   4. L0-L3 四级热冷代谢与增量 Wiki 编译调度（lifecycle.mjs + 卸载时 100% 优雅排空释放）
+//   5. 同进程只读服务（service.mjs）与可视化面板 RPC（rpc.mjs）
 
-import { homedir } from 'node:os';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-
-import { open as openStore, normalizeKind, MEMORY_KINDS } from './store.mjs';
-import { SearchIndex } from './search.mjs';
-import { embed as embedVec, vecStats } from './vector.mjs';
-import { gate, resolveConflict } from './judge.mjs';
+import storeMod from './store.mjs';
 import {
-  conflictJudgments,
-  renderRecall,
-  sleepPhase,
-  // wiki 编译层（T8-1）：投影只在内存，落盘只有 meta 两个键。
-  compileWiki,
-  diffWiki,
-  groundingViolations,
-  rawDigest,
-  WIKI_VERSION,
-} from './layer.mjs';
+  SearchIndex,
+  hybridSearch,
+  matchEntitySlots,
+  rrfFuse,
+} from './search.mjs';
 import {
-  configReport,
+  gate,
+  gateSlots,
+  classifyConflict,
+  resolveConflict,
+} from './judge.mjs';
+import {
+  MEMORY_KINDS,
+  MEMORY_CATEGORIES,
+  STORE_SCHEMA_VERSION,
+  kindToCategory,
+  categoryToKind,
+  normalizeCategory,
+} from './schema.mjs';
+import { sleepPhase } from './layer.mjs';
+import {
+  compileDirtyWikiPages,
+  buildWikiPage,
+  deriveClusterSlug,
+  runMetabolism,
+} from './lifecycle.mjs';
+import {
+  GLOBAL_SPACE_ID,
+  isSubagentSession,
+  resolveScope,
+  visibleSpaces,
+} from './scope.mjs';
+import {
+  TIER_S_MAX_CHARS,
+  TIER_D_MAX_CHARS,
+  TOTAL_INJECT_MAX_CHARS,
+  createInjector,
+} from './inject.mjs';
+export {
+  TIER_S_MAX_CHARS,
+  TIER_D_MAX_CHARS,
+  TOTAL_INJECT_MAX_CHARS,
+};
+import { createTurnCollector } from './turn-collector.mjs';
+import { processIngestQueue } from './distiller.mjs';
+import { expand as defaultExpand } from './query-expand.mjs';
+import { rerank as defaultRerank } from './rerank.mjs';
+import { embed as defaultEmbed, quantize, dequantize } from './vector.mjs';
+import { select as defaultSelect } from './llm-select.mjs';
+import {
   STATE_DIR,
-  embedDims,
+  moduleFlags as defaultModuleFlags,
+  embedDims as defaultEmbedDims,
+  configReport as defaultConfigReport,
   maxChars as configuredMaxChars,
   storageLimitBytes as configuredStorageLimitBytes,
-  // 自动记忆的五项配置走 config.mjs 的三级解析（env > config.json > 默认）。
-  resolveAutoCapture,
+  autoCaptureConfig,
 } from './config.mjs';
-import {
-  // 采集判定内核（纯函数，fail-open）：本文件只做「读 decision → 写库」的旁路。
-  createQuota,
-  extractCandidates,
-  formatAssistantSource,
-  formatSource,
-  isAutoSource,
-  resolveAutoConfig,
-} from './auto-capture.mjs';
-import {
-  // assistant 侧独立闸门（T87）：与 user 通路不共享任何阈值常量。
-  extractAssistantCandidates,
-  // T90：轮级分段采集。一段文本 → 段 + 工作状态 + 动作清单。
-  inspectAssistantMessage,
-  planAssistantCapture,
-  resolveAssistantConfig,
-} from './auto-capture-assistant.mjs';
-import { createTurnBuffer } from './auto-capture-turn.mjs';
-import { installMemjudgeRpc } from './rpc.mjs';
-import {
-  // 采集侧 kind 判定（T89）：把「用户是谁」和「约定了什么」从 event 里分出来。
-  // 判据全部在 kind-classify.mjs 里，本文件只做映射、配额与去重。
-  autoKindSource,
-  classifyCaptureKind,
-  createKindQuota,
-  sameFactSlot,
-} from './kind-classify.mjs';
+import { installMemjudgeRpc as defaultInstallRpc } from './rpc.mjs';
 import { createService, SERVICE_NAME } from './service.mjs';
-import { expand } from './query-expand.mjs';
-import { select } from './llm-select.mjs';
 
-/** Cordis 插件名（profile 里 `- id: memjudge` 的默认 name）。 */
 export const name = 'memjudge';
-
-/** 需要宿主注入的服务。缺 tools 或 systemPrompt 时 apply 不会被调用。 */
 export const inject = ['tools', 'systemPrompt', 'connection'];
 
-/** 注入 section 名。带冒号前缀，与 soul-md 的 `soul:*`、宿主的 `dsh:*` 同风格。 */
 export const SECTION_NAME = 'memjudge:recall';
-
-/** 排在宿主基础 section 之后、工具说明之前。 */
+export const CONTEXT_NAME = 'memjudge:context';
 export const SECTION_ORDER = 700;
 
-/** SPEC 能力 8 的硬上限。配置传更大也钳到这里。 */
 export const INJECT_HARD_LIMIT = 2000;
-
-/**
- * 注入三分区配额（按 INJECT_HARD_LIMIT 的份额定，实际按 injectBudget 等比缩放）。
- *
- * 为什么分区：改之前所有条目一视同仁抢 8 席，一条刚写的待办就能把用户的身份信息、
- * 说好的规矩挤出去——身份与约定被时间冲掉是这套记忆最痛的失败模式。
- * person/promise 不吃 access_count / recency 淘汰，只受条数与字符上限；
- * event 段保持原来的「按命中与时间流动」。
- * 三段之和 = 硬上限；段内不足的余量按顺序借给后面的段（person 优先占满）。
- */
 export const INJECT_SEGMENTS = Object.freeze([
-  { kind: 'person', label: '人：', cap: 800 },
-  { kind: 'promise', label: '约：', cap: 600 },
-  { kind: 'event', label: '事：', cap: 600 },
+  Object.freeze({ kind: 'person', header: '人：', share: 0.25, cap: 500 }),
+  Object.freeze({ kind: 'promise', header: '约：', share: 0.25, cap: 500 }),
+  Object.freeze({ kind: 'event', header: '事：', share: 0.50, cap: 1000 }),
 ]);
-
-/**
- * 每段的席位上限（防爆护栏，不是配额）。
- *
- * 为什么不用 cfg.injectLimit 当段上限：那个值是「列出几条索引」的旧口径，默认 8。
- * 三分之后真正决定能列几条的是**字符预算**——真实库 10 条人工记忆在 event 段要
- * 全部保留，卡 8 席会凭空丢两条。所以席位只做防爆（40 行远超任何段能装下的行数），
- * 装不下由 renderRecall 按整行丢弃。
- */
 export const INJECT_SEG_MAX_ROWS = 40;
 
-/** event 段里自动采集条目的席位上界（人工优先，auto 只补位）。 */
-export const INJECT_AUTO_SLOTS = 2;
-
-/** 人工 event 条目少于此数时才让 auto 补位，保证注入主体仍是人工确认过的内容。 */
-export const INJECT_AUTO_MANUAL_FLOOR = 6;
-
-/** 工具名。测试与文档共用这一份真源。 */
 export const TOOL_NAMES = Object.freeze([
   'memjudge_remember',
   'memjudge_recall',
@@ -131,1620 +96,2786 @@ export const TOOL_NAMES = Object.freeze([
   'memjudge_demote',
   'memjudge_conflicts',
   'memjudge_stats',
+  'memjudge_wiki',
 ]);
 
-/** 向量维度：跟随用户配置（config.mjs 的 dims，默认 64）。
- *  64 与 128 在 92 题召回、12 题综合上完全同分（91/92、0.792），但 64 维打包落盘
- *  只 +16KB（188416 B），128 维要 +31KB 顶穿 199680 的验收线——所以默认压在 64。
- *  必须是函数：面板改了 dims 之后同一个进程里要立刻按新维度读向量块，
- *  否则 allVectors 会拿旧维度的块当有效数据。 */
-
-
 export const DEFAULTS = Object.freeze({
-  /** 空串 = <DSH_HOME|~/.dsh>/memjudge/memjudge.db。绝不写用户主 profile 之外的位置。 */
-  dbPath: '',
-  /** 固定注入开关。默认关：能力 8 的 0 字符是优点，不是缺陷。 */
+  dbPath: null,
   autoInject: false,
-  /** 单次注入字符上限，1..2000。 */
+  injectMode: 'auto', // 'auto' | 'tiered' | 'legacy'
+  tierSBudget: TIER_S_MAX_CHARS,
+  tierDBudget: TIER_D_MAX_CHARS,
   injectBudget: INJECT_HARD_LIMIT,
-  /** Experimental injection-only ranking; legacy preserves historical behavior. */
+  injectLimit: 12,
+  autoCapture: true,
+  metabolismIntervalMs: 0,
   experimentalInjectMode: 'legacy',
   experimentalInjectHalfLifeDays: 30,
   experimentalInjectFloor: 0.1,
-  /** dual 保持历史双档；uniform 显式启用统一半衰期。 */
   decayMode: 'dual',
-  /** uniform 模式半衰期（天）。挂 lastAccessed，不是 createdAt。 */
   halfLifeDays: 30,
-  /** 衰减地板。0 = 严格按 schema.decayFactor（能力 12 要求 30 天 ≤0.25）。 */
   decayFloor: 0,
-  /** 检索命中即刷新 lastAccessed（「被用即刷新」）。 */
   touchOnRecall: true,
-  /** 注入索引最多列几条。 */
-  injectLimit: 8,
-  /** 融合检索（BM25 + 向量 RRF）。默认关：开启需要 key 与 32s 首次 embed，
-   *  测试与离线场景必须走纯 BM25。env MEMJUDGE_VECTOR=1 打开。 */
-  vector: process.env.MEMJUDGE_VECTOR === '1',
-  /** 查询扩展：LLM 把长问句拆成子查询分别检索。不落盘、不占库体；MEMJUDGE_EXPAND=1 打开。 */
-  expand: process.env.MEMJUDGE_EXPAND === '1',
-  /** LLM 在环选段：把候选段原文交给 chat 模型挑能回答的段。MEMJUDGE_LLMSELECT=1 打开。 */
-  llmSelect: process.env.MEMJUDGE_LLMSELECT === '1',
-  /** 向量缓存目录，null = <dbPath 同级>/.vec-cache。 */
-  vectorCacheDir: '',
+  vector: undefined,
+  rerank: undefined,
+  expand: undefined,
+  llmSelect: undefined,
 });
 
-// ---------------------------------------------------------------- 配置
-
-function clampInt(value, lo, hi, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(hi, Math.max(lo, Math.trunc(n)));
+export function defaultDbPath() {
+  const base = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  return path.join(base, 'memjudge', 'memjudge.db');
 }
 
-function clampNum(value, lo, hi, fallback) {
-  const n = Number(value);
+function clampInt(v, lo, hi, fallback) {
+  const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
-  return Math.min(hi, Math.max(lo, n));
+  return Math.max(lo, Math.min(hi, Math.trunc(n)));
 }
 
-/**
- * 归一化配置。衰减模式及统一半衰期严格校验，其他配置沿用历史归一化行为。
- * @param {object} [raw]
- */
-export function resolveConfig(raw) {
+function clampNum(v, lo, hi, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+export function resolveConfig(raw = {}, { defaultDbPathFn = defaultDbPath } = {}) {
   const src = raw && typeof raw === 'object' ? raw : {};
-  const vector = src.vector === undefined ? DEFAULTS.vector : src.vector === true;
-  const expand = src.expand === undefined ? DEFAULTS.expand : src.expand === true;
-  const llmSelect = src.llmSelect === undefined ? DEFAULTS.llmSelect : src.llmSelect === true;
-  const experimentalInjectMode = Object.hasOwn(src, 'experimentalInjectMode') ? src.experimentalInjectMode : DEFAULTS.experimentalInjectMode;
-  if (!['legacy', 'daily'].includes(experimentalInjectMode)) throw new TypeError('invalid experimentalInjectMode');
-  const experimentalInjectHalfLifeDays = Object.hasOwn(src, 'experimentalInjectHalfLifeDays') ? src.experimentalInjectHalfLifeDays : DEFAULTS.experimentalInjectHalfLifeDays;
-  const experimentalInjectFloor = Object.hasOwn(src, 'experimentalInjectFloor') ? src.experimentalInjectFloor : DEFAULTS.experimentalInjectFloor;
-  if (typeof experimentalInjectHalfLifeDays !== 'number' || !Number.isFinite(experimentalInjectHalfLifeDays) || experimentalInjectHalfLifeDays < 0.5 || experimentalInjectHalfLifeDays > 3650) throw new TypeError('invalid experimentalInjectHalfLifeDays');
-  if (typeof experimentalInjectFloor !== 'number' || !Number.isFinite(experimentalInjectFloor) || experimentalInjectFloor < 0 || experimentalInjectFloor > 1) throw new TypeError('invalid experimentalInjectFloor');
-  const hasMode = Object.hasOwn(src, 'decayMode');
-  const decayMode = hasMode ? src.decayMode : DEFAULTS.decayMode;
+  const dbPath = typeof src.dbPath === 'string' && src.dbPath.trim()
+    ? src.dbPath.trim()
+    : defaultDbPathFn();
+
+  const autoInject = src.autoInject === true;
+  const rawInjectMode = src.injectMode ?? DEFAULTS.injectMode;
+  if (rawInjectMode !== 'auto' && rawInjectMode !== 'tiered' && rawInjectMode !== 'legacy') {
+    throw new TypeError(`memjudge: injectMode 必须是 auto / tiered / legacy，收到 ${String(rawInjectMode)}`);
+  }
+
+  const tierSBudget = clampInt(src.tierSBudget, 100, TIER_S_MAX_CHARS, DEFAULTS.tierSBudget);
+  const tierDBudget = clampInt(src.tierDBudget, 100, TIER_D_MAX_CHARS, DEFAULTS.tierDBudget);
+  const injectBudget = clampInt(src.injectBudget, 1, INJECT_HARD_LIMIT, DEFAULTS.injectBudget);
+  const injectLimit = clampInt(src.injectLimit, 1, 100, DEFAULTS.injectLimit);
+
+  const expMode = src.experimentalInjectMode ?? DEFAULTS.experimentalInjectMode;
+  if (expMode !== 'legacy' && expMode !== 'daily') {
+    throw new TypeError(
+      `memjudge: experimentalInjectMode 必须是 "legacy" 或 "daily"，收到 ${JSON.stringify(expMode)}`,
+    );
+  }
+  const rawExpHalfLife = src.experimentalInjectHalfLifeDays ?? DEFAULTS.experimentalInjectHalfLifeDays;
+  if (typeof rawExpHalfLife !== 'number' || !Number.isFinite(rawExpHalfLife) || rawExpHalfLife < 0.5 || rawExpHalfLife > 3650) {
+    throw new TypeError(
+      `memjudge: experimentalInjectHalfLifeDays 必须是 [0.5, 3650] 内的有限数，收到 ${JSON.stringify(rawExpHalfLife)}`,
+    );
+  }
+  const rawExpFloor = src.experimentalInjectFloor ?? DEFAULTS.experimentalInjectFloor;
+  if (typeof rawExpFloor !== 'number' || !Number.isFinite(rawExpFloor) || rawExpFloor < 0 || rawExpFloor > 1) {
+    throw new TypeError(
+      `memjudge: experimentalInjectFloor 必须是 [0, 1] 内的有限数，收到 ${JSON.stringify(rawExpFloor)}`,
+    );
+  }
+
+  const decayMode = Object.prototype.hasOwnProperty.call(src, 'decayMode')
+    ? src.decayMode
+    : DEFAULTS.decayMode;
   if (decayMode !== 'dual' && decayMode !== 'uniform') {
-    throw new TypeError('配置 decayMode 必须为 dual 或 uniform');
+    throw new TypeError(
+      `memjudge: decayMode 必须是 "dual" 或 "uniform"，收到 ${JSON.stringify(decayMode)}`,
+    );
   }
   let halfLifeDays;
   if (decayMode === 'uniform') {
-    halfLifeDays = Object.hasOwn(src, 'halfLifeDays') ? src.halfLifeDays : DEFAULTS.halfLifeDays;
-    if (typeof halfLifeDays !== 'number' || !Number.isFinite(halfLifeDays) || halfLifeDays < 0.5 || halfLifeDays > 3650) {
-      throw new TypeError('配置 halfLifeDays 必须为 0.5 到 3650 之间的有限数字');
+    const rawHalfLife = Object.prototype.hasOwnProperty.call(src, 'halfLifeDays')
+      ? src.halfLifeDays
+      : DEFAULTS.halfLifeDays;
+    if (typeof rawHalfLife !== 'number' || !Number.isFinite(rawHalfLife) || rawHalfLife < 0.5 || rawHalfLife > 3650) {
+      throw new TypeError(
+        `memjudge: halfLifeDays 在 decayMode="uniform" 下必须是 [0.5, 3650] 内的有限数，收到 ${JSON.stringify(rawHalfLife)}`,
+      );
     }
+    halfLifeDays = rawHalfLife;
   } else {
     halfLifeDays = clampNum(src.halfLifeDays, 0.5, 3650, DEFAULTS.halfLifeDays);
   }
+
+  const autoCapDefault = autoCaptureConfig();
+  const autoCapture = typeof src.autoCapture === 'boolean'
+    ? src.autoCapture
+    : Boolean(autoCapDefault.enabled ?? autoCapDefault.autoCapture);
+
+  const metabolismIntervalMs = src.metabolismIntervalMs === undefined
+    ? DEFAULTS.metabolismIntervalMs
+    : clampInt(src.metabolismIntervalMs, 0, 24 * 3600 * 1000, DEFAULTS.metabolismIntervalMs);
+
   return {
-    dbPath: typeof src.dbPath === 'string' && src.dbPath.trim() ? src.dbPath.trim() : DEFAULTS.dbPath,
-    autoInject: src.autoInject === true,
-    injectBudget: clampInt(src.injectBudget, 1, INJECT_HARD_LIMIT, DEFAULTS.injectBudget),
-    experimentalInjectMode,
-    experimentalInjectHalfLifeDays,
-    experimentalInjectFloor,
+    dbPath,
+    autoInject,
+    injectMode: rawInjectMode,
+    tierSBudget,
+    tierDBudget,
+    injectBudget,
+    injectLimit,
+    autoCapture,
+    metabolismIntervalMs,
+    experimentalInjectMode: expMode,
+    experimentalInjectHalfLifeDays: rawExpHalfLife,
+    experimentalInjectFloor: rawExpFloor,
     decayMode,
     halfLifeDays,
     decayFloor: clampNum(src.decayFloor, 0, 1, DEFAULTS.decayFloor),
-    touchOnRecall: src.touchOnRecall !== false,
-    injectLimit: clampInt(src.injectLimit, 1, 50, DEFAULTS.injectLimit),
-    vector,
-    expand,
-    llmSelect,
-    vectorCacheDir: typeof src.vectorCacheDir === 'string' ? src.vectorCacheDir : DEFAULTS.vectorCacheDir,
-    // 假时钟注入点。不进 DEFAULTS（函数不可共享），只在这里透传。
+    touchOnRecall: Boolean(src.touchOnRecall ?? DEFAULTS.touchOnRecall),
+    vector: src.vector,
+    rerank: src.rerank,
+    expand: src.expand,
+    llmSelect: src.llmSelect,
+    storageLimitBytes: src.storageLimitBytes,
     now: typeof src.now === 'function' ? src.now : null,
   };
 }
 
-/** 默认库路径。DSH_HOME 优先，保证隔离 profile 不会写进用户主目录。 */
-export function defaultDbPath() {
-  const home = process.env.DSH_HOME || path.join(homedir(), '.dsh');
-  return path.join(home, 'memjudge', 'memjudge.db');
+function getRawDb(store) {
+  if (!store?.raw) return null;
+  return typeof store.raw === 'function' ? store.raw() : store.raw;
 }
 
-// ---------------------------------------------------------------- 编解码
-
-/** store.put 的 source 字段是字符串，这里把章/段号编成可逆 JSON。 */
-function encodeSource(chapter, para) {
-  if (chapter == null && para == null) return null;
-  return JSON.stringify({ chapter: Number(chapter) || 0, para: Number(para) || 0 });
-}
-
-/** 反向解析。历史数据可能是别的格式，解析失败退回 {0,0} 而不是抛错。 */
-function decodeSource(source) {
-  if (source == null) return { chapter: 0, para: 0 };
-  if (typeof source === 'object') {
-    return { chapter: Number(source.chapter) || 0, para: Number(source.para) || 0 };
+function chapterOf(m) {
+  if (Number.isInteger(m?.chapter) && m.chapter > 0) {
+    const out = {
+      chapter: m.chapter,
+      para: Number.isInteger(m?.para) ? m.para : 0,
+    };
+    if (typeof m?.documentId === 'string' && m.documentId) out.documentId = m.documentId;
+    return out;
   }
-  const text = String(source);
-  if (text.startsWith('{')) {
+  if (typeof m?.source === 'string' && m.source.trim().startsWith('{')) {
     try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed === 'object') {
-        return { chapter: Number(parsed.chapter) || 0, para: Number(parsed.para) || 0 };
+      const parsed = JSON.parse(m.source);
+      if (parsed && typeof parsed === 'object' && Number.isInteger(parsed.chapter) && parsed.chapter > 0) {
+        const out = {
+          chapter: parsed.chapter,
+          para: Number.isInteger(parsed.para) ? parsed.para : 0,
+        };
+        if (typeof parsed.documentId === 'string' && parsed.documentId) out.documentId = parsed.documentId;
+        return out;
       }
     } catch {
-      // 落到下面的兜底
+      // 非章段 JSON，走 id 兜底
     }
+  }
+  const hit = /^mem-c(\d+)-p(\d+)-/.exec(String(m?.id ?? ''));
+  if (hit) {
+    const ch = Number(hit[1]);
+    const p = Number(hit[2]);
+    if (ch > 0 || p > 0) return { chapter: ch, para: p };
   }
   return { chapter: 0, para: 0 };
 }
 
-const ID_SOURCE = /^mem-c(\d+)-p(\d+)-/;
-
-/**
- * 章/段号的权威读法：先看 source 列里的 JSON，其次看 id 前缀
- * （makeId 生成 `mem-c<章>-p<段>-<hash>`）。
- *
- * 为什么需要 id 兜底：source 列是**一列两用**——章级聚合检索（topChapters）要章号，
- * 面板分组要来源串。带显式 source 的记忆把这一列让给了来源串，章号只剩 id 里那份。
- * 不兜底则章级聚合会把每条显式来源记忆各算一章，冲突检测从「按文档」退化成「按句」。
- */
-function chapterOf(memory) {
-  const src = decodeSource(memory?.source);
-  // 只在完全拿不到章号时兜底：source 列有合法 JSON（哪怕只给了段号）就以它为准。
-  if (src.chapter !== 0 || src.para !== 0) return src;
-  // source 不是 encodeSource 的 JSON（显式来源串把这一列让出去了）时，章号只剩 id 里那份。
-  // 数值不限位数：makeId 的 padStart 只是补齐，三位章号会原样写成 100。
-  const m = ID_SOURCE.exec(String(memory?.id ?? ''));
-  if (!m) return src;
-  return { chapter: Number(m[1]) || 0, para: Number(m[2]) || 0 };
-}
-
-/** 注入索引里的来源标签：章号优先，显式来源次之，两者都没有才算手动写入。 */
-function sourceLabel(source) {
-  const text = typeof source === 'string' ? source.trim() : '';
-  if (!text || text.startsWith('{')) return '手动写入';
-  return oneLine(text, 24);
-}
-
-/** store.dump() 的一条 → SearchIndex.add 期望的文档形状。 */
-export function toDoc(memory) {
-  const src = chapterOf(memory);
+export function toDoc(m) {
+  const src = chapterOf(m);
+  const category = m.category ?? kindToCategory(m.kind);
+  const kind = m.kind ?? categoryToKind(category);
+  const tier = Number.isInteger(m.tier) ? m.tier : (kind === 'event' ? 3 : 1);
   return {
-    id: memory.id,
-    text: memory.text,
+    id: m.id,
+    spaceId: m.spaceId ?? GLOBAL_SPACE_ID,
+    category,
+    kind,
+    tier,
+    lTier: Number.isInteger(m.lTier) ? m.lTier : 1,
+    slotKey: m.slotKey ?? null,
+    text: m.text,
     source: src,
-    importance: memory.importance,
-    accessCount: memory.accessCount,
-    createdAt: memory.createdAt,
-    lastAccessed: memory.lastAccessed,
-    supersededBy: memory.supersededBy,
+    rawSource: m.source ?? null,
+    chapter: src.chapter || (Number.isFinite(m.chapter) ? m.chapter : 0),
+    para: src.para || (Number.isFinite(m.para) ? m.para : 0),
+    importance: m.importance ?? 0,
+    accessCount: m.accessCount ?? m.access_count ?? 0,
+    lastAccessed: m.lastAccessed ?? m.last_accessed ?? m.createdAt ?? m.created_at ?? 0,
+    createdAt: m.createdAt ?? m.created_at ?? 0,
   };
 }
 
-/** 压成单行并截断，用于注入索引。 */
-function oneLine(text, max) {
-  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
-  if (flat.length <= max) return flat;
-  let end = max - 1;
-  const before = flat.charCodeAt(end - 1), after = flat.charCodeAt(end);
-  if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end--;
-  return `${flat.slice(0, end)}…`;
+/**
+ * 证据门硬拒判定：gate()/gateSlots() 一旦给出 deny=true，除确认可放行的理由外一律硬拒。
+ * 白名单只保留「已验证可放行」的两个理由，其余理由由证据门自行扩充即可生效——
+ * 不再逐一枚举拒绝理由，避免产出集合与判定集合漂移导致判定恒 false。
+ */
+export function isHardDeny(v) {
+  if (!v?.deny) return false;
+  if (v.reason === 'hit' || v.reason === 'explain-question') return false;
+  return true;
 }
 
 /**
- * 拒答门的软硬之分。
- *
- * gate 的 no-facts 与「二字组覆盖不足」在评测语料上等于「材料里没有」，但在通用
- * 记忆场景里，用户写一句「今天心情不好」同样抽不出三元组——把它当拒答会让纯文本
- * 记忆永远查不到。所以这两类在 recall 里放行，只保留三类硬门：实体不存在、
- * 限定语不存在、拉丁标识不存在。
- *
- * 硬门不依赖三元组，所以 no-facts 时单独补一次拉丁标识检查：
- * 「白鲸号的 IMO 编号是多少」在纯叙述候选上仍会被拒。
+ * recall 证据门的最终裁决：bodyVerdict（片段窗口核验）与 slotGate（槽位索引核验）谁说了算。
+ * - 片段核验放行即放行：槽位图只是结构化投影，抽不出槽位不等于事实不存在，
+ *   让槽位门单方面否决会把「文本里明明写着、只是没抽成槽位」的整类召回拒死；
+ * - 片段核验要拒时，只有槽位门给出「肯定命中」才豁免，用来抵住文本窗口截断造成的误拒。
  */
-export function isHardDeny(verdict, query, body) {
-  const reason = verdict?.reason;
-  if (reason === 'entity-not-recorded' || reason === 'scope-not-recorded') return true;
-  if (reason === 'attribute-not-recorded') {
-    // 带 coverage 的是「二字组覆盖不足」。实测 104 道真题的块覆盖率下限是 0.43，
-    // 所以 cov<0.4 是「问的东西一个字组都对不上」，与 H4「海关关长」的 0% 同类，属硬门；
-    // 不再只认恰为 0 这一种。
-    return typeof verdict.coverage !== 'number' || verdict.coverage < 0.4;
-  }
-  if (reason === 'no-facts') {
-    const fold = (s) => String(s).replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0)).toLowerCase();
-    const latin = fold(query).match(/[a-z][a-z0-9]{1,}/g) || [];
-    const tokens = fold(body).match(/[a-z][a-z0-9]*/g) || [];
-    return latin.some((s) => !tokens.includes(s));
-  }
-  return false;
+export function shouldDenyRecall(bodyVerdict, slotGate) {
+  if (!isHardDeny(bodyVerdict)) return false;
+  const slotExplicitlyAffirmed = Boolean(
+    slotGate
+    && slotGate.deny === false
+    && slotGate.reason === 'hit'
+    && (slotGate.hits?.length ?? 0) > 0,
+  );
+  return !slotExplicitlyAffirmed;
 }
 
-// ---------------------------------------------------------------- 插件
+function textBlock(text) {
+  return [{ type: 'text', text }];
+}
 
-/**
- * 挂载插件。
- *
- * @param {object} ctx cordis Context（需已注入 tools 与 systemPrompt）
- * @param {object} [config] 见 DEFAULTS
- */
-export function apply(ctx, config, dependencies = {}) {
+const SURROGATE_RE = /[\uD800-\uDFFF]/;
+function sanitizeWellFormed(str) {
+  const s = String(str ?? '');
+  if (!SURROGATE_RE.test(s)) return s;
+  return typeof s.toWellFormed === 'function'
+    ? s.toWellFormed()
+    : s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+}
+
+function inlineText(text, max = 80) {
+  const clean = sanitizeWellFormed(String(text ?? '').replace(/\s+/g, ' ').trim());
+  if (clean.length <= max) return clean;
+  let cut = max - 1;
+  const hi = clean.charCodeAt(cut - 1);
+  if (hi >= 0xD800 && hi <= 0xDBFF) cut -= 1;
+  return `${clean.slice(0, cut)}…`;
+}
+
+function sourceLabel(rawSource) {
+  const s = typeof rawSource === 'string' ? rawSource.trim() : '';
+  if (!s) return '';
+  if (s.startsWith('auto:')) return '自动采集';
+  if (s.startsWith('turn:')) return '双边脱水';
+  return inlineText(s, 24);
+}
+
+function extractPlainTextFromBlocks(content) {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const part of content) {
+    if (typeof part === 'string') {
+      parts.push(part);
+    } else if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string') {
+      parts.push(part.text);
+    }
+  }
+  return parts.join('\n').trim();
+}
+
+function isRuntimeSnapshotMessage(msg) {
+  const src = msg?.source;
+  return Boolean(src && typeof src === 'object' && src.kind === 'runtime-context');
+}
+
+function extractLatestUserQueryFromMessages(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (!m || m.role !== 'user' || isRuntimeSnapshotMessage(m)) continue;
+    const txt = extractPlainTextFromBlocks(m.content);
+    if (txt) return txt;
+  }
+  return '';
+}
+
+function extractQueryFromPromptContext(promptCtx, pendingQueries) {
+  if (!promptCtx || typeof promptCtx !== 'object') return { query: '', isToolSubstep: false };
+  if (typeof promptCtx.query === 'string' && promptCtx.query.trim()) {
+    return { query: promptCtx.query.trim(), isToolSubstep: Boolean(promptCtx.isToolSubstep) };
+  }
+  const session = promptCtx.session ?? promptCtx.agent?.session ?? null;
+  const sessionId = session?.id ?? promptCtx.sessionId ?? null;
+  if (sessionId && pendingQueries.has(sessionId)) {
+    const pq = pendingQueries.get(sessionId);
+    return { query: pq.query, isToolSubstep: pq.isToolSubstep };
+  }
+  if (Array.isArray(promptCtx.messages) && promptCtx.messages.length > 0) {
+    const last = promptCtx.messages[promptCtx.messages.length - 1];
+    const isToolSubstep = Boolean(last && last.role === 'tool');
+    return {
+      query: isToolSubstep ? '' : extractLatestUserQueryFromMessages(promptCtx.messages),
+      isToolSubstep,
+    };
+  }
+  const log = session?.log;
+  if (Array.isArray(log) && log.length > 0) {
+    for (let i = log.length - 1; i >= 0; i -= 1) {
+      const ev = log[i];
+      if (!ev) continue;
+      if (ev.type === 'tool/result') {
+        return { query: '', isToolSubstep: true };
+      }
+      if (ev.type === 'user/message') {
+        if (isRuntimeSnapshotMessage(ev.message)) continue;
+        return { query: extractPlainTextFromBlocks(ev.message?.content), isToolSubstep: false };
+      }
+      if (ev.type === 'turn/end') break;
+    }
+  }
+  return { query: '', isToolSubstep: false };
+}
+
+export function apply(ctx, config = {}, dependencies = {}) {
   const deps = {
-    storeFactory: openStore,
-    maxChars: configuredMaxChars,
-    storageLimitBytes: configuredStorageLimitBytes,
-    installRpc: installMemjudgeRpc,
-    autoCapture: resolveAutoCapture,
-    defaultDbPath,
-    configReport,
-    embedDims,
-    expand,
-    select,
-    ...(dependencies && typeof dependencies === 'object' ? dependencies : {}),
+    storeFactory: dependencies.storeFactory ?? ((file, opts) => storeMod.open(file, opts)),
+    maxChars: dependencies.maxChars ?? configuredMaxChars,
+    storageLimitBytes: dependencies.storageLimitBytes ?? configuredStorageLimitBytes,
+    installRpc: dependencies.installRpc ?? defaultInstallRpc,
+    defaultDbPath: dependencies.defaultDbPath ?? defaultDbPath,
+    configReport: dependencies.configReport ?? defaultConfigReport,
+    moduleFlags: dependencies.moduleFlags ?? defaultModuleFlags,
+    embedDims: dependencies.embedDims ?? defaultEmbedDims,
+    expand: dependencies.expand ?? defaultExpand,
+    rerank: dependencies.rerank ?? defaultRerank,
+    embed: dependencies.embed ?? defaultEmbed,
+    select: dependencies.select ?? defaultSelect,
+    extractHybrid: dependencies.extractHybrid ?? null,
   };
-  const cfg = resolveConfig(config);
-  const vectorEnabled = () => cfg.vector;
-  // Capture decay settings at mount: rebuilding an index must not change its policy.
+
+  const cfg = resolveConfig(config, { defaultDbPathFn: deps.defaultDbPath });
   const decayOptions = {
     halfLifeDays: cfg.decayMode === 'uniform' ? cfg.halfLifeDays : null,
     decayFloor: cfg.decayFloor,
   };
-  const now = cfg.now ?? (() => Date.now());
-  const dbPath = cfg.dbPath || deps.defaultDbPath();
-  const vecDims = () => deps.embedDims();
-  let index = null;
-  let indexDirty = true;
-  let injectCache = null;
+  const now = cfg.now ?? dependencies.now ?? (() => Date.now());
+  const dbPath = cfg.dbPath;
+
   let fault = null;
-  let epoch = 0;
+  let store = null;
+  let index = null;
+  let indexBuiltForGen = -1;
   let contentGeneration = 0;
-  let autoCaptureCorpus = null;
-  let wiki = null;
-  const invalidate = () => {
-    indexDirty = true;
-    injectCache = null;
-    autoCaptureCorpus = null;
-  };
+
   const enterFault = (cause) => {
-    if (fault) return fault;
-    epoch += 1;
-    invalidate();
-    fault = new Error(`memjudge instance fault (epoch ${epoch})`, { cause });
+    if (!fault) {
+      fault = new Error(`memjudge store unavailable: ${cause?.message ?? cause}`, { cause });
+    }
+    index = null;
     return fault;
   };
-  let observedContent;
+
   const assertHealthy = () => {
+    if (disposed) throw new Error('memjudge plugin disposed');
     if (fault) throw fault;
-    const current = store.contentVersion();
-    if (observedContent !== undefined && current !== observedContent) {
-      contentGeneration += 1;
-      invalidate();
-    }
-    observedContent = current;
   };
-  // 两个上限都来自用户配置层（env > config.json > 默认 2MB / 0）：
-  // storageLimitBytes 只决定 stats() 的「上限/是否超预算」，maxChars 才是写入闸门。
-  const store = deps.storeFactory(dbPath, {
+
+  const limitBytes = cfg.storageLimitBytes === undefined
+    ? deps.storageLimitBytes()
+    : cfg.storageLimitBytes;
+
+  store = deps.storeFactory(dbPath, {
     now,
+    decayMode: cfg.decayMode,
+    halfLifeDays: cfg.halfLifeDays,
     maxChars: deps.maxChars(),
-    storageLimitBytes: deps.storageLimitBytes(),
+    storageLimitBytes: limitBytes,
+    ...(limitBytes === undefined ? {} : { limitBytes }),
     onFault: (cause) => enterFault(cause),
   });
 
   const disposers = [];
+  const track = (d) => { if (typeof d === 'function') disposers.push(d); };
   let disposed = false;
-  const track = (disposer) => {
-    if (typeof disposer === 'function') disposers.push(disposer);
-    return disposer;
-  };
-  const dispose = () => {
-    if (disposed) return;
-    disposed = true;
-    for (let i = disposers.length - 1; i >= 0; i -= 1) {
-      try { disposers[i](); } catch { /* 单个 disposer 失败不阻断后续释放与关库 */ }
+  let disposeResult;
+  let ingestTask = null;
+  const lifetime = new AbortController();
+  let metabolismTimer = null;
+  let ingestTimer = null;
+  const turnCollectors = new Map();
+  const pendingQueries = new Map();
+  const registeredSpaces = new Set([GLOBAL_SPACE_ID]);
+
+  const ensureSpaceRegistered = (scopeInfo) => {
+    if (!scopeInfo || !scopeInfo.spaceId || registeredSpaces.has(scopeInfo.spaceId)) return;
+    if (scopeInfo.spaceId === GLOBAL_SPACE_ID) {
+      registeredSpaces.add(GLOBAL_SPACE_ID);
+      return;
     }
-    disposers.length = 0;
-    index = null;
-    injectCache = null;
-    wiki = null;
-    store.close();
+    if (typeof store.upsertSpace === 'function') {
+      try {
+        store.upsertSpace({
+          spaceId: scopeInfo.spaceId,
+          kind: scopeInfo.kind || 'workspace',
+          rootPath: scopeInfo.rootPath ?? scopeInfo.workspaceRoot ?? scopeInfo.cwd ?? null,
+          label: scopeInfo.label || scopeInfo.spaceId,
+        });
+        registeredSpaces.add(scopeInfo.spaceId);
+      } catch (err) {
+        // fail-open：只读库或最小测试桩等场景不阻断会话，但必须留痕以便定位空间登记失败
+        console.warn(`[memjudge] 空间登记失败 spaceId=${scopeInfo.spaceId}: ${err?.message ?? err}`);
+      }
+    }
+  };
+
+  const flushUnclosedTurnsToQueue = () => {
+    for (const [, entry] of turnCollectors.entries()) {
+      try {
+        if (entry.hasInput) {
+          entry.collector.closeTurn({ now: now() });
+        }
+      } catch {
+        // fail-open
+      }
+    }
+    turnCollectors.clear();
+  };
+
+  const dispose = () => {
+    if (disposed) return disposeResult;
+    disposed = true;
+    lifetime.abort();
+    if (metabolismTimer) {
+      clearInterval(metabolismTimer);
+      metabolismTimer = null;
+    }
+    if (ingestTimer) {
+      clearTimeout(ingestTimer);
+      ingestTimer = null;
+    }
+    flushUnclosedTurnsToQueue();
+    pendingQueries.clear();
+    while (disposers.length) {
+      const fn = disposers.pop();
+      try { fn(); } catch { /* ignore */ }
+    }
+    const close = () => { try { store?.close?.(); } catch { /* ignore */ } };
+    // Cordis may await this Promise; even a non-awaiting host cannot close early.
+    // Preserve synchronous disposal for idle callers and the same Promise for retries.
+    if (ingestTask) disposeResult = ingestTask.then(close, close);
+    else close();
+    return disposeResult;
   };
 
   try {
-  // 宿主 RPC 通道：给 browser 半侧（client.js 的设置页「记忆库」面板）提供只读数据。
-  // 无 Connection RPC 时静默空函数，不影响其它功能。
-  track(deps.installRpc(ctx, { dbPath }));
+    const vecCache = new Map();
+    const rerankCache = new Map();
+    const expandCache = new Map();
+    const selectCache = new Map();
+    const recallCache = new Map();
+    let vecCacheModelKey = '';
 
-  const getIndex = () => {
-    assertHealthy();
-    if (!index || indexDirty) {
-      const built = new SearchIndex({ ...decayOptions, maxChars: cfg.injectBudget });
-      built.addAll(store.dump().map(toDoc));
+    const getStoreDataGen = () => (typeof store.dataGeneration === 'function' ? store.dataGeneration() : contentGeneration);
+
+    const getIndex = () => {
+      assertHealthy();
+      const curGen = getStoreDataGen();
+      if (index && indexBuiltForGen === curGen) return index;
+      const rows = typeof store.list === 'function'
+        ? store.list({ status: 'active', includeText: true, limit: 100000 })
+        : store.dump();
+      const built = new SearchIndex({
+        now: () => now(),
+        ...decayOptions,
+        store,
+      }).addAll(rows.map(toDoc));
+      for (const [id, vec] of vecCache) built.setVector(id, vec);
       index = built;
-      indexDirty = false;
-      if (vectorEnabled() && store) {
-        // 先吃落盘的向量块（同步、零网络）。没有就后台补，绝不阻塞启动：
-        // 启动重建现在 43ms，接一次 32s 的 embed 会让插件装载卡死。
-        const cached = store.allVectors(vecDims());
-        if (cached.size) built.setVectors(cached);
-        else warmVectors(built);
-      }
-    }
-    return index;
-  };
-
-  /** 后台补向量：失败/无 key 时静默返回，索引保持纯 BM25。 */
-  let vectorWarming = null;
-  const warmVectors = (built) => {
-    if (vectorWarming) return vectorWarming;
-    vectorWarming = (async () => {
-      try {
-        const rows = store.dump();
-        const vecs = await embedVec(rows.map((r) => r.text), { dims: vecDims(), cacheDir: cfg.vectorCacheDir });
-        if (!vecs) return;
-        const m = new Map();
-        rows.forEach((r, i) => { if (vecs[i]) m.set(r.id, vecs[i]); });
-        store.putVectors(m);
-        built.setVectors(m);
-        if (injectCache !== null) injectCache = null;
-      } catch {
-        // 静默：融合检索是增强项，失败就退回纯 BM25
-      } finally {
-        vectorWarming = null;
-      }
-    })();
-    return vectorWarming;
-  };
-
-  /**
-   * 固定注入块：三分分区索引（人 / 约 / 事）。只放 descriptor（id + 首行 + 来源），
-   * 正文一个字不进 prompt。关闭时返回空串——dsh-system-prompt 会过滤空 section。
-   *
-   * 排序与淘汰规则按 kind 分开，这是本次改造的核心：
-   *   person / promise  importance 降序 + created_at 升序（老的身份事实是地基，
-   *                    同分时先保老的）；**不看 access_count、不看 recency**，
-   *                    只在条数与字符预算上受限——用户的身份与说好的规矩不该被
-   *                    一条刚写的待办挤出注入面。
-   *   event             tier 升序 + importance 降序 + created_at 升序（v7；tier 由
-   *                    scripts/nightly.mjs 按命中与闲置维护），前面仍叠「人工优先，
-   *                    auto 最多补 2 席且需 accessCount>0」。
-   *
-   * 渲染仍走 layer.renderRecall（soul-md 同源）：预算按整行扣，装不下的行整条丢掉，
-   * 绝不截半行——半行 descriptor 对模型是噪声。
-   */
-  const renderInject = () => {
-    assertHealthy();
-    if (!cfg.autoInject) return '';
-    const daily = cfg.experimentalInjectMode === 'daily';
-    if (!daily && injectCache !== null) return injectCache;
-
-    const snapshot = daily ? store.injectionSnapshot() : null;
-    if (snapshot && !snapshot.complete) throw new Error('experimental injection snapshot incomplete');
-    const rows = daily ? snapshot.candidates : store.dump();
-    const instant = daily ? now() : 0;
-    if (daily && (typeof instant !== 'number' || !Number.isFinite(instant))) throw new TypeError('invalid injection clock');
-    if (!rows.length) {
-      injectCache = '';
-      return injectCache;
-    }
-
-    const bucket = { person: [], promise: [], event: [] };
-    for (const row of rows) bucket[normalizeKind(row.kind)].push(row);
-
-    const tie = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-    const byImportance = (a, b) => (b.importance - a.importance) || (a.createdAt - b.createdAt) || tie(a, b);
-    // event 段的排序键（v7）：tier ASC, importance DESC, created_at ASC。
-    // tier 在前是有意的：tier 是 nightly 算出来的时效判断（被反复命中的上浮、长期没读的
-    // 下沉），比单条 importance 更接近「现在还该不该占席位」。同 tier 内仍按人工给的
-    // importance 排，最后用 created_at 兜底——老条目先留，与新写的待办抢席位时不吃亏。
-    const byTier = (a, b) => (a.tier - b.tier) || (b.importance - a.importance) || (a.createdAt - b.createdAt) || tie(a, b);
-    const dailyWeight = row => {
-      const days = Math.floor(Math.max(0, instant - row.lastAccessed) / 86400000);
-      return row.importance * (cfg.experimentalInjectFloor + (1 - cfg.experimentalInjectFloor) * Math.pow(0.5, days / cfg.experimentalInjectHalfLifeDays));
+      indexBuiltForGen = curGen;
+      return index;
     };
-    const eventOrder = daily ? (a, b) => (dailyWeight(b) - dailyWeight(a)) || (a.createdAt - b.createdAt) || tie(a, b) : byTier;
-    bucket.person.sort(byImportance);
-    bucket.promise.sort(byImportance);
 
-    // event：人工条目的席位优先，auto 只在人工不足时补位。
-    // auto 还要求 accessCount>0——一次都没被读过的自动条目进注入面只是噪声。
-    const manualEvent = bucket.event.filter((row) => !isAutoSource(row.source)).sort(eventOrder);
-    const autoEvent = bucket.event
-      .filter((row) => isAutoSource(row.source) && row.accessCount > 0)
-      .sort(eventOrder);
-    const autoSlots = manualEvent.length < INJECT_AUTO_MANUAL_FLOOR
-      ? Math.min(INJECT_AUTO_SLOTS, Math.max(0, cfg.injectLimit - manualEvent.length))
-      : 0;
-    bucket.event = [...manualEvent, ...autoEvent.slice(0, autoSlots)];
+    const bumpContentGeneration = () => {
+      contentGeneration += 1;
+      index = null;
+      recallCache.clear();
+    };
 
-    const total = rows.length;
-    const scale = cfg.injectBudget / INJECT_HARD_LIMIT;
-    const tail = '\n用 memjudge_recall 取全文，memjudge_conflicts 查前后矛盾。';
-    const heading = (counts) => `## memjudge 记忆索引（人 ${counts.person} / 约 ${counts.promise} / 事 ${counts.event} 条，库内 ${total} 条）`;
+    const invalidate = () => {
+      index = null;
+      recallCache.clear();
+    };
 
-    // 预算按 heading 的**上界**扣一次，选完再把真实 heading 写回去：上界取的是
-    // 每段候选条数（≥ 实际选中条数），数字位数只多不少，所以真实 heading 一定比它短，
-    // 总长恒 ≤ injectBudget，也不会因为条数位数变化而在两轮之间振荡。
-    const headMax = heading({
-      person: bucket.person.length,
-      promise: bucket.promise.length,
-      event: bucket.event.length,
-    });
-    const counts = { person: 0, promise: 0, event: 0 };
-    const parts = [];
-    let left = cfg.injectBudget - headMax.length - tail.length - (INJECT_SEGMENTS.length - 1);
-    let carry = 0; // 前面各段没花完的余量，按顺序借给后面的段
-    for (const seg of INJECT_SEGMENTS) {
-      if (left <= 0) break;
-      const cap = Math.min(left, Math.floor(seg.cap * scale) + carry);
-      const maxRows = INJECT_SEG_MAX_ROWS;
-      const topics = bucket[seg.kind].slice(0, maxRows).map((row) => {
-        const src = chapterOf(row);
-        return {
-          key: row.id,
-          title: oneLine(row.text, 90),
-          summary: src.chapter ? `ch${src.chapter}` : sourceLabel(row.source),
-        };
-      });
-      const body = cap > 0 && topics.length ? renderRecall([{ heading: seg.label, topics }], cap) : '';
-      if (!body) {
-        // 整段装不下任何一行：连小标题都不输出（空标题只是噪声），余量继续往后借。
-        carry += cap;
-        continue;
+    const wikiRuntime = { compiles: 0, skipped: 0, lastSignature: '', pageCount: 0 };
+    const touchWiki = () => { wikiRuntime.lastSignature = ''; };
+
+    function getWikiStatusString() {
+      const pages = typeof store.listWikiPages === 'function'
+        ? store.listWikiPages({ limit: 10000 })
+        : [];
+      const dirtyCount = pages.filter((p) => p.dirty).length;
+      const sig = `${getStoreDataGen()}:${pages.length}:${dirtyCount}`;
+      if (sig === wikiRuntime.lastSignature && wikiRuntime.compiles > 0) {
+        wikiRuntime.skipped += 1;
+      } else {
+        wikiRuntime.compiles += 1;
+        wikiRuntime.lastSignature = sig;
       }
-      parts.push(body);
-      counts[seg.kind] = Math.max(0, body.split('\n').length - 1);
-      carry += Math.max(0, cap - body.length);
-      left -= body.length + 1;
+      wikiRuntime.pageCount = pages.length;
+      return `v${STORE_SCHEMA_VERSION} 持久化 ${pages.length} 页（待重编 ${dirtyCount} 页）/ 检查 ${wikiRuntime.compiles} 次，命中跳过 ${wikiRuntime.skipped} 次`;
     }
 
-    injectCache = parts.length ? `${heading(counts)}\n${parts.join('\n')}${tail}` : '';
-    return injectCache;
-  };
-
-  // ── wiki 编译层（T8-1）───────────────────────────────────────────────
-  // docs/wiki-layer-spec.md §2 的硬决策：编译产物只活在内存，库里只留两个 meta
-  // 键（wiki_version / raw_digest，合计 <200 字节）。不建表、不写 md、不建 FTS——
-  // memories 是 raw 的唯一副本，投影一旦落盘就成了第二份真相，冲突再也说不清哪边
-  // 是材料。投影随时可以按 raw 重算，所以「没有落盘投影」从来不是缺陷。
-  const WIKI_META_VERSION = 'wiki_version';
-  const WIKI_META_DIGEST = 'raw_digest';
-
-  /** 内存投影。null = 本进程还没编过（≠「库里没有 wiki」）。 */
-  let stmtMetaGet = null;
-  let stmtMetaPut = null;
-
-  /** 运行时计数：让 stats 与测试能区分「真编了一次」与「digest 命中直接跳过」。 */
-  const wikiRuntime = {
-    compiles: 0,
-    skipped: 0,
-    unverified: 0,
-    status: 'idle',
-    digest: null,
-  };
-
-  const metaRead = (key) => {
-    try {
-      stmtMetaGet ??= store.raw().prepare('SELECT v FROM meta WHERE k = ?');
-      const row = stmtMetaGet.get(key);
-      return row ? String(row.v) : null;
-    } catch {
-      return null;
-    }
-  };
-
-  // meta 只是「这张投影对应哪份 raw」的书签：写失败最多下次多编一次，不挡写入。
-  const metaWrite = (key, value) => {
-    try {
-      stmtMetaPut ??= store.raw().prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)');
-      stmtMetaPut.run(key, String(value));
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  /**
-   * 重编 wiki 投影。三条短路规则：
-   *   1. 内存投影的 rawDigest 与当前 raw 相同 → 直接复用（compiles 不动）。
-   *   2. meta.raw_digest 已存在且等于当前 raw → 这份 raw 之前编过，投影只是丢了
-   *      （进程重启）。仍要编一次把内存投影建起来，但用 diffWiki 记下相对上次落盘
-   *      投影的增删改判，而不是当成一个全新库。
-   *   3. Grounding 有违规时不拒绝编译、不抛错：投影照建，状态降为 unverified
-   *      （文档 §2.3），raw 与写入结果完全不受影响。
-   */
-  const refreshWiki = (persist = false) => {
-    const rows = store.dump();
-    const digest = rawDigest(rows);
-
-    if (wiki && wiki.rawDigest === digest) {
-      wikiRuntime.skipped += 1;
-      return wiki;
-    }
-
-    const storedDigest = metaRead(WIKI_META_DIGEST);
-    const storedVersion = metaRead(WIKI_META_VERSION);
-    const sameAsStored = storedDigest === digest && storedVersion === String(WIKI_VERSION);
-
-    const compiled = compileWiki(rows);
-    wikiRuntime.compiles += 1;
-
-    // 只跟内存里的旧投影比。投影不落盘，重启后拿不到上一版的块，宁可不给 diff
-    // 也不伪造「全部新增」；storedDigest 相同意味着这份 raw 之前编过且内容没动，
-    // 此时 diff 恒为空，直接置 null。
-    const previous = wiki;
-    compiled.diff = previous && !sameAsStored ? diffWiki(previous, compiled) : null;
-    compiled.reusedStoredDigest = sameAsStored;
-
-    const violations = groundingViolations(compiled);
-    compiled.grounding = { violations, status: violations.length ? 'unverified' : 'verified' };
-    wiki = compiled;
-
-    wikiRuntime.unverified = violations.length;
-    wikiRuntime.status = compiled.grounding.status;
-    wikiRuntime.digest = digest;
-    // 书签只在写库/删库路径落盘：读工具（stats/recall）懒编投影时不写库，保持
-    // 「读不产生写入」这条契约。
-    if (persist) {
-      metaWrite(WIKI_META_VERSION, WIKI_VERSION);
-      metaWrite(WIKI_META_DIGEST, digest);
-    }
-    return wiki;
-  };
-
-  /**
-   * 写库/删库后的接线钩子。编译异常一律吞掉：记忆写入是主业务，wiki 只是投影，
-   * 失败就退回「没有投影」，下次写库再试，raw 一个字节都不受影响。
-   */
-  const touchWiki = () => {
-    try {
-      refreshWiki(true);
-    } catch {
-      wiki = null;
-      wikiRuntime.status = 'idle';
-    }
-  };
-
-  /** 只读投影入口：没编过就按需编一次（不落盘）。T8-2/T8-4 从这里取投影。 */
-  const getWiki = () => {
-    assertHealthy();
-    if (wiki) return wiki;
-    try {
-      return refreshWiki(false);
-    } catch {
-      return null;
-    }
-  };
-
-  // ── 自动记忆（T2 接线）：agent/pre-step 采集 ──────────────────────────
-  // 设计真源 docs/auto-capture-spec.md §1.3（挂载点与 prepend 语义）/ §4.3（章号分配）/
-  // §7.2（fail-open 纪律）。判定内核在 src/auto-capture.mjs，这里只做旁路：
-  // 读最终 decision → 取候选 → store.put。永不往 decision.messages 里 push 任何东西。
-  //
-  // 守卫的必要性：test/plugin.test.mjs 的 MockContext 只有 tools / systemPrompt / effect，
-  // 没有 on。不判就整条 apply 抛错，既有 5 条工具用例全崩。
-  const autoCfg = resolveAutoConfig(deps.autoCapture(config && typeof config === 'object' ? config : {}));
-  // config.autoCapture === false 是硬开关：即使 env 把它翻回 true 也不采集。
-  const autoEnabled = autoCfg.enabled !== false && !(config && config.autoCapture === false);
-  // 配额状态机在 apply 里建一次、handler 复用。每次重建等于单会话/单轮上限从未生效。
-  const autoQuota = createQuota({ ...autoCfg, now });
-  // person/promise 的独立配额（T89）：1 条/轮、10 条/会话，与 event 的 2/40 互不挤占。
-  // 名字里的「kind」指记忆三分，不是文件类型；event 通路完全不经过这一份状态机。
-  const autoKindQuota = createKindQuota({ perTurnLimit: 1, sessionLimit: 10 });
-  /** 自动章号起点：1-899 留给显式导入的语料，900+ 归自动条目（spec §4.3）。 */
-  const AUTO_CHAPTER_START = 900;
-  /** meta 里存「下一个可用自动章号」的键（与 wiki_version/raw_digest 同级，不建新表）。 */
-  const AUTO_META_CHAPTER = 'auto_capture_chapter_next';
-  /** 会话 → { chapter, para }：一会话一章，段号在章内递增。上限 256 个会话，超出淘汰最旧。 */
-  const autoSeqs = new Map();
-
-  /**
-   * 领一个章号。号在事务里领，读-改-写之间不 await，避免并发同号。
-   * meta 写失败时退回起点号：宁可多会话共章，也不让采集整条断掉。
-   */
-  const claimChapter = (metaKey) => {
-    const db = store.raw();
-    let began = false;
-    try {
-      db.exec('BEGIN');
-      began = true;
-      const row = db.prepare('SELECT v FROM meta WHERE k = ?').get(metaKey);
-      const prev = Number.parseInt(row ? String(row.v) : '', 10);
-      const chapter = Number.isFinite(prev) && prev >= AUTO_CHAPTER_START ? prev : AUTO_CHAPTER_START;
-      db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run(metaKey, String(chapter + 1));
-      db.exec('COMMIT');
-      return chapter;
-    } catch (err) {
-      if (began) {
-        try {
-          db.exec('ROLLBACK');
-        } catch {
-          // 事务可能已因写失败自行回滚
-        }
+    function compileWikiNow({ spaceId } = {}) {
+      if (typeof store.listWikiPages !== 'function') {
+        return { compiled: 0, dirtyCompiled: 0, seeded: 0 };
       }
-      console.warn('[memjudge] auto-capture 章号领取失败，退回起点号：', err && err.message);
-      return AUTO_CHAPTER_START;
-    }
-  };
-
-  const claimAutoChapter = () => claimChapter(AUTO_META_CHAPTER);
-
-  /** 取（必要时分配）会话的章号与下一个段号。 */
-  const autoSeqFor = (sessionId) => {
-    const key = sessionId.trim();
-    const hit = autoSeqs.get(key);
-    if (hit) return hit;
-    const entry = { chapter: claimAutoChapter(), para: 0 };
-    if (autoSeqs.size >= 256) {
-      const oldest = autoSeqs.keys().next();
-      if (!oldest.done) autoSeqs.delete(oldest.value);
-    }
-    autoSeqs.set(key, entry);
-    return entry;
-  };
-
-  /** G5 候选语料：懒取一次，写库路径已通过 invalidate() 清空。 */
-  const autoCorpus = () => {
-    assertHealthy();
-    if (autoCaptureCorpus === null) autoCaptureCorpus = store.dump().map((m) => m.text);
-    return autoCaptureCorpus;
-  };
-
-  // ── 自动记忆（T87）：session/event 采集 assistant 侧结论 ─────────────────────
-  // 为什么不是 agent/pre-step：它在 step 开始**之前**调用（agent-loop/lib/index.js:742），
-  // 那一刻 assistant 还没开始生成，钩子天然只看得到刚发出的 user 消息——这才是「记忆里
-  // 只有我说的话」的机制根因，不只是 CAPTURE_KINDS 的白名单。
-  // 宿主把最终消息写进会话日志后同步广播 session/event（session/lib/index.js commit()
-  // L1589-1601），assistant/message 的 data 形如 { turn, step, message, usage?, stream }，
-  // message.content 是块数组（text / reasoning / tool-call，见 dsh-llm assembler.js）。
-  // 判定内核在 src/auto-capture-assistant.mjs，这里同样只做旁路。
-  const autoAsstCfg = resolveAssistantConfig(config && typeof config === 'object' ? config : {});
-  const autoAsstEnabled = autoAsstCfg.enabled !== false && !(config && config.autoCapture === false);
-  // assistant 独立配额：与 user 的 2 条/轮、40 条/会话分开计数，两边互不挤占。
-  const autoAsstQuota = createQuota({ ...autoAsstCfg, now });
-  // 章号：与 user 通路共用同一个自增序列，但**每条发言各领一个新章**。
-  // 起初想让两条通路各用一条序列，实测立刻撞号：两个 meta 键的初值都是 900，
-  // 首轮 user 拿 900、首轮 assistant 也拿 900，章级聚合照样把双方拼成一份文档。
-  // 共用单序列是唯一能保证「两条通路永不同章」又能保持号单调的方案；代价是号增长快一倍。
-  const autoAsstSeqs = new Map();
-
-  /** 取（必要时分配）assistant 通路的章号与下一个段号。 */
-  const autoAsstSeqFor = (sessionId) => {
-    const key = sessionId.trim();
-    const hit = autoAsstSeqs.get(key);
-    if (hit) return hit;
-    const entry = { chapter: claimAutoChapter(), para: 0 };
-    if (autoAsstSeqs.size >= 256) {
-      const oldest = autoAsstSeqs.keys().next();
-      if (!oldest.done) autoAsstSeqs.delete(oldest.value);
-    }
-    autoAsstSeqs.set(key, entry);
-    return entry;
-  };
-
-  // ── 轮级累积（T90）─────────────────────────────────────────────────────
-  // 为什么必须累积到一轮：宿主每发一条 assistant/message 就是一个 **step**（一次工具循环
-  // 算一步）。实测一个真实回合有 50–100 步，每步正文平均 8.5 字，39/41 步不足 50 字。
-  // 任何「按消息判 200 字下限」的闸门都只会看到碎片，于是 129 条库里只剩 1 条助手记忆。
-  // 一轮累积起来中位 2535 字（max 7912，23/25 轮 ≥200 字），才是可切段落库的单位。
-  const autoAsstTurn = createTurnBuffer({ flushAtChars: autoAsstCfg.turnFlushChars });
-  const shortId = (id) => String(id ?? '').slice(0, 8) || 'unknown';
-  let autoAsstArmed = false;
-
-  /**
-   * 一段累积文本 → 分段落库。两条路径共用：阈值软冲（长轮次中途）与 turn/end 硬冲。
-   * @returns {number} 实际写入条数
-   */
-  const flushAssistantTurn = (batch) => {
-    if (!batch || typeof batch.text !== 'string' || batch.text.trim() === '') return 0;
-    let plan;
-    try {
-      plan = planAssistantCapture(batch.text, {
-        ...autoAsstCfg,
-        existing: autoCorpus(),
-        sessionId: batch.sessionId,
-        turn: batch.turn,
+      const ts = now();
+      const dirtyRes = compileDirtyWikiPages(store, {
+        ...(spaceId && spaceId !== 'all' ? { spaceId } : {}),
+        now: ts,
       });
-    } catch (err) {
-      console.warn('[memjudge] assistant-capture plan 失败：', err && err.message);
-      return 0;
-    }
-
-    if (!plan || !Array.isArray(plan.candidates) || plan.candidates.length === 0) {
-      // 全被闸门拦下也必须留痕：没有这行，线上永远看不出「为什么这条没进库」。
-      console.warn(
-        `[memjudge] assistant-capture skip: session=${shortId(batch.sessionId)} t${batch.turn} s${batch.step}`
-        + ` chars=${plan?.weight ?? 0} reasons=${JSON.stringify(plan?.reasons ?? {})}`,
+      const listOpts = { status: 'active', includeText: true, limit: 2000 };
+      if (spaceId && spaceId !== 'all') listOpts.spaceId = spaceId;
+      const activeMems = store.list(listOpts);
+      const groups = new Map();
+      for (const m of activeMems) {
+        if (m.category === 'rule' || m.category === 'profile') continue;
+        const sp = m.spaceId ?? GLOBAL_SPACE_ID;
+        const slug = deriveClusterSlug(m);
+        const gKey = `${sp}::${slug}`;
+        if (!groups.has(gKey)) groups.set(gKey, { spaceId: sp, slug, mems: [] });
+        groups.get(gKey).mems.push(m);
+      }
+      const existing = new Set(
+        store.listWikiPages({ limit: 10000 }).map((p) => `${p.spaceId}::${p.slug}`),
       );
-      return 0;
-    }
-
-    let wrote = 0;
-    for (const candidate of plan.candidates) {
-      // 配额在候选循环里判：候选已按价值排好序（状态摘要 → 高分段 → 动作清单），
-      // 被拦即停，不会把低价值的尾部塞进去。
-      if (typeof autoAsstQuota.admit === 'function') {
-        const gate = autoAsstQuota.admit(batch.sessionId, batch.turn);
-        if (!gate?.ok) break;
-      }
-      let source;
-      try {
-        source = formatAssistantSource(batch.sessionId, batch.turn, batch.step, candidate.part);
-      } catch {
-        continue;
-      }
-      const seq = autoAsstSeqFor(batch.sessionId);
-      seq.para += 1;
-      try {
-        const result = store.put({
-          text: candidate.text,
-          importance: candidate.importance,
-          chapter: seq.chapter,
-          para: seq.para,
-          source,
-          recordDuplicateOccurrence: false,
+      let seeded = 0;
+      for (const [gKey, grp] of groups.entries()) {
+        if (existing.has(gKey) || grp.mems.length === 0) continue;
+        buildWikiPage(store, {
+          spaceId: grp.spaceId,
+          slug: grp.slug,
+          memories: grp.mems,
+          now: ts,
         });
-        if (result && result.inserted) { wrote += 1; contentGeneration += 1; }
-      } catch (err) {
-        console.warn('[memjudge] assistant-capture 写入跳过：', err && err.message);
+        seeded += 1;
       }
-    }
-
-    if (wrote > 0) {
-      invalidate();
       touchWiki();
+      const dirtyCount = Array.isArray(dirtyRes) ? dirtyRes.length : Number(dirtyRes?.compiled ?? 0);
+      return {
+        compiled: dirtyCount + seeded,
+        dirtyCompiled: dirtyCount,
+        seeded,
+      };
     }
-    console.warn(
-      `[memjudge] assistant-capture flush: session=${shortId(batch.sessionId)} t${batch.turn} s${batch.step}`
-      + ` chars=${plan.weight} segs=${plan.segments.length} cand=${plan.candidates.length} wrote=${wrote}`
-      + ` reasons=${JSON.stringify(plan.reasons)}`,
-    );
-    return wrote;
-  };
 
-  if (typeof ctx.on === 'function') {
-    // { prepend: true }：位于瀑布最外层，await next() 之后拿到的是内层处理完的最终
-    // decision（含 driver 追加的 runtime-context），spec §1.3 第 1 点。
-    // 不包 track/ctx.effect：ctx.on 的 disposer 已挂在当前 fiber 上，再包一层会重复释放。
-    ctx.on('agent/pre-step', async (input, next) => {
-      // 采集关闭：一次判定都不做，但仍必须原样放行。
-      if (!autoEnabled) return await next();
-
-      // await next() 独立成首句、不进 try：next() 自身抛的错是别的插件的错，不替它吞。
-      const decision = await next();
+    function runMetabolismNow(opts = {}) {
+      if (disposed || fault) return null;
       try {
-        if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
-
-        const sessionId = input?.agent?.session?.id;
-        let source;
-        try {
-          source = formatSource(sessionId, input?.turn);
-        } catch {
-          console.warn('[memjudge] auto-capture skipped: invalid-source-identity-or-turn');
-          return decision;
-        }
-        const turn = Number(source.slice(source.lastIndexOf(':t') + 2));
-
-        const candidates = extractCandidates(decision.messages, {
-          ...autoCfg,
-          existing: autoCorpus(),
-          quota: autoQuota,
-          sessionId,
-          turn,
-          onInvalidText: () => console.warn('[memjudge] auto-capture skipped: unpaired-surrogate'),
-        });
-        if (candidates.length === 0) return decision;
-        let wrote = 0;
-        for (const candidate of candidates) {
-          // T89：先判 kind，再决定这条走哪条闸门。判据全在 kind-classify.mjs，
-          // role 固定 'user'：assistant 的发言永远不可能是「用户是谁」。
-          const verdict = classifyCaptureKind(candidate.text, { role: 'user' });
-          const kind = verdict.kind;
-          if (kind !== 'event') {
-            // 独立配额：超了就不写。person/promise 占的是注入面里永久的固定席位
-            // （人 800 / 约 600 字符），宁可这轮少记一条，也不要挤掉一条真有用的。
-            const __adm = autoKindQuota.admit(sessionId, turn);
-            if (!__adm.ok) continue;
-            // 同实体（我）+ 同属性 + 同取值 = 同一条事实，不重复落库。
-            if (store.byKind(kind, 500).some((row) => sameFactSlot(row.text, candidate.text))) continue;
-          }
-          const seq = autoSeqFor(sessionId);
-          seq.para += 1;
-          try {
-            const result = store.put({
-              text: candidate.text,
-              importance: candidate.importance,
-              chapter: seq.chapter,
-              para: seq.para,
-              kind,
-              // 自动写入的 person/promise 带 `|k:<kind>` 尾标：整批回滚/审计靠它，
-              // bySourcePrefix 的 v2 前缀匹配不受尾标影响。
-              source: autoKindSource(source, kind),
-              recordDuplicateOccurrence: false,
-            });
-            if (result && result.inserted) { wrote += 1; contentGeneration += 1; }
-          } catch (err) {
-            // 单条写失败（预算超限 / 库异常）不拖累其余候选，也不碰这一轮对话。
-            console.warn('[memjudge] auto-capture 写入跳过：', err && err.message);
-          }
-        }
-
-        if (wrote > 0) {
-          invalidate();
+        const res = runMetabolism(store, { now: now(), ...opts });
+        const act = res?.actions ?? {};
+        if (
+          (act.l3Archived ?? 0) > 0
+          || (act.wikiPagesUpdated ?? 0) > 0
+          || (act.l1DemotedToL2 ?? 0) > 0
+          || (act.compacted ?? 0) > 0
+          || Boolean(act.vacuumed)
+        ) {
+          bumpContentGeneration();
           touchWiki();
         }
-      } catch (e) {
-        console.warn('[memjudge] auto-capture 跳过：', e && e.message);
+        return res;
+      } catch {
+        return null;
       }
-      // 任何情况下都返回 decision 本体：不修改、不替换、不返回 undefined。
-      return decision;
-    }, { prepend: true });
+    }
 
-    // ── assistant 侧采集（T87）─────────────────────────────────────────────
-    // session/event 是纯 emit 的观察型钩子：不能改事件，但可以在监听器里写记忆。
-    // 宿主对每个监听器做了 containment（单个抛错被吞、不毁会话），本函数仍然自己
-    // 兜住全部异常——采集出问题只允许留下一条 warn，绝不允许变成用户看得见的错误。
-    // ── assistant 侧采集（T87 / T90 轮级）─────────────────────────────────
-    // session/event 是纯 emit 的观察型钩子：不能改事件，但可以在监听器里写记忆。
-    // 宿主对每个监听器做了 containment（单个抛错被吞、不毁会话），本函数仍然自己
-    // 兜住全部异常——采集出问题只允许留下一条 warn，绝不允许变成用户看得见的错误。
-    //
-    // 只订阅两种事件：
-    //   assistant/message → 只累积，不判闸（单步正文太短，判了必死）；
-    //   turn/end          → 一轮结束，drain 出整轮文本再交给 planAssistantCapture 切段。
-    ctx.on('session/event', (session, event) => {
-      if (!autoAsstEnabled) return;
+    // -------------------------------------------------------------- 异步脱水队列消费与周期代谢
+
+    function drainIngestQueue(limit = 16) {
+      if (disposed || fault || ingestTask || typeof store.claimIngestJobs !== 'function') {
+        return { processed: 0, written: 0 };
+      }
+      ingestTask = (async () => {
       try {
-        if (!event || typeof event.type !== 'string') return;
-        const sessionId = session?.id;
-        if (typeof sessionId !== 'string' || sessionId.trim() === '') return;
-        const data = event.data;
-        const turn = data?.turn;
-        if (!Number.isSafeInteger(turn) || turn < 0) return;
-
-        if (event.type === 'turn/end') {
-          const batch = autoAsstTurn.drain(sessionId, turn);
-          if (batch) flushAssistantTurn(batch);
-          return;
+        const flags = deps.moduleFlags();
+        const report = deps.configReport();
+        const llmEnabled = Boolean(flags.llmExtract && report.hasKey);
+        const res = await processIngestQueue({
+          store,
+          limit,
+          now: now(),
+          signal: lifetime.signal,
+          llmOpts: { enabled: llmEnabled, signal: lifetime.signal },
+        });
+        if (!disposed && (res.saved ?? res.written ?? 0) > 0) {
+          bumpContentGeneration();
+          touchWiki();
         }
-        if (event.type !== 'assistant/message') return;
-
-        const message = data && data.message;
-        if (!message || message.role !== 'assistant') return;
-
-        // A1/A2 复用 assistantVerdict 的同一份实现（role + source.kind 白名单 + 只留 text 块）。
-        const view = inspectAssistantMessage(message);
-        if (view.problem !== null) return;
-
-        const step = Number.isSafeInteger(data?.step) && data.step >= 0 ? data.step : 0;
-        const pushed = autoAsstTurn.push(sessionId, turn, step, view.text);
-
-        // 首次真正收到消息时打一条 arm 日志：这条是「监听器到底有没有挂上真实宿主」的
-        // 唯一可观测证据。假 ctx 测试证明不了这一点，只有宿主日志里有它才算数。
-        if (!autoAsstArmed) {
-          autoAsstArmed = true;
-          console.warn(`[memjudge] assistant-capture armed: session=${shortId(sessionId)} flushAt=${autoAsstTurn.flushAtChars}`);
-        }
-
-        if (pushed.flush) flushAssistantTurn(pushed.flush);
-      } catch (e) {
-        console.warn('[memjudge] assistant-capture 跳过：', e && e.message);
+        if (!disposed && res.processed >= limit) scheduleIngestDrain();
+        return res;
+      } catch {
+        return { processed: 0, written: 0 };
       }
+      })().finally(() => {
+        ingestTask = null;
+        // Continue full batches; also revisit expired crash leases without stealing
+        // a possibly live worker's claim on activation. Timer never keeps host alive.
+        if (!disposed) scheduleIngestDrain(300_000);
+      });
+      return ingestTask;
+    }
+
+    function scheduleIngestDrain(delayMs = 0) {
+      if (disposed || ingestTimer) return;
+      ingestTimer = setTimeout(() => {
+        ingestTimer = null;
+        void drainIngestQueue();
+      }, delayMs);
+      if (typeof ingestTimer.unref === 'function') ingestTimer.unref();
+    }
+
+    if (cfg.metabolismIntervalMs > 0) {
+      metabolismTimer = setInterval(() => {
+        runMetabolismNow();
+      }, cfg.metabolismIntervalMs);
+      if (typeof metabolismTimer.unref === 'function') metabolismTimer.unref();
+    }
+
+    // -------------------------------------------------------------- 保 Prefix KV Cache 两段式注入器
+
+    const injector = createInjector({
+      store,
+      tierSMaxChars: cfg.tierSBudget,
+      tierDMaxChars: cfg.tierDBudget,
+      totalMaxChars: Math.min(TOTAL_INJECT_MAX_CHARS, cfg.injectBudget),
+      now: () => now(),
+      ...decayOptions,
     });
-  }
+    track(() => injector.dispose());
+    // Resume persisted pending work on every activation (stale processing leases
+    // retain the existing 5-minute claim timeout to avoid stealing a live worker).
+    scheduleIngestDrain();
 
-  const textBlock = (text) => [{ type: 'text', text }];
+    // -------------------------------------------------------------- 双边闭合轮采集与宿主会话总线接线
 
-  /**
-   * 按章聚合：同章的段拼回一条再判冲突。
-   * 冲突是「同一份文档里前后说法不一致」，段级切分把一句拆到两条记忆里会漏判；
-   * 章级聚合复现 t12 的检测口径（章是一份文档）。
-   */
-  const chapterRows = () => {
-    const byChapter = new Map();
-    for (const memory of store.dump()) {
-      const chapter = chapterOf(memory).chapter;
-      const key = chapter > 0 ? `ch${chapter}` : memory.id;
-      let entry = byChapter.get(key);
-      if (!entry) {
-        entry = { id: key, text: '', createdAt: memory.createdAt };
-        byChapter.set(key, entry);
-      }
-      entry.text += (entry.text ? '\n' : '') + memory.text;
-      entry.createdAt = Math.max(entry.createdAt, memory.createdAt);
-    }
-    return [...byChapter.values()];
-  };
+    function getOrCreateCollector(session, turnOverride) {
+      const sessionId = session?.id ?? 'default';
+      const header = session?.header ?? session ?? {};
+      const scopeInfo = resolveScope({ session, header, cwd: header.cwd });
+      ensureSpaceRegistered(scopeInfo);
+      const cur = turnCollectors.get(sessionId);
+      const turnNo = Number.isInteger(turnOverride) ? turnOverride : (cur ? cur.turnNo : 0);
+      if (cur && cur.turnNo === turnNo) return cur;
 
-  // -------------------------------------------------------------- 工具
-
-  track(ctx.tools.register({
-    name: 'memjudge_remember',
-    description:
-      '把一条事实写进 memjudge 长期记忆。原文一字不改地落库（写入后 dump 与输入字符级相等），'
-      + '同时抽出实体-属性-值三元组供冲突检测与拒答判断使用。同一条文本重复写入是幂等的，'
-      + '不会产生重复行。需要覆盖旧结论时用 supersedes 指向旧 id，旧条目正文不会被改写。'
-      + 'kind 决定这条记忆在注入里的待遇：person=关于用户本人的稳定事实（身份、习惯、偏好、关系），'
-      + 'promise=双方的约定与要求（他要求你怎么做、说好的规矩）——这两类不受使用频率与时间淘汰，'
-      + '会常驻注入面；event=一次性的经过与结果（默认），按命中与时间流动。'
-      + '拿不准就留空用默认 event，但「用户是谁」「说好了什么」必须显式标 person/promise。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        text: { type: 'string', description: '要记住的原文。建议一条一个事实，别整章倾倒。' },
-        kind: {
-          type: 'string',
-          enum: [...MEMORY_KINDS],
-          description: 'person=关于用户本人的稳定事实（身份/习惯/偏好/关系）；'
-            + 'promise=双方的约定与要求（他要求你怎么做、说好的规矩）；'
-            + 'event=一次性的经过与结果（默认）。非法值归 event。',
-        },
-        importance: { type: 'number', description: '重要度 0..1，影响衰减地板（≥0.6 时给 0.6 地板）。默认 0。' },
-        chapter: { type: 'integer', description: '来源章号，用于章级聚合检索。' },
-        para: { type: 'integer', description: '来源段号，用于同章内排序。' },
-        documentId: { type: 'string', description: '显式文档身份；不会从 source 推断。' },
-        supersedes: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '被本条取代的旧记忆 id 列表。只建链，不改旧正文。',
-        },
-        source: {
-          type: 'string',
-          description: '这条记忆来自哪里（会话/文件/项目）。面板按它分组。',
-        },
-      },
-      required: ['text'],
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string' },
-          inserted: { type: 'boolean' },
-          factCount: { type: 'integer' },
-          chars: { type: 'integer' },
-          total: { type: 'integer' },
-          kind: { type: 'string' },
-          version: { type: 'string' },
-        },
-        required: ['id', 'inserted', 'factCount', 'chars', 'total', 'kind'],
-      },
-      render: (_args, value) => textBlock(
-        value.inserted
-          ? `已写入 ${value.id}（${value.kind}，${value.chars} 字，抽出 ${value.factCount} 条三元组，库内共 ${value.total} 条）；原文版本 ${value.version}`
-          : `已存在 ${value.id}（${value.kind}，幂等命中，未重复写入；库内共 ${value.total} 条）；原文版本 ${value.version}`,
-      ),
-    },
-    isConcurrencySafe: () => false,
-    async execute(args) {
-      const text = String(args?.text ?? '');
-      if (!text.trim()) throw new Error('memjudge_remember: text 不能为空');
-      // 来源：显式 source 优先（面板按它分组），没给才退回章/段号的 JSON 编码。
-      // 两者写同一列，显式 source 时不并列存：decodeSource 对非 JSON 串已有兜底
-      // （退回 {chapter:0,para:0}），章号仍可从 id 的 mem-c<章>-p<段>- 前缀恢复。
-      const explicitSource = typeof args?.source === 'string' ? args.source.trim() : '';
-      const result = store.put({
-        text,
-        // 未显式给 kind 时传 undefined（而不是 'event'）：put 用「是否显式」区分
-        // 「新增一条 event」与「幂等命中时把已有 person 改回 event」。
-        kind: args?.kind == null || args.kind === '' ? undefined : normalizeKind(args.kind),
-        importance: clampNum(args?.importance, 0, 1, 0),
-        chapter: args?.chapter,
-        para: args?.para,
-        documentId: args?.documentId,
-        supersedes: args?.supersedes ?? null,
-        source: explicitSource || encodeSource(args?.chapter, args?.para),
-      });
-      contentGeneration += 1;
-      invalidate();
-      // 写入后立刻重编 wiki 投影（幂等命中时 rawDigest 不变，直接跳过）。
-      touchWiki();
-      return {
-        id: result.id,
-        inserted: result.inserted,
-        factCount: result.factCount,
-        chars: text.length,
-        total: store.stats().memories,
-        kind: result.kind,
-        version: createHash('sha256').update(text, 'utf16le').digest('hex'),
+      const entry = {
+        sessionId,
+        spaceId: scopeInfo.spaceId,
+        turnNo,
+        origin: header.origin ?? 'user',
+        hasInput: false,
+        collector: createTurnCollector({
+          store,
+          spaceId: scopeInfo.spaceId,
+          sessionId,
+          turnNo,
+          origin: header.origin ?? 'user',
+        }),
       };
-    },
-  }));
-
-  /**
-   * 召回链本体：段级 BM25 → 章级聚合选章 → 预算装填 → 拒答门 → 命中刷新。
-   *
-   * 从 memjudge_recall 的 execute 逐行抽出（逻辑一字未改），唯一目的是让只读服务
-   * 契约（src/service.mjs）复用**同一条**链。在 service 里另写一份「差不多」的检索
-   * 是隐患：两份实现迟早漂移，届时下游插件和会话里的模型会看到不同的召回结果。
-   *
-   * @param {{query?:string, budget?:number, topChapters?:number}} args 与工具入参同形
-   * @param {{touch?: boolean}} [runOpts] touch=false 时不刷新 lastAccessed（服务契约用）
-   */
-  const runRecall = async (args, runOpts = {}) => {
-    const query = String(args?.query ?? '').trim();
-    if (!query) throw new Error('memjudge_recall: query 不能为空');
-    const budget = clampInt(args?.budget, 1, INJECT_HARD_LIMIT, cfg.injectBudget);
-    const topChapters = clampInt(args?.topChapters, 1, 4, 2);
-
-    // 融合检索开启且向量就绪时走异步双路；查询扩展开启时走多子查询；否则维持纯 BM25
-    // 同步路径（行为一字不变）。三条路径共用同一个 fillFromScored，装填语义不变。
-    assertHealthy();
-    const finish = (result) => {
-      assertHealthy();
-      if (generation !== contentGeneration) throw new Error('memjudge recall stale: content changed');
-      return result;
-    };
-    const ix = getIndex();
-    const generation = contentGeneration;
-    const found = cfg.expand
-      ? await ix.searchExpanded(query, { maxChars: budget, topChapters, now: now(), expandFn: deps.expand })
-      : (cfg.llmSelect || (vectorEnabled() && ix.hasVectors))
-        ? await ix.searchAsync(query, {
-          maxChars: budget, topChapters, now: now(),
-          dims: vecDims(), cacheDir: cfg.vectorCacheDir, llmSelect: cfg.llmSelect, selectFn: deps.select,
-        })
-        : ix.search(query, { maxChars: budget, topChapters, now: now() });
-    assertHealthy();
-    if (generation !== contentGeneration) throw new Error('memjudge recall stale: content changed');
-    if (!found.hits.length) {
-      return finish({ denied: true, reason: 'no-candidates', detail: '检索无候选段', chars: 0, elapsedMs: found.elapsedMs, hits: [] });
+      turnCollectors.set(sessionId, entry);
+      return entry;
     }
 
-    // 先裁剪再判断：在整章上跑 gate 判据恒真，裁到预算内才有区分力。
-    const body = found.hits.map((h) => h.text).join('\n\n');
-    // t15：属性缺席判据要 L1 的 (entity, attr) 集合；store 的 facts 就是 L1 产物。
-    const l1Facts = store.allFacts();
-    const verdict = gate(query, body, { l1Facts });
-    // 硬拒必须在**全文口径**上复核：body 是裁剪后的检索结果，名词块覆盖率天然偏低，
-    // 在它上面判「材料里没有这个说法」会把 R12「硫含量」、R45「待了多久」、
-    // R78「邮件包编号」这类真问题误拒（body 口径 0.25–0.33，全文口径 0.33–0.56）。
-    // body 只用于展示，不单独决定拒答。
-    let finalVerdict = verdict;
-    if (verdict.deny) {
-      const full = store.raw().prepare('SELECT text FROM memories').all().map((r) => r.text).join('\n');
-      const fullVerdict = gate(query, full, { l1Facts });
-      if (!isHardDeny(fullVerdict, query, full)) {
-        finalVerdict = { ...fullVerdict, deny: false };
-      } else {
-        finalVerdict = fullVerdict;
+    function handleSessionEvent(session, event) {
+      if (disposed || fault || !event || typeof event !== 'object') return;
+      const sessionId = session?.id ?? event.sessionId ?? 'default';
+      const header = session?.header ?? session ?? {};
+
+      if (event.type === 'compaction/end') {
+        injector.onCompaction(sessionId);
+        return;
+      }
+      if (event.type === 'session/end' || event.type === 'session/dispose') {
+        injector.onSessionEnd(sessionId);
+        pendingQueries.delete(sessionId);
+        const pendingTurn = turnCollectors.get(sessionId);
+        if (pendingTurn && pendingTurn.hasInput) {
+          try { pendingTurn.collector.closeTurn({ now: now() }); } catch { /* ignore */ }
+          scheduleIngestDrain(0);
+        }
+        turnCollectors.delete(sessionId);
+        return;
+      }
+
+      if (!cfg.autoCapture) return;
+      if (isSubagentSession(session) || isSubagentSession(header)) return;
+
+      const evTurn = Number.isInteger(event.turn) ? event.turn : undefined;
+
+      switch (event.type) {
+        case 'turn/start': {
+          const prev = turnCollectors.get(sessionId);
+          if (prev && prev.hasInput && evTurn !== undefined && prev.turnNo !== evTurn) {
+            try { prev.collector.closeTurn({ now: now() }); } catch { /* ignore */ }
+            turnCollectors.delete(sessionId);
+            scheduleIngestDrain(0);
+          }
+          getOrCreateCollector(session, evTurn ?? ((prev?.turnNo ?? -1) + 1));
+          break;
+        }
+
+        case 'user/message': {
+          if (isRuntimeSnapshotMessage(event.message)) return;
+          const text = extractPlainTextFromBlocks(event.message?.content ?? event.text ?? '');
+          if (!text) return;
+          if (isSubagentSession(header, text)) return;
+          pendingQueries.set(sessionId, { query: text, isToolSubstep: false });
+          const entry = getOrCreateCollector(session, evTurn);
+          entry.collector.recordUser(text);
+          entry.hasInput = true;
+          break;
+        }
+
+        case 'assistant/message': {
+          const text = extractPlainTextFromBlocks(event.message?.content ?? event.text ?? '');
+          if (!text) return;
+          const entry = getOrCreateCollector(session, evTurn);
+          entry.collector.recordAssistant(text);
+          entry.hasInput = true;
+          break;
+        }
+
+        case 'tool/result': {
+          const toolName = event.toolName ?? event.name ?? event.call?.name ?? 'tool';
+          if (typeof toolName === 'string' && toolName.startsWith('memjudge_')) return;
+          pendingQueries.set(sessionId, { query: '', isToolSubstep: true });
+          const isErr = Boolean(event.isError || event.status === 'error' || event.error);
+          const outText = extractPlainTextFromBlocks(event.result?.content ?? event.output ?? event.error ?? '');
+          const entry = getOrCreateCollector(session, evTurn);
+          entry.collector.recordTool({
+            tool: String(toolName),
+            ok: !isErr,
+            summary: outText || (isErr ? 'failed' : 'ok'),
+          });
+          entry.hasInput = true;
+          break;
+        }
+
+        case 'command/done': {
+          const exitCode = Number(event.exitCode ?? 0);
+          const entry = getOrCreateCollector(session, evTurn);
+          entry.collector.recordTool({
+            tool: 'command',
+            ok: exitCode === 0,
+            exitCode,
+            summary: String(event.command ?? event.summary ?? `exit ${exitCode}`),
+          });
+          entry.hasInput = true;
+          break;
+        }
+
+        case 'turn/end': {
+          const entry = turnCollectors.get(sessionId);
+          turnCollectors.delete(sessionId);
+          pendingQueries.delete(sessionId);
+          if (entry && entry.hasInput) {
+            try {
+              const closed = entry.collector.closeTurn({ now: now() });
+              if (closed?.enqueued || closed?.queued) {
+                scheduleIngestDrain(0);
+              }
+            } catch {
+              // fail-open
+            }
+          }
+          break;
+        }
+
+        default:
+          break;
       }
     }
-    if (finalVerdict.deny && isHardDeny(finalVerdict, query, body)) {
-      return finish({
-        denied: true,
-        reason: String(finalVerdict.reason ?? 'denied'),
-        detail: String(finalVerdict.detail ?? ''),
-        chars: 0,
-        elapsedMs: found.elapsedMs,
-        hits: [],
-      });
+
+    // 优先通过 ctx.inject(['sessions']) 挂载，并在无 sessions 服务时回退到直接 ctx.on('session/event')
+    const seenEvents = new WeakSet();
+    const dispatchSessionEvent = (session, event) => {
+      if (event && typeof event === 'object') {
+        if (seenEvents.has(event)) return;
+        seenEvents.add(event);
+      }
+      try {
+        handleSessionEvent(session, event);
+      } catch {
+        // fail-open：采集旁路绝不影响主会话
+      }
+    };
+
+    let attachedViaInject = false;
+    if (typeof ctx?.inject === 'function') {
+      try {
+        const subDisp = ctx.inject(['sessions'], (sctx) => {
+          attachedViaInject = true;
+          if (typeof sctx?.on === 'function') {
+            track(sctx.on('session/event', dispatchSessionEvent));
+          }
+        });
+        track(subDisp);
+      } catch {
+        // ignore
+      }
+    }
+    if (typeof ctx?.on === 'function') {
+      track(ctx.on('session/event', (session, event) => {
+        if (attachedViaInject) return;
+        dispatchSessionEvent(session, event);
+      }));
     }
 
-    // 服务契约要求「读」真的只读：touch=false 时不写 last_accessed / access_count。
-    if (runOpts.touch !== false && cfg.touchOnRecall) {
-      const at = now();
+    // -------------------------------------------------------------- RPC 路由挂载
+
+    track(deps.installRpc(ctx, {
+      dbPath,
+      store,
+      getIndex,
+      invalidate: () => { bumpContentGeneration(); },
+      touchWiki,
+      compileWikiNow,
+      runMetabolismNow,
+      getInjectStatus: () => ({
+        hasContextChannel: typeof ctx?.systemPrompt?.context === 'function',
+      }),
+      config: cfg,
+      fetchImpl: dependencies.fetch,
+    }));
+
+    // -------------------------------------------------------------- 注入：v1 Legacy 兼容与 v2 两段式动态注入
+
+    function renderLegacyInject() {
+      assertHealthy();
+      if (!cfg.autoInject) return '';
+      const budget = cfg.injectBudget;
+      if (budget <= 0) return '';
+
+      if (cfg.experimentalInjectMode === 'daily') {
+        const snap = store.injectionSnapshot({
+          mode: 'daily',
+          now: now(),
+          halfLifeDays: cfg.experimentalInjectHalfLifeDays,
+          floor: cfg.experimentalInjectFloor,
+          perKindCap: INJECT_SEG_MAX_ROWS,
+        });
+        const total = snap.total;
+        if (total === 0) return '';
+        const kCounts = snap.kinds;
+        const head = `## memjudge 记忆索引（人 ${kCounts.person} / 约 ${kCounts.promise} / 事 ${kCounts.event} 条，库内 ${total} 条）\n`;
+        const foot = '\n用 memjudge_recall 取全文，memjudge_conflicts 查前后矛盾。';
+        const avail = budget - head.length - foot.length;
+        if (avail <= 24) return '';
+
+        const nonEmpty = INJECT_SEGMENTS
+          .map((seg) => ({ seg, rows: snap.byKind[seg.kind] ?? [] }))
+          .filter((g) => g.rows.length > 0);
+        if (!nonEmpty.length) return '';
+
+        const totalShare = nonEmpty.reduce((s, g) => s + g.seg.share, 0);
+        const caps = nonEmpty.map((g) => Math.floor((avail * g.seg.share) / totalShare));
+        const blocks = [];
+        let carry = 0;
+
+        for (let idx = 0; idx < nonEmpty.length; idx += 1) {
+          const { seg, rows } = nonEmpty[idx];
+          const cap = caps[idx] + carry;
+          const headerLine = `${seg.header}\n`;
+          if (cap <= headerLine.length + 12) {
+            carry = cap;
+            continue;
+          }
+          let block = headerLine;
+          let added = 0;
+          for (const r of rows) {
+            const src = chapterOf(r);
+            const summary = src.chapter ? `ch${src.chapter}` : sourceLabel(r.source);
+            const line = `- ${JSON.stringify(r.id)} — ${inlineText(r.text, 90)}${summary ? `：${summary}` : ''}\n`;
+            if (block.length + line.length > cap) break;
+            block += line;
+            added += 1;
+          }
+          if (added > 0) {
+            blocks.push(block);
+            carry = cap - block.length;
+          } else {
+            carry = cap;
+          }
+        }
+        if (!blocks.length) return '';
+        return sanitizeWellFormed(`${head}${blocks.join('')}${foot}`.slice(0, budget));
+      }
+
+      const base = store.stats();
+      if (base.memories === 0) return '';
+      const k = base.kinds;
+      const head = `## memjudge 记忆索引（人 ${k.person} / 约 ${k.promise} / 事 ${k.event} 条，库内 ${base.memories} 条）\n`;
+      const foot = '\n用 memjudge_recall 取全文，memjudge_conflicts 查前后矛盾。';
+      const avail = budget - head.length - foot.length;
+      if (avail <= 24) return '';
+
+      const rawGroups = INJECT_SEGMENTS.map((seg) => {
+        const fetched = store.byKind(seg.kind, INJECT_SEG_MAX_ROWS);
+        const rows = seg.kind === 'event'
+          ? fetched.filter((r) => !(
+              typeof r.source === 'string'
+              && r.source.startsWith('auto:chat#')
+              && (r.accessCount ?? 0) <= 0
+            ))
+          : fetched;
+        return { seg, rows };
+      });
+
+      const nonEmpty = rawGroups.filter((g) => g.rows.length > 0);
+      if (!nonEmpty.length) return '';
+      const totalShare = nonEmpty.reduce((s, g) => s + g.seg.share, 0);
+      const caps = nonEmpty.map((g) => Math.floor((avail * g.seg.share) / totalShare));
+      const blocks = [];
+      let carry = 0;
+
+      for (let idx = 0; idx < nonEmpty.length; idx += 1) {
+        const { seg, rows } = nonEmpty[idx];
+        const cap = caps[idx] + carry;
+        const headerLine = `${seg.header}\n`;
+        if (cap <= headerLine.length + 12) {
+          carry = cap;
+          continue;
+        }
+        let block = headerLine;
+        let added = 0;
+        const limit = seg.kind === 'event' ? cfg.injectLimit : INJECT_SEG_MAX_ROWS;
+        for (const r of rows.slice(0, limit)) {
+          const src = chapterOf(r);
+          const summary = src.chapter ? `ch${src.chapter}` : sourceLabel(r.source);
+          const line = `- ${JSON.stringify(r.id)} — ${inlineText(r.text, 90)}${summary ? `：${summary}` : ''}\n`;
+          if (block.length + line.length > cap) break;
+          block += line;
+          added += 1;
+        }
+        if (added > 0) {
+          blocks.push(block);
+          carry = cap - block.length;
+        } else {
+          carry = cap;
+        }
+      }
+      if (!blocks.length) return '';
+      return sanitizeWellFormed(`${head}${blocks.join('')}${foot}`.slice(0, budget));
+    }
+
+    const hasContextChannel = typeof ctx?.systemPrompt?.context === 'function';
+
+    function shouldUseTieredMode(promptCtx) {
+      if (cfg.injectMode === 'legacy') return false;
+      if (cfg.injectMode === 'tiered') return true;
+      if (hasContextChannel) return true;
+      if (
+        promptCtx
+        && typeof promptCtx === 'object'
+        && (
+          promptCtx.session
+          || promptCtx.agent
+          || promptCtx.sessionId
+          || promptCtx.cwd
+          || promptCtx.spaceId
+          || Array.isArray(promptCtx.messages)
+          || typeof promptCtx.query === 'string'
+        )
+      ) {
+        return true;
+      }
+      return false;
+    }
+
+    function resolveInjectCtx(promptCtx) {
+      const session = promptCtx?.session ?? promptCtx?.agent?.session ?? null;
+      const header = session?.header ?? promptCtx?.header ?? {};
+      const sessionId = promptCtx?.sessionId ?? session?.id ?? 'default';
+      const scopeInfo = resolveScope({
+        space: promptCtx?.spaceId ?? promptCtx?.space,
+        session,
+        agent: promptCtx?.agent,
+        header,
+        cwd: promptCtx?.cwd ?? header?.cwd,
+      });
+      ensureSpaceRegistered(scopeInfo);
+      return {
+        sessionId,
+        spaceId: scopeInfo.spaceId,
+        spaces: scopeInfo.spaces,
+        session,
+        header,
+      };
+    }
+
+    function renderTierS(promptCtx) {
+      assertHealthy();
+      if (!cfg.autoInject) return '';
+      const injectCtx = resolveInjectCtx(promptCtx);
+      if (isSubagentSession(injectCtx.session) || isSubagentSession(injectCtx.header)) {
+        return '';
+      }
+      const res = injector.getTierS({
+        store,
+        sessionId: injectCtx.sessionId,
+        spaceId: injectCtx.spaceId,
+        spaces: injectCtx.spaces,
+        tierSMaxChars: Math.min(TIER_S_MAX_CHARS, cfg.tierSBudget, cfg.injectBudget),
+      });
+      return sanitizeWellFormed(res.text);
+    }
+
+    function renderTierDSync(promptCtx) {
+      assertHealthy();
+      if (!cfg.autoInject) return '';
+      const injectCtx = resolveInjectCtx(promptCtx);
+      if (isSubagentSession(injectCtx.session) || isSubagentSession(injectCtx.header)) {
+        return '';
+      }
+      const { query, isToolSubstep } = extractQueryFromPromptContext(promptCtx, pendingQueries);
+      if (!query || isToolSubstep) return '';
+      const res = injector.getTierDSync(query, {
+        store,
+        searchIndex: getIndex(),
+        sessionId: injectCtx.sessionId,
+        spaceId: injectCtx.spaceId,
+        spaces: injectCtx.spaces,
+        isToolSubstep,
+        tierSMaxChars: Math.min(TIER_S_MAX_CHARS, cfg.tierSBudget),
+        tierDMaxChars: Math.min(TIER_D_MAX_CHARS, cfg.tierDBudget),
+        totalMaxChars: Math.min(TOTAL_INJECT_MAX_CHARS, cfg.injectBudget),
+      });
+      return sanitizeWellFormed(res.text);
+    }
+
+    function renderSection(promptCtx) {
+      if (shouldUseTieredMode(promptCtx)) {
+        const tierS = renderTierS(promptCtx);
+        if (hasContextChannel) return tierS;
+        const tierD = renderTierDSync(promptCtx);
+        if (!tierD) return tierS;
+        if (!tierS) return tierD;
+        const totalCap = Math.min(TOTAL_INJECT_MAX_CHARS, cfg.injectBudget);
+        const combined = `${tierS}\n\n${tierD}`;
+        return sanitizeWellFormed(combined.length <= totalCap ? combined : combined.slice(0, totalCap));
+      }
+      return renderLegacyInject();
+    }
+
+    // -------------------------------------------------------------- 增强模块配置与向量回填
+
+    const vecConfig = () => {
+      const f = deps.moduleFlags();
+      return {
+        wantVec: cfg.vector ?? f.vector,
+        wantRerank: cfg.rerank ?? f.rerank,
+        wantExpand: cfg.expand ?? f.expand,
+        wantSelect: cfg.llmSelect ?? f.llmSelect,
+        wantLlmExtract: f.llmExtract,
+      };
+    };
+
+    const syncVecCacheKey = () => {
+      const r = deps.configReport();
+      const g = r.groups?.embed;
+      const key = `${g?.baseUrl ?? ''}|${g?.model ?? ''}|${deps.embedDims()}`;
+      if (vecCacheModelKey && vecCacheModelKey !== key) {
+        vecCache.clear();
+        if (index) index.clearVectors();
+      }
+      vecCacheModelKey = key;
+    };
+
+    let backfilling = false;
+    const backfillVectors = async () => {
+      if (backfilling || disposed || fault) return;
+      backfilling = true;
       try {
-        for (const hit of found.hits) {
-          const row = store.updateAccess(hit.id, at);
-          if (index && !indexDirty) {
-            const doc = index.docs.find((item) => item.id === hit.id);
-            if (row && doc && row.text === doc.text) {
-              doc.accessCount = row.access_count;
-              doc.lastAccessed = row.last_accessed;
-            } else {
-              indexDirty = true;
+        syncVecCacheKey();
+        const rows = typeof store.list === 'function'
+          ? store.list({ status: 'active', includeText: true, limit: 5000 })
+          : store.dump();
+        if (typeof store.getVectors === 'function') {
+          const persisted = store.getVectors({ dims: deps.embedDims() });
+          if (Array.isArray(persisted)) {
+            for (const item of persisted) {
+              if (!vecCache.has(item.memoryId) && item.vec) {
+                const f32 = dequantize(item.vec, item.scale);
+                vecCache.set(item.memoryId, f32);
+                if (index) index.setVector(item.memoryId, f32);
+              }
             }
           }
         }
-        injectCache = null;
-      } catch (error) {
-        // The write may have succeeded before its follow-up read failed.
-        indexDirty = true;
-        injectCache = null;
-        throw error;
+        const missing = rows.filter((r) => !vecCache.has(r.id));
+        const BATCH = 32;
+        for (let i = 0; i < missing.length && !disposed && !fault; i += BATCH) {
+          const slice = missing.slice(i, i + BATCH);
+          const vecs = await deps.embed(slice.map((r) => r.text), { dims: deps.embedDims(), fetchImpl: dependencies.fetch });
+          if (disposed || fault || !vecs) return;
+          for (let j = 0; j < slice.length; j += 1) {
+            if (!vecs[j]) continue;
+            vecCache.set(slice[j].id, vecs[j]);
+            if (index) index.setVector(slice[j].id, vecs[j]);
+            if (typeof store.putVector === 'function') {
+              try {
+                const qVec = vecs[j] instanceof Int8Array ? vecs[j] : quantize(vecs[j]);
+                store.putVector({ memoryId: slice[j].id, vec: qVec, dims: qVec.length });
+              } catch { /* ignore */ }
+            }
+          }
+        }
+      } finally {
+        backfilling = false;
       }
+    };
+
+    // -------------------------------------------------------------- 工具执行期空间解析辅助
+
+    function normalizeExplicitSpaceId(rawSp, session) {
+      const sp = String(rawSp || '').trim();
+      if (!sp || sp.toLowerCase() === GLOBAL_SPACE_ID) return GLOBAL_SPACE_ID;
+      if (/^workspace:/i.test(sp) && !/^workspace:[0-9a-f]{12}$/i.test(sp)) {
+        const customId = sp.toLowerCase();
+        if (typeof store.upsertSpace === 'function') {
+          try { store.upsertSpace({ spaceId: customId, kind: 'workspace', rootPath: null, label: customId }); } catch { /* ignore */ }
+        }
+        return customId;
+      }
+      const sc = resolveScope({ space: sp, session });
+      ensureSpaceRegistered(sc);
+      return sc.spaceId;
     }
 
-    // t18 冲突自述：命中段里同槽多值 + 原文含显式修订语时，前置一行修订结论。
-    // 无修订语时 judgments 为空，零字符开销，不污染普通题。
-    const judgments = conflictJudgments(query, found.hits, { l1Facts });
+    function resolveToolSpace(args, exec, category) {
+      const session = exec?.agent?.session ?? null;
+      if (typeof args?.space === 'string' && args.space.trim()) {
+        return normalizeExplicitSpaceId(args.space, session);
+      }
+      if (typeof args?.spaceId === 'string' && args.spaceId.trim()) {
+        return normalizeExplicitSpaceId(args.spaceId, session);
+      }
+      if (category === 'rule' || category === 'profile') {
+        return GLOBAL_SPACE_ID;
+      }
+      const header = session?.header ?? null;
+      if (session || header?.cwd) {
+        const sc = resolveScope({ session, agent: exec?.agent, header, cwd: header?.cwd });
+        ensureSpaceRegistered(sc);
+        return sc.spaceId;
+      }
+      return GLOBAL_SPACE_ID;
+    }
 
-    return finish({
-      denied: false,
-      chars: found.chars,
-      elapsedMs: found.elapsedMs,
-      conflictLine: judgments.length ? judgments[0].line : '',
-      hits: found.hits.map((h) => ({
-        id: h.id,
-        chapter: h.chapter,
-        para: h.para,
-        chars: h.chars,
-        score: h.score,
-        text: h.text,
-        version: h.version,
-        truncated: Boolean(h.truncated),
-        ...(h.truncated && Number.isInteger(h.windowStart) ? { windowStart: h.windowStart, windowEnd: h.windowEnd, startsAtBoundary: h.startsAtBoundary } : {}),
-      })),
-    });
-  };
+    function resolveRecallSpaces(args, exec) {
+      const session = exec?.agent?.session ?? null;
+      const explicit = typeof args?.space === 'string' && args.space.trim()
+        ? args.space.trim()
+        : (typeof args?.spaceId === 'string' && args.spaceId.trim() ? args.spaceId.trim() : '');
+      if (explicit === 'all') return null;
+      if (explicit) {
+        const normId = normalizeExplicitSpaceId(explicit, session);
+        return visibleSpaces(normId);
+      }
+      const header = session?.header ?? null;
+      if (session || header?.cwd) {
+        const sc = resolveScope({ session, agent: exec?.agent, header, cwd: header?.cwd });
+        ensureSpaceRegistered(sc);
+        return visibleSpaces(sc);
+      }
+      return null;
+    }
 
-  track(ctx.tools.register({
-    name: 'memjudge_recall',
-    description:
-      '在 memjudge 长期记忆里检索。两阶段：段级 BM25（CJK 二元组倒排）→ 章级聚合选章 → 章内按预算装填。'
-      + '返回的是原文片段，不做摘要改写。命中即刷新访问时间（衰减挂 lastAccessed）。'
-      + '材料里确实没有记载时返回 denied=true 并说明缺的是实体、属性还是值——不要据此编造。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        query: { type: 'string', description: '自然语言问题或关键词。' },
-        budget: { type: 'integer', description: `本次返回字符预算，1..${INJECT_HARD_LIMIT}。默认取配置的 injectBudget。` },
-        topChapters: { type: 'integer', description: '章级聚合取前几章，1..4。默认 2（实测 1→0.946、2→0.989、3→0.978）。' },
-      },
-      required: ['query'],
-    },
-    output: {
-      schema: {
+    // -------------------------------------------------------------- 1. memjudge_remember
+
+    track(ctx.tools.register({
+      name: 'memjudge_remember',
+      description:
+        '把一条事实写进 memjudge 长期记忆。原文一字不改地落库（写入后 dump 与输入字符级相等），'
+        + '同时抽出结构化实体-属性-值槽位供 O(log N) 证据门与三分冲突检测使用。'
+        + '支持五类 v2 记忆（category: rule/profile/decision/experience/state）与旧三类（kind: person/promise/event）双向兼容；'
+        + 'state 类配合 slotKey 实现单活状态覆写并自动归档旧版本至 memory_revisions。',
+      parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          denied: { type: 'boolean' },
-          reason: { type: 'string' },
-          detail: { type: 'string' },
-          chars: { type: 'integer' },
-          elapsedMs: { type: 'number' },
-          // 保留兼容字段；召回不推断冲突现值。
-          conflictLine: { type: 'string' },
-          hits: {
+          text: { type: 'string', description: '要记住的原文。建议一条一个事实，别整章倾倒。' },
+          category: {
+            type: 'string',
+            enum: [...MEMORY_CATEGORIES],
+            description: 'v2 五类记忆：rule=跨项目铁律；profile=用户画像；decision=架构决策；experience=排障经验（默认）；state=单活演进状态。',
+          },
+          kind: {
+            type: 'string',
+            enum: [...MEMORY_KINDS],
+            description: '兼容旧三分法：person=用户画像；promise=铁律约定；event=经验事件。',
+          },
+          slotKey: { type: 'string', description: '单活槽位键（如 deploy:prod:status）；配合 category="state" 原地覆写并记录修订链。' },
+          space: { type: 'string', description: '目标空间 ID（如 workspace:<hash> 或 global）。省略时 rule/profile 归 global，其余归当前工作区。' },
+          source: { type: 'string', description: '记忆来源（会话/文件/项目）。' },
+          documentId: { type: 'string', description: '显式文档身份；不会从 source 推断。' },
+          chapter: { type: 'integer', description: '来源章号，用于章级聚合检索。' },
+          para: { type: 'integer', description: '来源段号，用于同章内排序。' },
+          importance: { type: 'number', description: '重要度 0..1，影响衰减地板。默认 0。' },
+          supersedes: {
             type: 'array',
-            items: {
+            items: { type: 'string' },
+            description: '被本条取代的旧记忆 id 列表。',
+          },
+        },
+        required: ['text'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string' },
+            inserted: { type: 'boolean' },
+            created: { type: 'boolean' },
+            spaceId: { type: 'string' },
+            category: { type: 'string' },
+            kind: { type: 'string' },
+            tier: { type: 'integer' },
+            slotKey: { type: 'string' },
+            supersededId: { type: 'string' },
+            revisionNumber: { type: 'integer' },
+            factCount: { type: 'integer' },
+            facts: { type: 'array', items: { type: 'object' } },
+            chars: { type: 'integer' },
+            total: { type: 'integer' },
+            version: { type: 'string' },
+          },
+          required: ['id', 'inserted', 'factCount', 'chars', 'total', 'kind', 'version'],
+        },
+        render: (_args, value) => textBlock(
+          `${value.inserted ? '已记住' : '已存在（幂等/覆写跳过）'} ${value.id} [${value.spaceId ?? 'global'} | ${value.category ?? value.kind} | version=${value.version}]`
+          + `（${value.chars} 字，抽得 ${value.factCount} 条槽位，库内共 ${value.total} 条）`,
+        ),
+      },
+      isConcurrencySafe: () => false,
+      async execute(args, exec) {
+        assertHealthy();
+        const text = typeof args?.text === 'string' ? args.text : '';
+        if (!text.trim()) throw new Error('memjudge_remember: text 不能为空');
+
+        const category = args?.category !== undefined
+          ? normalizeCategory(args.category, args?.kind)
+          : (args?.slotKey ? 'state' : kindToCategory(args?.kind));
+        const kind = categoryToKind(category);
+        const spaceId = resolveToolSpace(args, exec, category);
+        const slotKey = typeof args?.slotKey === 'string' && args.slotKey.trim()
+          ? args.slotKey.trim()
+          : undefined;
+        const version = createHash('sha256').update(text, 'utf16le').digest('hex');
+
+        let saved;
+        if (category === 'state' && slotKey && typeof store.putState === 'function') {
+          const stateRes = store.putState({
+            spaceId,
+            slotKey,
+            text,
+            source: args.source ?? null,
+            importance: args.importance ?? 0.8,
+            now: now(),
+          });
+          const row = store.get(stateRes.id, true);
+          const revisions = typeof store.listRevisions === 'function' ? store.listRevisions(stateRes.id) : [];
+          saved = {
+            id: stateRes.id,
+            inserted: Boolean(stateRes.inserted || stateRes.updated),
+            created: Boolean(stateRes.inserted),
+            spaceId,
+            category: 'state',
+            kind: 'event',
+            tier: stateRes.tier ?? 0,
+            slotKey,
+            revisionNumber: revisions.length + 1,
+            factCount: Array.isArray(row?.facts) ? row.facts.length : 0,
+            facts: Array.isArray(row?.facts) ? row.facts : [],
+          };
+        } else {
+          const putRes = store.put({
+            spaceId,
+            category,
+            kind,
+            slotKey: slotKey ?? null,
+            text,
+            source: args.source ?? null,
+            documentId: args.documentId,
+            chapter: args.chapter,
+            para: args.para,
+            importance: args.importance ?? 0,
+            supersedes: args.supersedes ?? [],
+            createdAt: now(),
+          });
+          const row = store.get(putRes.id, true);
+          saved = {
+            id: putRes.id,
+            inserted: Boolean(putRes.inserted),
+            created: Boolean(putRes.inserted),
+            spaceId: putRes.spaceId ?? spaceId,
+            category: putRes.category ?? category,
+            kind: putRes.kind ?? kind,
+            tier: putRes.tier ?? 1,
+            slotKey,
+            factCount: putRes.factCount ?? (Array.isArray(row?.facts) ? row.facts.length : 0),
+            facts: Array.isArray(row?.facts) ? row.facts : [],
+          };
+        }
+        assertHealthy();
+
+        // 同步阶段立即递增 contentGeneration，确保并发只读快照在微任务边界精准感知内容变动
+        bumpContentGeneration();
+        touchWiki();
+
+        let factCount = saved.factCount;
+        let facts = saved.facts;
+        const { wantVec, wantLlmExtract } = vecConfig();
+        if (saved.inserted && wantLlmExtract && typeof store.rebuildFactsHybrid === 'function') {
+          try {
+            const rebuilt = await store.rebuildFactsHybrid({
+              fetchImpl: dependencies.fetch,
+              signal: lifetime.signal,
+              ...(deps.extractHybrid ? { extractHybrid: deps.extractHybrid } : {}),
+            });
+            assertHealthy();
+            if (rebuilt?.updated) {
+              const refreshed = store.get(saved.id, true);
+              if (Array.isArray(refreshed?.facts)) {
+                facts = refreshed.facts;
+                factCount = refreshed.facts.length;
+              }
+              bumpContentGeneration();
+              touchWiki();
+            }
+          } catch {
+            if (fault) throw fault;
+          }
+        }
+
+        assertHealthy();
+        if (saved.inserted && wantVec) {
+          try {
+            syncVecCacheKey();
+            const vecs = await deps.embed([text], { dims: deps.embedDims(), fetchImpl: dependencies.fetch });
+            assertHealthy();
+            if (vecs?.[0]) {
+              vecCache.set(saved.id, vecs[0]);
+              if (index) index.setVector(saved.id, vecs[0]);
+              if (typeof store.putVector === 'function') {
+                const qVec = vecs[0] instanceof Int8Array ? vecs[0] : quantize(vecs[0]);
+                store.putVector({ memoryId: saved.id, vec: qVec, dims: qVec.length });
+              }
+            }
+          } catch {
+            // 降级为 BM25
+          }
+        }
+
+        assertHealthy();
+        const total = store.stats().memories;
+        return {
+          id: saved.id,
+          inserted: saved.inserted,
+          created: saved.created,
+          spaceId: saved.spaceId,
+          category: saved.category,
+          kind: saved.kind,
+          tier: saved.tier,
+          ...(saved.slotKey ? { slotKey: saved.slotKey } : {}),
+          ...(saved.supersededId ? { supersededId: saved.supersededId } : {}),
+          ...(saved.revisionNumber !== undefined ? { revisionNumber: saved.revisionNumber } : {}),
+          factCount,
+          facts,
+          chars: text.length,
+          total,
+          version,
+        };
+      },
+    }));
+
+    // -------------------------------------------------------------- 2. memjudge_recall
+
+    const runRecall = async (args, { touch = cfg.touchOnRecall, exec = null } = {}) => {
+      assertHealthy();
+      const query = typeof args?.query === 'string' ? args.query.trim() : '';
+      if (!query) throw new Error('memjudge_recall: query 不能为空');
+
+      const budget = clampInt(args?.budget, 1, INJECT_HARD_LIMIT, Math.min(cfg.injectBudget, INJECT_HARD_LIMIT));
+      const topChapters = clampInt(args?.topChapters, 1, 4, 2);
+      const targetSpaces = resolveRecallSpaces(args, exec);
+      const { wantVec, wantRerank, wantExpand, wantSelect } = vecConfig();
+
+      const startGen = contentGeneration;
+      const ix = getIndex();
+      if (ix.docs.length === 0) {
+        return {
+          denied: true,
+          reason: 'empty-store',
+          detail: '记忆库为空',
+          chars: 0,
+          elapsedMs: 0,
+          hits: [],
+        };
+      }
+
+      if (wantVec) {
+        syncVecCacheKey();
+        if (vecCache.size < ix.docs.length) void backfillVectors();
+      }
+
+      const needsAsyncPipeline = Boolean(
+        wantExpand
+        || wantRerank
+        || wantSelect
+        || (wantVec && (ix.hasVectors || typeof store.vectorSearch === 'function')),
+      );
+
+      const callNow = now();
+      const cacheKey = `${startGen}\0${callNow}\0${budget}\0${topChapters}\0${targetSpaces ? targetSpaces.join(',') : '*'}\0${wantVec ? 1 : 0}${wantRerank ? 1 : 0}${wantExpand ? 1 : 0}${wantSelect ? 1 : 0}\0${query}`;
+      let cached = recallCache.get(cacheKey);
+      let found;
+      let t0;
+
+      if (cached) {
+        t0 = process.hrtime.bigint();
+        found = cached;
+      } else if (!needsAsyncPipeline) {
+        // 离线同步快路径：单次事件循环栈帧内完成 BM25 + entity_slots O(log N) 融合，零额外微任务切换
+        t0 = process.hrtime.bigint();
+        const searchOpts = {
+          maxChars: budget,
+          topChapters,
+          now: callNow,
+          ...decayOptions,
+          ...(targetSpaces ? { spaces: targetSpaces } : {}),
+        };
+        found = ix.search(query, searchOpts);
+
+        // 若 BM25 未命中但结构化槽位精确命中（例如纯代码符号/属性键值查询），补入槽位路候选
+        if (!found.hits.length && typeof store.querySlots === 'function') {
+          const slotMatch = matchEntitySlots(query, {
+            store,
+            ...(targetSpaces ? { spaces: targetSpaces } : {}),
+          });
+          if (slotMatch.rankedIds.length > 0) {
+            const rrfMap = rrfFuse([[], slotMatch.rankedIds], 60);
+            const fallbackHits = [];
+            let usedChars = 0;
+            for (const id of slotMatch.rankedIds) {
+              const doc = ix.docs.find((d) => d.id === id);
+              if (!doc) continue;
+              const sliceText = doc.text.length > budget ? doc.text.slice(0, budget) : doc.text;
+              if (usedChars + sliceText.length > budget && fallbackHits.length > 0) break;
+              usedChars += sliceText.length;
+              fallbackHits.push({
+                id: doc.id,
+                spaceId: doc.spaceId,
+                slotKey: doc.slotKey,
+                category: doc.category,
+                chapter: doc.chapter,
+                para: doc.para,
+                text: sliceText,
+                version: createHash('sha256').update(doc.text, 'utf16le').digest('hex'),
+                chars: sliceText.length,
+                truncated: sliceText.length < doc.text.length,
+                ...(sliceText.length < doc.text.length ? { windowStart: 0, windowEnd: sliceText.length, startsAtBoundary: true } : {}),
+                score: rrfMap.get(id) ?? (1 / 61),
+                bm25: 0,
+                rrf: rrfMap.get(id) ?? (1 / 61),
+                routes: ['slot'],
+              });
+            }
+            if (fallbackHits.length > 0) {
+              found = {
+                hits: fallbackHits,
+                text: fallbackHits.map((h) => h.text).join('\n\n'),
+                chars: usedChars,
+                scan: { ...found.scan, slots: { count: slotMatch.rankedIds.length } },
+                elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
+              };
+            }
+          }
+        }
+        assertHealthy();
+        if (startGen === contentGeneration) {
+          if (recallCache.size >= 128) recallCache.delete(recallCache.keys().next().value);
+          recallCache.set(cacheKey, found);
+        }
+      } else {
+        t0 = process.hrtime.bigint();
+        let queryVector = null;
+        if (wantVec && ix.hasVectors) {
+          try {
+            const qv = await deps.embed([query], { dims: deps.embedDims(), fetchImpl: dependencies.fetch });
+            queryVector = qv?.[0] ?? null;
+          } catch {
+            queryVector = null;
+          }
+        }
+        assertHealthy();
+        found = await hybridSearch(ix, query, {
+          store,
+          maxChars: budget,
+          topChapters,
+          now: now(),
+          ...decayOptions,
+          ...(targetSpaces ? { spaces: targetSpaces } : {}),
+          vector: wantVec,
+          queryVector,
+          embed: queryVector ? async () => [queryVector] : (wantVec ? (texts) => deps.embed(texts, { dims: deps.embedDims(), fetchImpl: dependencies.fetch }) : undefined),
+          rerank: wantRerank,
+          rerankFn: wantRerank ? (q, docs, o) => deps.rerank(q, docs, { ...o, fetchImpl: dependencies.fetch }) : undefined,
+          rerankCache,
+          expand: wantExpand,
+          expandFn: wantExpand ? (q, o) => deps.expand(q, { ...o, fetchImpl: dependencies.fetch }) : undefined,
+          expandCache,
+          llmSelect: wantSelect,
+          selectFn: wantSelect ? (q, cands, o) => deps.select(q, cands, { ...o, fetchImpl: dependencies.fetch }) : undefined,
+          selectCache,
+        });
+        assertHealthy();
+        if (contentGeneration !== startGen) {
+          throw new Error('memjudge_recall aborted: store mutated during async recall');
+        }
+        if (recallCache.size >= 128) recallCache.delete(recallCache.keys().next().value);
+        recallCache.set(cacheKey, found);
+      }
+
+      if (!found.hits.length) {
+        return {
+          denied: true,
+          reason: 'no-candidates',
+          detail: '检索无候选段',
+          chars: 0,
+          elapsedMs: found.elapsedMs,
+          hits: [],
+        };
+      }
+
+      // O(log N) 槽位证据门 + Top-K 命中正文双重核验（彻底消灭 O(N) 全表扫描 store.allFacts()）
+      const slotGate = typeof store.querySlots === 'function'
+        ? gateSlots(query, store, {
+            ...(targetSpaces ? { spaces: targetSpaces } : {}),
+          })
+        : null;
+
+      // 从命中的 Top-K 记忆行提取局部结构化槽位，零全表扫描
+      const topKL1Facts = [];
+      for (const h of found.hits) {
+        const m = store.get(h.id, true);
+        if (Array.isArray(m?.facts)) {
+          for (const f of m.facts) topKL1Facts.push(f);
+        }
+      }
+
+      const bodyVerdict = gate(query, found.text, topKL1Facts.length ? { l1Facts: topKL1Facts } : {});
+      if (shouldDenyRecall(bodyVerdict, slotGate)) {
+        const denial = isHardDeny(bodyVerdict) ? bodyVerdict : slotGate;
+        return {
+          denied: true,
+          reason: denial.reason,
+          detail: JSON.stringify(denial.detail ?? {}),
+          chars: 0,
+          elapsedMs: Number(process.hrtime.bigint() - t0) / 1e6,
+          hits: [],
+        };
+      }
+
+      if (touch) {
+        const at = now();
+        for (const h of found.hits) {
+          store.updateAccess(h.id, at);
+          assertHealthy();
+          if (index) {
+            const doc = index.docs.find((d) => d.id === h.id);
+            if (doc) {
+              doc.accessCount = (doc.accessCount ?? 0) + 1;
+              doc.lastAccessed = at;
+            }
+          }
+        }
+        if (found.hits.length > 0) {
+          recallCache.clear();
+        }
+      }
+
+      const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      const out = {
+        denied: false,
+        chars: found.chars,
+        elapsedMs,
+        chaptersPicked: found.scan?.chaptersPicked ?? [],
+        hits: found.hits.map((h) => ({
+          id: h.id,
+          ...(h.spaceId ? { spaceId: h.spaceId } : {}),
+          ...(h.category ? { category: h.category } : {}),
+          ...(h.slotKey ? { slotKey: h.slotKey } : {}),
+          chapter: h.chapter,
+          para: h.para,
+          chars: h.chars ?? h.text.length,
+          score: h.score,
+          text: h.text,
+          version: h.version,
+          truncated: h.truncated,
+          ...(Array.isArray(h.routes) ? { routes: h.routes } : {}),
+          ...(h.windowStart !== undefined ? {
+            windowStart: h.windowStart,
+            windowEnd: h.windowEnd,
+            startsAtBoundary: h.startsAtBoundary,
+          } : {}),
+        })),
+      };
+      if (found.scan?.expansion) out.expansion = found.scan.expansion;
+      if (found.scan?.rerank && found.scan.rerank.degraded !== 'disabled') out.rerank = found.scan.rerank;
+      if (found.scan?.selection && found.scan.selection.pool > 0) out.selection = found.scan.selection;
+      return out;
+    };
+
+    track(ctx.tools.register({
+      name: 'memjudge_recall',
+      description:
+        '在 memjudge 长期记忆里检索。融合 BM25 + Int8 向量 + 结构化槽位三路 RRF，前置工作区隔离（当前 workspace + global），'
+        + '并经 O(log N) 槽位证据门拦截编造。返回原文片段；命中即刷新访问时间。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          query: { type: 'string', description: '自然语言问题或关键词。' },
+          space: { type: 'string', description: '指定检索空间（默认自动取当前工作区 + global；传 "all" 跨全空间检索）。' },
+          budget: { type: 'integer', description: '本次返回字符预算，1..2000。' },
+          topChapters: { type: 'integer', description: '章级聚合取前几章，1..4。默认 2。' },
+        },
+        required: ['query'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            denied: { type: 'boolean' },
+            reason: { type: 'string' },
+            detail: { type: 'string' },
+            chars: { type: 'integer' },
+            elapsedMs: { type: 'number' },
+            chaptersPicked: { type: 'array', items: { type: 'integer' } },
+            expansion: { type: 'object' },
+            rerank: { type: 'object' },
+            selection: { type: 'object' },
+            hits: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  id: { type: 'string' },
+                  spaceId: { type: 'string' },
+                  category: { type: 'string' },
+                  slotKey: { type: 'string' },
+                  chapter: { type: 'integer' },
+                  para: { type: 'integer' },
+                  chars: { type: 'integer' },
+                  score: { type: 'number' },
+                  text: { type: 'string' },
+                  version: { type: 'string' },
+                  truncated: { type: 'boolean' },
+                  routes: { type: 'array', items: { type: 'string' } },
+                  windowStart: { type: 'integer' },
+                  windowEnd: { type: 'integer' },
+                  startsAtBoundary: { type: 'boolean' },
+                },
+                required: ['id', 'chapter', 'para', 'score', 'text', 'version', 'truncated'],
+              },
+            },
+          },
+          required: ['denied', 'chars', 'elapsedMs', 'hits'],
+        },
+        render: (_args, value) => {
+          if (value.denied) {
+            return textBlock(`拒答（${value.reason}）：材料未记载，禁止据此编造。${value.detail ? ` 详情：${value.detail}` : ''}`);
+          }
+          const lines = value.hits.map(
+            (h) => `[${h.id} | ${h.spaceId ?? 'global'} | ch${h.chapter}:p${h.para} | score=${Math.round(h.score * 1000) / 1000} | v=${h.version}${h.truncated ? (Number.isInteger(h.windowStart) ? ` | 截断 ${h.windowStart}:${h.windowEnd}` : ' | 截断') : ''}]\n${h.text}`,
+          );
+          return textBlock(`召回 ${value.hits.length} 段（${value.chars} 字，${Number(value.elapsedMs ?? 0).toFixed(2)}ms）：\n\n${lines.join('\n\n')}`);
+        },
+      },
+      isConcurrencySafe: () => true,
+      async execute(args, exec) {
+        return runRecall(args, { touch: cfg.touchOnRecall, exec });
+      },
+    }));
+
+    // -------------------------------------------------------------- 3. memjudge_read
+
+    track(ctx.tools.register({
+      name: 'memjudge_read',
+      description: '按记忆 id 分页读取原文。续页传入首页 version 校验内容；offset 和 nextOffset 是 UTF-16 码元偏移；读取不刷新访问时间。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', description: '召回结果中的记忆 id。' },
+          offset: { type: 'integer', minimum: 0, description: '起始偏移，默认 0。' },
+          limit: { type: 'integer', minimum: 2, maximum: 2000, description: '每页 2..2000 个 UTF-16 码元，默认 2000。' },
+          version: { type: 'string', description: '首页返回的原文版本，续页传入以检查内容变化。' },
+        },
+        required: ['id'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            found: { type: 'boolean' },
+            id: { type: 'string' },
+            text: { type: 'string' },
+            offset: { type: 'integer' },
+            nextOffset: { type: 'integer' },
+            total: { type: 'integer' },
+            truncated: { type: 'boolean' },
+            version: { type: 'string' },
+          },
+          required: ['found', 'id', 'text', 'offset', 'nextOffset', 'total', 'truncated'],
+        },
+        render: (_args, value) => textBlock(JSON.stringify(value)),
+      },
+      isConcurrencySafe: () => false,
+      execute({ id, offset = 0, limit = 2000, version }) {
+        assertHealthy();
+        if (
+          typeof id !== 'string' || !id
+          || !Number.isSafeInteger(offset) || offset < 0
+          || !Number.isSafeInteger(limit) || limit < 2 || limit > 2000
+          || (version !== undefined && (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version)))
+        ) {
+          throw new Error('memjudge_read: invalid arguments');
+        }
+        const row = store.get(id, false);
+        if (!row) {
+          if (version !== undefined) throw new Error('memjudge_read: stale version');
+          return { found: false, id, text: '', offset: 0, nextOffset: 0, total: 0, truncated: false };
+        }
+        const text = row.text;
+        const currentVersion = createHash('sha256').update(text, 'utf16le').digest('hex');
+        if (version !== undefined && version !== currentVersion) throw new Error('memjudge_read: stale version');
+        if (
+          offset > text.length
+          || (
+            offset > 0 && offset < text.length
+            && text.charCodeAt(offset - 1) >= 0xD800 && text.charCodeAt(offset - 1) <= 0xDBFF
+            && text.charCodeAt(offset) >= 0xDC00 && text.charCodeAt(offset) <= 0xDFFF
+          )
+        ) {
+          throw new Error('memjudge_read: invalid offset');
+        }
+        let end = Math.min(text.length, offset + limit);
+        if (
+          end < text.length
+          && text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF
+          && text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF
+        ) {
+          end -= 1;
+        }
+        return {
+          found: true,
+          id,
+          text: text.slice(offset, end),
+          offset,
+          nextOffset: end,
+          total: text.length,
+          truncated: end < text.length,
+          version: currentVersion,
+        };
+      },
+    }));
+
+    // -------------------------------------------------------------- 4. memjudge_forget
+
+    track(ctx.tools.register({
+      name: 'memjudge_forget',
+      description:
+        '从 memjudge 长期记忆里物理删除条目（不可恢复）。支持按 id、query、source 或 space 清理；'
+        + '先用 dryRun=true 预览将删除的 id，确认后再执行物理删除。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', description: '要删除的记忆 id。' },
+          source: { type: 'string', description: '精确删除该已知来源的全部条目；优先于 id/query。' },
+          space: { type: 'string', description: '按空间过滤或批量清理指定空间（如 workspace:<hash>）。' },
+          query: { type: 'string', description: '按检索命中批量删除。与 id 同时给时以 id 优先。' },
+          limit: { type: 'integer', description: 'query 模式最多删几条，1..100。默认 10。' },
+          dryRun: { type: 'boolean', description: '只列出将删除的 id，不落库。' },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            forgotten: { type: 'array', items: { type: 'string' } },
+            count: { type: 'integer' },
+            dryRun: { type: 'boolean' },
+          },
+          required: ['forgotten', 'count', 'dryRun'],
+        },
+        render: (_args, value) => textBlock(
+          value.count === 0
+            ? '没有匹配到要遗忘的条目'
+            : `${value.dryRun ? '将遗忘' : '已遗忘'} ${value.count} 条：${value.forgotten.join(', ')}`,
+        ),
+      },
+      isConcurrencySafe: () => false,
+      async execute(args, exec) {
+        const dryRun = args?.dryRun === true;
+        const spaceFilter = typeof args?.space === 'string' && args.space.trim() && args.space !== 'all'
+          ? normalizeExplicitSpaceId(args.space, exec?.agent?.session ?? null)
+          : undefined;
+        assertHealthy();
+
+        const runForget = (opts) => {
+          try {
+            return store.forget(opts);
+          } catch (err) {
+            if (fault) throw fault;
+            throw err;
+          }
+        };
+
+        if (args?.source !== undefined) {
+          const result = runForget({ source: args.source, spaceId: spaceFilter, dryRun });
+          assertHealthy();
+          if (!dryRun && result.count > 0) {
+            for (const rid of result.forgotten) vecCache.delete(rid);
+            bumpContentGeneration();
+            touchWiki();
+          }
+          return { forgotten: result.forgotten, count: result.count, dryRun };
+        }
+
+        if (!args?.id && !args?.query && spaceFilter) {
+          const result = runForget({ spaceId: spaceFilter, dryRun });
+          assertHealthy();
+          if (!dryRun && result.count > 0) {
+            for (const rid of result.forgotten) vecCache.delete(rid);
+            bumpContentGeneration();
+            touchWiki();
+          }
+          return { forgotten: result.forgotten, count: result.count, dryRun };
+        }
+
+        const ids = [];
+        if (args?.id) {
+          ids.push(String(args.id));
+        } else if (args?.query) {
+          const limit = clampInt(args?.limit, 1, 100, 10);
+          const found = getIndex().search(String(args.query), {
+            maxChars: 1e9,
+            limit: 1e6,
+            now: now(),
+            ...(spaceFilter ? { spaceId: spaceFilter } : {}),
+          });
+          for (const hit of found.hits.slice(0, limit)) ids.push(hit.id);
+        }
+        if (!ids.length) return { forgotten: [], count: 0, dryRun };
+        if (dryRun) return { forgotten: ids, count: ids.length, dryRun: true };
+
+        const removed = runForget({ ids, spaceId: spaceFilter }).forgotten;
+        assertHealthy();
+        if (removed.length > 0) {
+          for (const rid of removed) vecCache.delete(rid);
+          bumpContentGeneration();
+          touchWiki();
+        }
+        return { forgotten: removed, count: removed.length, dryRun: false };
+      },
+    }));
+
+    // -------------------------------------------------------------- 5. memjudge_demote
+
+    track(ctx.tools.register({
+      name: 'memjudge_demote',
+      description:
+        '把误判为 rule/profile（person/promise）的记忆安全降级为 experience/event（L1）：'
+        + '正文、来源、访问记录全部保留，不再常驻 Tier-S 静态热底座，随生命周期正常代谢。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', description: '要降级的记忆 id。' },
+        },
+        required: ['id'],
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            found: { type: 'boolean' },
+            id: { type: 'string' },
+            changed: { type: 'boolean' },
+            categoryBefore: { type: 'string' },
+            kindBefore: { type: 'string' },
+            tierBefore: { type: 'integer' },
+            category: { type: 'string' },
+            kind: { type: 'string' },
+            tier: { type: 'integer' },
+          },
+          required: ['found', 'id', 'changed', 'kindBefore', 'tierBefore', 'kind', 'tier'],
+        },
+        render: (_args, value) => textBlock(
+          !value.found
+            ? `没有找到 id=${value.id} 的记忆`
+            : value.changed
+              ? `已把 ${value.id} 从 ${value.categoryBefore ?? value.kindBefore}（tier ${value.tierBefore}）降级为 ${value.category ?? value.kind}（tier ${value.tier}）`
+              : `${value.id} 已经是 ${value.category ?? value.kind}（tier ${value.tier}），无需改动`,
+        ),
+      },
+      isConcurrencySafe: () => false,
+      execute(args) {
+        assertHealthy();
+        const id = typeof args?.id === 'string' ? args.id.trim() : '';
+        if (!id) throw new Error('memjudge_demote: id 必须是非空字符串');
+        const beforeRow = store.get(id, false);
+        const result = store.setKind(id, 'event');
+        assertHealthy();
+        if (!result) {
+          return {
+            found: false,
+            id,
+            changed: false,
+            categoryBefore: '',
+            kindBefore: '',
+            tierBefore: 0,
+            category: '',
+            kind: '',
+            tier: 0,
+          };
+        }
+        if (result.changed) {
+          bumpContentGeneration();
+          touchWiki();
+        }
+        return {
+          found: true,
+          id: result.id,
+          changed: result.changed,
+          categoryBefore: result.categoryBefore ?? beforeRow?.category ?? result.kindBefore,
+          kindBefore: result.kindBefore,
+          tierBefore: result.tierBefore,
+          category: result.category ?? 'experience',
+          kind: result.kind,
+          tier: result.tier,
+        };
+      },
+    }));
+
+    // -------------------------------------------------------------- 6. memjudge_conflicts
+
+    function buildChapterRows(spaceFilter) {
+      const rows = typeof store.list === 'function'
+        ? store.list({
+            status: 'active',
+            includeText: true,
+            limit: 100000,
+            ...(spaceFilter ? { spaces: visibleSpaces(spaceFilter) } : {}),
+          })
+        : store.dump();
+      const byChapter = new Map();
+      const pushSeg = (docKey, chapter, para, mem) => {
+        const key = `${docKey}\0${chapter}`;
+        if (!byChapter.has(key)) byChapter.set(key, []);
+        byChapter.get(key).push({ mem, para });
+      };
+      for (const m of rows) {
+        const occs = typeof store.occurrencesV1 === 'function' ? store.occurrencesV1(m.id) : [];
+        const validOccs = occs.filter((o) => o && (o.documentId != null || o.chapter != null || o.source != null));
+        if (validOccs.length > 0) {
+          for (const o of validOccs) {
+            const fallback = chapterOf({ id: m.id, source: o.source ?? m.source });
+            const ch = o.chapter ?? fallback.chapter ?? 0;
+            const pa = o.para ?? fallback.para ?? 0;
+            const docId = o.documentId ?? fallback.documentId ?? (ch > 0 ? `ch:${ch}` : `mem:${m.id}`);
+            pushSeg(docId, ch, pa, m);
+          }
+        } else {
+          const src = chapterOf(m);
+          const docKey = src.documentId ?? (src.chapter > 0 ? `ch:${src.chapter}` : `mem:${m.id}`);
+          pushSeg(docKey, src.chapter, src.para, m);
+        }
+      }
+      const out = [];
+      for (const [key, group] of byChapter) {
+        const chapter = Number(key.slice(key.indexOf('\0') + 1));
+        group.sort((a, b) => a.para - b.para || String(a.mem.id).localeCompare(String(b.mem.id)));
+        out.push({
+          id: group[group.length - 1].mem.id,
+          chapter,
+          text: group.map((g) => g.mem.text).join('\n'),
+          segments: group.map((g) => ({
+            id: g.mem.id,
+            para: g.para,
+            text: g.mem.text,
+            createdAt: g.mem.createdAt ?? g.mem.created_at,
+          })),
+        });
+      }
+      out.sort((a, b) => a.chapter - b.chapter);
+      return out;
+    }
+
+    function normalizeConflictPolarity(p) {
+      if (p === -1 || p === '-1' || p === 'negate' || p === 'negative') return 'negate';
+      if (p === 0 || p === '0' || p === 'neutral') return 'neutral';
+      return 'affirm';
+    }
+
+    function extractConflictType(cls) {
+      const t = typeof cls === 'string' ? cls : (cls?.type ?? 'disputed');
+      return t === 'supersession' || t === 'conditional' || t === 'disputed' ? t : 'disputed';
+    }
+
+    function collectSlotTriConflicts(spaceFilter) {
+      const db = getRawDb(store);
+      if (!db) return [];
+      const spaces = spaceFilter ? visibleSpaces(spaceFilter) : null;
+      let rows = [];
+      try {
+        if (spaces && spaces.length > 0) {
+          const ph = spaces.map(() => '?').join(', ');
+          rows = db.prepare(
+            `SELECT s.entity, s.attr, s.value, s.unit, s.polarity, s.quote, s.memory_id, s.space_id,
+                    m.text, m.created_at, m.superseded_by, m.supersedes_json
+               FROM main.entity_slots s
+               JOIN main.memories m ON m.id = s.memory_id
+              WHERE m.status = 'active' AND s.space_id IN (${ph})
+              ORDER BY m.created_at ASC`,
+          ).all(...spaces);
+        } else {
+          rows = db.prepare(
+            `SELECT s.entity, s.attr, s.value, s.unit, s.polarity, s.quote, s.memory_id, s.space_id,
+                    m.text, m.created_at, m.superseded_by, m.supersedes_json
+               FROM main.entity_slots s
+               JOIN main.memories m ON m.id = s.memory_id
+              WHERE m.status = 'active'
+              ORDER BY m.created_at ASC`,
+          ).all();
+        }
+      } catch {
+        return [];
+      }
+
+      const groups = new Map();
+      for (const r of rows) {
+        if (!r.attr || r.value == null) continue;
+        const gKey = `${r.entity || ''}::${r.attr}::${r.unit || ''}`;
+        if (!groups.has(gKey)) {
+          groups.set(gKey, {
+            key: gKey,
+            entity: String(r.entity || ''),
+            attr: String(r.attr || ''),
+            unit: String(r.unit || ''),
+            items: [],
+            distinctVals: new Set(),
+          });
+        }
+        const g = groups.get(gKey);
+        const pol = normalizeConflictPolarity(r.polarity);
+        const vLabel = pol === 'negate' ? `非${r.value}` : String(r.value);
+        g.distinctVals.add(vLabel);
+        g.items.push({ ...r, polarityLabel: pol, vLabel });
+      }
+
+      const conflicts = [];
+      for (const g of groups.values()) {
+        if (g.distinctVals.size < 2) continue;
+        const first = g.items[0];
+        const latest = g.items[g.items.length - 1];
+        let supersedes = [];
+        try { supersedes = JSON.parse(latest.supersedes_json || '[]'); } catch { supersedes = []; }
+
+        const cls = classifyConflict(
+          {
+            id: first.memory_id,
+            entity: first.entity,
+            attr: first.attr,
+            value: first.value,
+            unit: first.unit,
+            polarity: first.polarityLabel,
+            text: first.text || first.quote || '',
+            createdAt: first.created_at,
+            supersededBy: first.superseded_by,
+          },
+          {
+            id: latest.memory_id,
+            entity: latest.entity,
+            attr: latest.attr,
+            value: latest.value,
+            unit: latest.unit,
+            polarity: latest.polarityLabel,
+            text: latest.text || latest.quote || '',
+            createdAt: latest.created_at,
+            supersedes,
+          },
+        );
+        const conflictType = extractConflictType(cls);
+
+        const vals = [...g.distinctVals];
+        conflicts.push({
+          key: g.key,
+          entity: g.entity,
+          attr: g.attr,
+          unit: g.unit,
+          conflictType,
+          values: vals,
+          current: vals[vals.length - 1],
+          currentMemId: String(latest.memory_id ?? ''),
+          supersededValues: vals.slice(0, -1),
+          evidence: g.items.slice(0, 6).map((it) => ({
+            memId: String(it.memory_id ?? ''),
+            value: String(it.value ?? ''),
+            polarity: it.polarityLabel,
+            quote: inlineText(it.quote || it.text || '', 140),
+          })),
+        });
+      }
+      return conflicts;
+    }
+
+    track(ctx.tools.register({
+      name: 'memjudge_conflicts',
+      description:
+        '基于 entity_slots 与章节聚合检测记忆中的前后矛盾，并通过 classifyConflict 给出三分冲突定性：'
+        + 'supersession（演进覆盖）、conditional（条件并存）、disputed（真冲突待裁决）及原句证据。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          limit: { type: 'integer', description: '最多返回几组矛盾，1..50。默认 20。' },
+          space: { type: 'string', description: '限定空间（如 workspace:<hash>；默认当前可见空间）。' },
+          type: {
+            type: 'string',
+            enum: ['supersession', 'conditional', 'disputed'],
+            description: '可选按冲突分类过滤。',
+          },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            conflicts: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  key: { type: 'string' },
+                  entity: { type: 'string' },
+                  attr: { type: 'string' },
+                  unit: { type: 'string' },
+                  conflictType: { type: 'string' },
+                  values: { type: 'array', items: { type: 'string' } },
+                  current: { type: 'string' },
+                  currentMemId: { type: 'string' },
+                  supersededValues: { type: 'array', items: { type: 'string' } },
+                  evidence: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      additionalProperties: false,
+                      properties: {
+                        memId: { type: 'string' },
+                        value: { type: 'string' },
+                        polarity: { type: 'string' },
+                        quote: { type: 'string' },
+                      },
+                      required: ['memId', 'value', 'polarity', 'quote'],
+                    },
+                  },
+                },
+                required: ['key', 'attr', 'unit', 'conflictType', 'values', 'current', 'currentMemId', 'supersededValues'],
+              },
+            },
+            total: { type: 'integer' },
+            supersededCount: { type: 'integer' },
+            byType: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                supersession: { type: 'integer' },
+                conditional: { type: 'integer' },
+                disputed: { type: 'integer' },
+              },
+              required: ['supersession', 'conditional', 'disputed'],
+            },
+          },
+          required: ['conflicts', 'total', 'supersededCount', 'byType'],
+        },
+        render: (_args, value) => textBlock(
+          value.total === 0
+            ? '未发现前后矛盾'
+            : `发现 ${value.total} 组矛盾（supersession=${value.byType.supersession}, conditional=${value.byType.conditional}, disputed=${value.byType.disputed}）：\n\n${value.conflicts
+              .map((c) => `- [${c.conflictType}] ${c.entity ? `${c.entity}·` : ''}${c.attr}${c.unit ? `（${c.unit}）` : ''}：${c.values.join(' → ')}，现取 ${c.current}（${c.currentMemId}）`)
+              .join('\n')}`,
+        ),
+      },
+      isConcurrencySafe: () => true,
+      async execute(args, exec) {
+        assertHealthy();
+        const limit = clampInt(args?.limit, 1, 50, 20);
+        const spaceFilter = typeof args?.space === 'string' && args.space.trim() && args.space !== 'all'
+          ? normalizeExplicitSpaceId(args.space, exec?.agent?.session ?? null)
+          : undefined;
+        const typeFilter = typeof args?.type === 'string' && args.type.trim() ? args.type.trim() : '';
+
+        const slotConflicts = collectSlotTriConflicts(spaceFilter);
+        const chapResult = resolveConflict(buildChapterRows(spaceFilter));
+
+        const merged = [...slotConflicts];
+        const seenAttrUnit = new Set(slotConflicts.map((c) => `${c.attr}::${c.unit}`));
+        for (const c of chapResult.conflicts) {
+          const attrName = String(c.attr ?? c.noun ?? '');
+          const sig = `${attrName}::${c.unit ?? ''}`;
+          if (seenAttrUnit.has(sig)) continue;
+          const evList = Array.isArray(c.evidence) ? c.evidence : [];
+          const firstEv = evList[0] ?? {};
+          const lastEv = evList[evList.length - 1] ?? {};
+          const vals = Array.isArray(c.values) ? c.values.map((v) => String(v ?? '')) : [];
+          const cls = c.conflictType ?? classifyConflict(
+            {
+              id: firstEv.memId ?? '',
+              attr: attrName,
+              value: vals[0] ?? '',
+              unit: c.unit ?? '',
+              text: firstEv.text ?? firstEv.sentence ?? '',
+            },
+            {
+              id: c.currentMemId ?? lastEv.memId ?? '',
+              attr: attrName,
+              value: c.current ?? vals[vals.length - 1] ?? '',
+              unit: c.unit ?? '',
+              text: lastEv.text ?? lastEv.sentence ?? '',
+            },
+          );
+          const conflictType = extractConflictType(cls);
+          merged.push({
+            key: String(c.key ?? sig),
+            entity: String(c.entity ?? ''),
+            attr: attrName,
+            unit: String(c.unit ?? ''),
+            conflictType,
+            values: vals,
+            current: String(c.current ?? vals[vals.length - 1] ?? ''),
+            currentMemId: String(c.currentMemId ?? lastEv.memId ?? ''),
+            supersededValues: Array.isArray(c.supersededValues) ? c.supersededValues.map((v) => String(v ?? '')) : [],
+            evidence: evList.slice(0, 6).map((e) => ({
+              memId: String(e.memId ?? ''),
+              value: String(e.value ?? ''),
+              polarity: normalizeConflictPolarity(e.polarity),
+              quote: inlineText(e.text ?? e.sentence ?? '', 140),
+            })),
+          });
+        }
+
+        const filtered = typeFilter ? merged.filter((c) => c.conflictType === typeFilter) : merged;
+        const byType = { supersession: 0, conditional: 0, disputed: 0 };
+        for (const c of filtered) {
+          if (c.conflictType in byType) byType[c.conflictType] += 1;
+        }
+
+        return {
+          conflicts: filtered.slice(0, limit),
+          total: filtered.length,
+          supersededCount: chapResult.superseded.length + byType.supersession,
+          byType,
+        };
+      },
+    }));
+
+    // -------------------------------------------------------------- 7. memjudge_stats
+
+    track(ctx.tools.register({
+      name: 'memjudge_stats',
+      description:
+        'memjudge v2 全维体检：总条数、空间分布（spaces）、五类 category 与三类 kind 分布、'
+        + 'L0-L3 热冷层级分布、wiki_pages 页数、Tier-S/Tier-D 两段式注入预算状态与增强模块开关。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          verbose: { type: 'boolean', description: '附带库路径与详细空间快照。' },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            schemaVersion: { type: 'integer' },
+            memories: { type: 'integer' },
+            facts: { type: 'integer' },
+            categories: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                rule: { type: 'integer' },
+                profile: { type: 'integer' },
+                decision: { type: 'integer' },
+                experience: { type: 'integer' },
+                state: { type: 'integer' },
+              },
+              required: ['rule', 'profile', 'decision', 'experience', 'state'],
+            },
+            kinds: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                person: { type: 'integer' },
+                promise: { type: 'integer' },
+                event: { type: 'integer' },
+              },
+              required: ['person', 'promise', 'event'],
+            },
+            layers: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                L0: { type: 'integer' },
+                L1: { type: 'integer' },
+                L2: { type: 'integer' },
+                L3: { type: 'integer' },
+              },
+              required: ['L0', 'L1', 'L2', 'L3'],
+            },
+            spaces: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  id: { type: 'string' },
+                  kind: { type: 'string' },
+                  label: { type: 'string' },
+                  memoryCount: { type: 'integer' },
+                },
+                required: ['id', 'kind', 'label', 'memoryCount'],
+              },
+            },
+            wikiCount: { type: 'integer' },
+            pendingIngestJobs: { type: 'integer' },
+            textChars: { type: 'integer' },
+            bytes: { type: 'integer' },
+            limitBytes: { type: 'integer' },
+            withinLimit: { type: 'boolean' },
+            docs: { type: 'integer' },
+            terms: { type: 'integer' },
+            postings: { type: 'integer' },
+            chapters: { type: 'integer' },
+            injectEnabled: { type: 'boolean' },
+            injectMode: { type: 'string' },
+            injectChars: { type: 'integer' },
+            injectBudget: { type: 'integer' },
+            tierSBudget: { type: 'integer' },
+            tierDBudget: { type: 'integer' },
+            dbPath: { type: 'string' },
+            tidy: { type: 'string' },
+            modules: { type: 'string' },
+            keyConfigured: { type: 'boolean' },
+            keySource: { type: 'string' },
+            panelPath: { type: 'string' },
+            wiki: { type: 'string' },
+          },
+          required: [
+            'schemaVersion', 'memories', 'facts', 'categories', 'kinds', 'layers', 'spaces', 'wikiCount',
+            'textChars', 'bytes', 'limitBytes', 'withinLimit',
+            'docs', 'terms', 'postings', 'chapters',
+            'injectEnabled', 'injectChars', 'injectBudget', 'tierSBudget', 'tierDBudget', 'dbPath',
+            'modules', 'keyConfigured', 'keySource', 'panelPath',
+          ],
+        },
+        render: (_args, value) => textBlock(
+          `Schema v${value.schemaVersion} | 记忆 ${value.memories} 条 / 槽位 ${value.facts} 条 / 正文 ${value.textChars} 字\n`
+          + `五类 rule ${value.categories.rule} / profile ${value.categories.profile} / decision ${value.categories.decision} / experience ${value.categories.experience} / state ${value.categories.state}\n`
+          + `三分 人 ${value.kinds.person} / 约 ${value.kinds.promise} / 事 ${value.kinds.event}\n`
+          + `层级 L0=${value.layers.L0} / L1=${value.layers.L1} / L2=${value.layers.L2} / L3=${value.layers.L3} | Wiki 知识页 ${value.wikiCount} 页 | 空间 ${value.spaces.length} 个\n`
+          + `库体 ${(value.bytes / 1024).toFixed(1)}KB（上限 ${(value.limitBytes / 1024).toFixed(0)}KB，${value.withinLimit ? '在预算内' : '超预算'}）\n`
+          + `倒排 ${value.terms} 词 / ${value.postings} 条 posting / ${value.chapters} 章\n`
+          + `后台整理 ${value.tidy ?? '未运行'}\n`
+          + `注入 ${value.injectEnabled ? `开启 [${value.injectMode}]（当前 ${value.injectChars} 字，Tier-S<=${value.tierSBudget} + Tier-D<=${value.tierDBudget} <= ${value.injectBudget}）` : '关闭（0 字符）'}\n`
+          + `wiki ${value.wiki}\n`
+          + `模块 ${value.modules}\n`
+          + `密钥 ${value.keyConfigured ? `已配置（${value.keySource}）` : '未配置——向量/重排/LLM 脱水停用，走纯离线引擎'}\n`
+          + `面板 ${value.panelPath}`,
+        ),
+      },
+      isConcurrencySafe: () => true,
+      async execute(args, exec) {
+        assertHealthy();
+        const base = store.stats();
+        const ix = getIndex().stats();
+        const sessionCtx = exec?.agent?.session ? { session: exec.agent.session } : undefined;
+        const injectText = renderSection(sessionCtx);
+        const tidy = sleepPhase(buildChapterRows(), { tierRows: store.dump() });
+        const report = deps.configReport();
+
+        const spaceCounts = new Map();
+        const db = getRawDb(store);
+        if (db) {
+          try {
+            const sRows = db
+              .prepare("SELECT space_id, COUNT(*) AS cnt FROM main.memories WHERE status = 'active' GROUP BY space_id")
+              .all();
+            for (const r of sRows) spaceCounts.set(String(r.space_id), Number(r.cnt ?? 0));
+          } catch { /* ignore */ }
+        }
+        const spaces = typeof store.listSpaces === 'function'
+          ? store.listSpaces().map((sp) => {
+              const sid = String(sp.spaceId ?? sp.id ?? GLOBAL_SPACE_ID);
+              return {
+                id: sid,
+                kind: String(sp.kind ?? 'workspace'),
+                label: String(sp.label || sid),
+                memoryCount: spaceCounts.get(sid) ?? 0,
+              };
+            })
+          : [{ id: GLOBAL_SPACE_ID, kind: 'global', label: 'Global', memoryCount: base.memories }];
+
+        const wikiPages = typeof store.listWikiPages === 'function' ? store.listWikiPages({ limit: 10000 }) : [];
+        const lt = base.lTiers ?? {};
+        const layers = {
+          L0: Number(lt[0] ?? lt.L0 ?? 0),
+          L1: Number(lt[1] ?? lt.L1 ?? (base.lTiers ? 0 : base.memories)),
+          L2: Number(lt[2] ?? lt.L2 ?? 0),
+          L3: Number(lt[3] ?? lt.L3 ?? 0),
+        };
+
+        return {
+          schemaVersion: base.schemaVersion ?? STORE_SCHEMA_VERSION,
+          memories: base.memories,
+          facts: base.facts,
+          categories: base.categories ?? { rule: 0, profile: 0, decision: 0, experience: base.memories, state: 0 },
+          kinds: base.kinds,
+          layers,
+          spaces,
+          wikiCount: wikiPages.length,
+          pendingIngestJobs: base.pendingIngestJobs ?? 0,
+          textChars: base.textChars,
+          bytes: base.bytes,
+          limitBytes: base.limitBytes,
+          withinLimit: base.withinLimit,
+          docs: ix.docs,
+          terms: ix.terms,
+          postings: ix.postings,
+          chapters: ix.chapters,
+          injectEnabled: cfg.autoInject,
+          injectMode: shouldUseTieredMode(sessionCtx) ? 'tiered' : 'legacy',
+          injectChars: injectText.length,
+          injectBudget: cfg.injectBudget,
+          tierSBudget: cfg.tierSBudget,
+          tierDBudget: cfg.tierDBudget,
+          dbPath: args?.verbose === true ? (store.path ?? dbPath) : '',
+          tidy: `${tidy.conflicts.length} 组待审矛盾 / ${tidy.archived.length} 条待降级`
+            + ` / ${tidy.tierWrites.length} 条 tier 提案`
+            + ` / ${tidy.relations.length} 条共现关系`
+            + (tidy.errors.length ? ` / ${tidy.errors.length} 阶段失败` : ''),
+          modules: (() => {
+            const f = report.flags ?? deps.moduleFlags();
+            return `jieba ${f.jieba ? 'ON' : 'OFF'} / 向量 ${f.vector ? 'ON' : 'OFF'}`
+              + ` / rerank ${f.rerank ? 'ON' : 'OFF'} / 扩展 ${f.expand ? 'ON' : 'OFF'}`
+              + ` / 选段 ${f.llmSelect ? 'ON' : 'OFF'} / LLM脱水 ${f.llmExtract ? 'ON' : 'OFF'}`
+              + ` / 双边采集 ${cfg.autoCapture ? 'ON' : 'OFF'}`;
+          })(),
+          keyConfigured: Boolean(report.hasKey),
+          keySource: String(report.keySource ?? 'none'),
+          panelPath: path.join(STATE_DIR, 'panel.html'),
+          wiki: getWikiStatusString(),
+        };
+      },
+    }));
+
+    // -------------------------------------------------------------- 8. memjudge_wiki（v2 新增）
+
+    track(ctx.tools.register({
+      name: 'memjudge_wiki',
+      description:
+        '管理与查阅当前空间的 L2 演进知识页（wiki_pages）及单活状态看板（state）：'
+        + '支持 action="list" 列出知识页与单活状态、action="read" 按 slug 读取完整 Markdown 知识页、action="compile" 触发增量编译。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'read', 'compile'],
+            description: '操作类型：list（默认）、read（需传 slug）、compile（增量编译脏簇与新主题）。',
+          },
+          slug: { type: 'string', description: 'action="read" 时指定知识页 slug 或 pageId。' },
+          space: { type: 'string', description: '指定空间 ID（默认当前工作区 + global；传 "all" 查看全库）。' },
+          limit: { type: 'integer', description: '返回页数上限，1..100，默认 50。' },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            action: { type: 'string' },
+            spaceId: { type: 'string' },
+            compiled: { type: 'integer' },
+            totalPages: { type: 'integer' },
+            page: {
               type: 'object',
               additionalProperties: false,
               properties: {
                 id: { type: 'string' },
-                chapter: { type: 'integer' },
-                para: { type: 'integer' },
-                chars: { type: 'integer' },
-                score: { type: 'number' },
-                text: { type: 'string' },
-                version: { type: 'string' },
-                truncated: { type: 'boolean' },
-                windowStart: { type: 'integer' },
-                windowEnd: { type: 'integer' },
-                startsAtBoundary: { type: 'boolean' },
+                spaceId: { type: 'string' },
+                slug: { type: 'string' },
+                title: { type: 'string' },
+                summary: { type: 'string' },
+                markdown: { type: 'string' },
+                sourceIds: { type: 'array', items: { type: 'string' } },
+                dirty: { type: 'boolean' },
+                version: { type: 'integer' },
+                updatedAt: { type: 'number' },
               },
-              required: ['id', 'chapter', 'para', 'chars', 'score', 'text', 'version', 'truncated'],
+              required: ['id', 'spaceId', 'slug', 'title', 'markdown', 'version'],
+            },
+            pages: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  id: { type: 'string' },
+                  spaceId: { type: 'string' },
+                  slug: { type: 'string' },
+                  title: { type: 'string' },
+                  summary: { type: 'string' },
+                  markdown: { type: 'string' },
+                  sourceIds: { type: 'array', items: { type: 'string' } },
+                  dirty: { type: 'boolean' },
+                  version: { type: 'integer' },
+                  updatedAt: { type: 'number' },
+                },
+                required: ['id', 'spaceId', 'slug', 'title', 'markdown', 'version'],
+              },
+            },
+            states: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  id: { type: 'string' },
+                  spaceId: { type: 'string' },
+                  slotKey: { type: 'string' },
+                  text: { type: 'string' },
+                  updatedAt: { type: 'number' },
+                  revisionCount: { type: 'integer' },
+                },
+                required: ['id', 'spaceId', 'slotKey', 'text', 'revisionCount'],
+              },
             },
           },
+          required: ['action', 'spaceId', 'totalPages', 'pages', 'states'],
         },
-        required: ['denied', 'chars', 'elapsedMs', 'hits'],
-      },
-      render: (_args, value) => {
-        if (value.denied) {
-          return textBlock(`没有记载（${value.reason}${value.detail ? `：${value.detail}` : ''}）`);
-        }
-        const lines = value.hits.map((h) => `[${h.id} ch${h.chapter}${h.truncated ? ` 截断 ${h.windowStart}:${h.windowEnd}` : ''} 版本 ${h.version}] ${h.text}`);
-        const head = value.conflictLine ? `${value.conflictLine}\n\n` : '';
-        return textBlock(`${head}命中 ${value.hits.length} 段，共 ${value.chars} 字：\n\n${lines.join('\n\n')}`);
-      },
-    },
-    isConcurrencySafe: () => false,
-    // 链本体在 runRecall（只读服务契约共用同一条链），这里只是入参透传。
-    async execute(args) {
-      return runRecall(args);
-    },
-  }));
-
-  track(ctx.tools.register({
-    name: 'memjudge_read',
-    description: '按记忆 id 分页读取原文。续页传入首页 version 校验内容；offset 和 nextOffset 是 UTF-16 码元偏移；读取不刷新访问时间。',
-    parameters: {
-      type: 'object', additionalProperties: false,
-      properties: {
-        id: { type: 'string', description: '召回结果中的记忆 id。' },
-        offset: { type: 'integer', minimum: 0, description: '起始偏移，默认 0。' },
-        limit: { type: 'integer', minimum: 2, maximum: 2000, description: '每页 2..2000 个 UTF-16 码元，默认 2000。' },
-        version: { type: 'string', description: '首页返回的原文版本，续页传入以检查内容变化。' },
-      }, required: ['id'],
-    },
-    output: {
-      schema: {
-        type: 'object', additionalProperties: false,
-        properties: {
-          found: { type: 'boolean' }, id: { type: 'string' }, text: { type: 'string' },
-          offset: { type: 'integer' }, nextOffset: { type: 'integer' },
-          total: { type: 'integer' }, truncated: { type: 'boolean' },
-          version: { type: 'string' },
-        }, required: ['found', 'id', 'text', 'offset', 'nextOffset', 'total', 'truncated'],
-      },
-      render: (_args, value) => textBlock(JSON.stringify(value)),
-    },
-    isConcurrencySafe: () => false,
-    execute({ id, offset = 0, limit = 2000, version }) {
-      assertHealthy();
-      if (typeof id !== 'string' || !id || !Number.isSafeInteger(offset) || offset < 0 ||
-          !Number.isSafeInteger(limit) || limit < 2 || limit > 2000 ||
-          (version !== undefined && (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version)))) throw new Error('memjudge_read: invalid arguments');
-      const row = store.get(id, false);
-      if (!row) {
-        if (version !== undefined) throw new Error('memjudge_read: stale version');
-        return { found: false, id, text: '', offset: 0, nextOffset: 0, total: 0, truncated: false };
-      }
-      const text = row.text;
-      const currentVersion = createHash('sha256').update(text, 'utf16le').digest('hex');
-      if (version !== undefined && version !== currentVersion) throw new Error('memjudge_read: stale version');
-      if (offset > text.length || (offset > 0 && offset < text.length &&
-          text.charCodeAt(offset - 1) >= 0xD800 && text.charCodeAt(offset - 1) <= 0xDBFF &&
-          text.charCodeAt(offset) >= 0xDC00 && text.charCodeAt(offset) <= 0xDFFF)) {
-        throw new Error('memjudge_read: invalid offset');
-      }
-      let end = Math.min(text.length, offset + limit);
-      if (end < text.length && text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF &&
-          text.charCodeAt(end) >= 0xDC00 && text.charCodeAt(end) <= 0xDFFF) end--;
-      return { found: true, id, text: text.slice(offset, end), offset, nextOffset: end, total: text.length, truncated: end < text.length, version: currentVersion };
-    },
-  }));
-
-  track(ctx.tools.register({
-    name: 'memjudge_forget',
-    description:
-      '从 memjudge 长期记忆里物理删除条目（不可恢复）。按 id 精确删，或按 query 检索命中后删前 limit 条。'
-      + '先用 dryRun=true 看会删哪些，确认后再真删。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        id: { type: 'string', description: '要删除的记忆 id。' },
-        source: { type: 'string', description: '精确删除该已知来源的全部位置；保留其他来源。优先于 id/query。' },
-        query: { type: 'string', description: '按检索命中批量删除。与 id 同时给时以 id 优先。' },
-        limit: { type: 'integer', description: 'query 模式最多删几条，1..100。默认 10。' },
-        dryRun: { type: 'boolean', description: '只列出将删除的 id，不落库。' },
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          forgotten: { type: 'array', items: { type: 'string' } },
-          count: { type: 'integer' },
-          dryRun: { type: 'boolean' },
+        render: (_args, value) => {
+          if (value.action === 'read') {
+            if (!value.page) return textBlock('未找到对应的 Wiki 知识页。');
+            return textBlock(`# ${value.page.title} (${value.page.slug} v${value.page.version})\n\n${value.page.markdown}`);
+          }
+          const header = value.action === 'compile'
+            ? `已完成增量编译（编译 ${value.compiled ?? 0} 页）：共 ${value.totalPages} 页 Wiki，${value.states.length} 项单活状态`
+            : `当前可见 Wiki 知识页 ${value.totalPages} 页，单活状态 ${value.states.length} 项`;
+          const pLines = value.pages.slice(0, 20).map(
+            (p) => `- [${p.spaceId}] ${p.slug} (v${p.version}${p.dirty ? ', dirty' : ''}): ${p.title}（源记忆 ${p.sourceIds?.length ?? 0} 条）`,
+          );
+          const sLines = value.states.slice(0, 20).map(
+            (s) => `- [${s.spaceId}] ${s.slotKey} = ${inlineText(s.text, 72)}（修订 ${s.revisionCount} 次）`,
+          );
+          return textBlock(
+            [
+              header,
+              pLines.length ? `\n【Wiki 知识页】\n${pLines.join('\n')}` : '',
+              sLines.length ? `\n【单活 State 快照】\n${sLines.join('\n')}` : '',
+            ].filter(Boolean).join('\n'),
+          );
         },
-        required: ['forgotten', 'count', 'dryRun'],
       },
-      render: (_args, value) => textBlock(
-        value.count === 0
-          ? '没有匹配到要遗忘的条目'
-          : `${value.dryRun ? '将遗忘' : '已遗忘'} ${value.count} 条：${value.forgotten.join(', ')}`,
-      ),
-    },
-    isConcurrencySafe: () => false,
-    async execute(args) {
-      const dryRun = args?.dryRun === true;
-      assertHealthy();
-      const runForget = (opts) => {
-        try {
-          return store.forget(opts);
-        } catch (err) {
-          if (fault) throw fault;
-          throw err;
-        }
-      };
-      if (args?.source !== undefined) {
-        const result = runForget({ source: args.source, dryRun });
+      isConcurrencySafe: (args) => (args?.action ?? 'list') !== 'compile',
+      async execute(args, exec) {
         assertHealthy();
-        if (!dryRun) { invalidate(); touchWiki(); }
-        return { forgotten: result.forgotten, count: result.count, dryRun };
-      }
-      const ids = [];
-      if (args?.id) {
-        ids.push(String(args.id));
-      } else if (args?.query) {
-        const limit = clampInt(args?.limit, 1, 100, 10);
-        const found = getIndex().search(String(args.query), { maxChars: 1e9, limit: 1e6, now: now() });
-        for (const hit of found.hits.slice(0, limit)) ids.push(hit.id);
-      }
-      if (!ids.length) return { forgotten: [], count: 0, dryRun };
-      if (dryRun) return { forgotten: ids, count: ids.length, dryRun: true };
+        const rawAction = typeof args?.action === 'string' ? args.action : 'list';
+        const action = rawAction === 'get' ? 'read' : rawAction;
+        const limit = clampInt(args?.limit, 1, 100, 50);
 
-      const removed = runForget({ ids }).forgotten;
-      assertHealthy();
-      invalidate();
-      // 删除同样改变 raw：投影必须跟着重建，否则 wiki 里会留着已经忘掉的块。
-      touchWiki();
-      return { forgotten: removed, count: removed.length, dryRun: false };
-    },
-  }));
+        let targetSpace = typeof args?.space === 'string' && args.space.trim() ? args.space.trim() : '';
+        if (targetSpace && targetSpace !== 'all') {
+          targetSpace = normalizeExplicitSpaceId(targetSpace, exec?.agent?.session ?? null);
+        } else if (!targetSpace) {
+          const session = exec?.agent?.session ?? null;
+          const header = session?.header ?? null;
+          if (session || header?.cwd) {
+            const sc = resolveScope({ session, agent: exec?.agent, header, cwd: header?.cwd });
+            ensureSpaceRegistered(sc);
+            targetSpace = sc.spaceId;
+          } else {
+            targetSpace = 'all';
+          }
+        }
 
-  track(ctx.tools.register({
-    name: 'memjudge_demote',
-    description:
-      '把一条记忆从 person/promise 降级为 event：正文、来源、访问记录全部保留，只改分类与衰减层级。'
-      + '误判纠正用这个，不要用 memjudge_forget——删了正文就再也捞不回来。'
-      + '降级后该条从 Pinned（tier 1）落到 event 档（tier 3），可随 nightly 正常升降；'
-      + '召回仍能命中，只是不再常驻注入面的「人：/约：」两段。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        id: { type: 'string', description: '要降级的记忆 id（memjudge_recall 返回的 id）。' },
-      },
-      required: ['id'],
-    },
-    output: {
-      schema: {
-        type: 'object', additionalProperties: false,
-        properties: {
-          found: { type: 'boolean' },
-          id: { type: 'string' },
-          changed: { type: 'boolean' },
-          kindBefore: { type: 'string' },
-          tierBefore: { type: 'integer' },
-          kind: { type: 'string' },
-          tier: { type: 'integer' },
-        },
-        required: ['found', 'id', 'changed', 'kindBefore', 'tierBefore', 'kind', 'tier'],
-      },
-      render: (_args, value) => textBlock(
-        !value.found
-          ? `没有找到 id=${value.id} 的记忆`
-          : value.changed
-            ? `已把 ${value.id} 从 ${value.kindBefore}（tier ${value.tierBefore}）降级为 ${value.kind}（tier ${value.tier}）`
-            : `${value.id} 已经是 ${value.kind}（tier ${value.tier}），无需改动`,
-      ),
-    },
-    isConcurrencySafe: () => false,
-    execute(args) {
-      assertHealthy();
-      const id = typeof args?.id === 'string' ? args.id.trim() : '';
-      if (!id) throw new Error('memjudge_demote: id 必须是非空字符串');
-      const result = store.setKind(id, 'event');
-      assertHealthy();
-      if (!result) return { found: false, id, changed: false, kindBefore: '', tierBefore: 0, kind: '', tier: 0 };
-      if (result.changed) {
-        invalidate();
-        // 分类变了，wiki 的块归属也跟着变：投影必须重建，否则「人：」段里会留着已降级的条目。
-        touchWiki();
-      }
-      return {
-        found: true,
-        id: result.id,
-        changed: result.changed,
-        kindBefore: result.kindBefore,
-        tierBefore: result.tierBefore,
-        kind: result.kind,
-        tier: result.tier,
-      };
-    },
-  }));
+        let compiled = 0;
+        if (action === 'compile') {
+          const comp = compileWikiNow({ spaceId: targetSpace === 'all' ? undefined : targetSpace });
+          compiled = comp.compiled;
+        }
 
-  track(ctx.tools.register({
-    name: 'memjudge_conflicts',
-    description:
-      '列出 memjudge 记忆里前后矛盾的数值：同一单位出现两个不同值，且两句共享同一个名词。'
-      + '按章聚合后判断（同一份文档里前后说法不一致才算矛盾）。返回每组矛盾的取值序列与'
-      + '按时间取的最新值。注意 current 是结构规则的结果：原文自带「已作废」「现予更正」这类'
-      + '措辞时，最新值可能落在复述旧值的那一句上，此时以 evidence 里的原句为准。'
-      + '判据不看措辞——「发现矛盾」靠的是同单位不同值 + 共享名词，不是「更正」二字。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        limit: { type: 'integer', description: '最多返回几组矛盾，1..50。默认 20。' },
+        const spacesFilter = targetSpace === 'all' ? undefined : visibleSpaces(targetSpace);
+        const rawPages = typeof store.listWikiPages === 'function'
+          ? store.listWikiPages({
+              ...(spacesFilter ? { spaces: spacesFilter } : {}),
+              limit,
+            })
+          : [];
+
+        const mapPage = (p) => {
+          const pid = String(p.pageId ?? p.id ?? '');
+          const md = String(p.summary ?? p.markdown ?? '');
+          return {
+            id: pid,
+            spaceId: String(p.spaceId ?? GLOBAL_SPACE_ID),
+            slug: String(p.slug ?? ''),
+            title: String(p.title ?? p.slug ?? ''),
+            summary: md,
+            markdown: md,
+            sourceIds: Array.isArray(p.sourceIds) ? p.sourceIds : [],
+            dirty: Boolean(p.dirty),
+            version: Number(p.version ?? 1),
+            updatedAt: Number(p.updatedAt ?? 0),
+          };
+        };
+
+        const pages = rawPages.map(mapPage);
+        const stateRows = typeof store.byCategory === 'function'
+          ? store.byCategory('state', {
+              ...(spacesFilter ? { spaces: spacesFilter } : {}),
+              limit,
+            })
+          : [];
+        const states = stateRows.map((s) => {
+          const revs = typeof store.listRevisions === 'function' ? store.listRevisions(s.id) : [];
+          return {
+            id: s.id,
+            spaceId: s.spaceId ?? GLOBAL_SPACE_ID,
+            slotKey: s.slotKey ?? '',
+            text: s.text,
+            updatedAt: Number(s.updatedAt ?? s.createdAt ?? 0),
+            revisionCount: revs.length,
+          };
+        });
+
+        if (action === 'read') {
+          const slug = typeof args?.slug === 'string' ? args.slug.trim() : '';
+          if (!slug) throw new Error('memjudge_wiki: action="read" 时必须提供非空 slug');
+          const hit = pages.find((p) => p.slug === slug || p.id === slug) ?? null;
+          return {
+            action: 'read',
+            spaceId: targetSpace,
+            totalPages: pages.length,
+            ...(hit ? { page: hit } : {}),
+            pages: hit ? [hit] : [],
+            states,
+          };
+        }
+
+        return {
+          action,
+          spaceId: targetSpace,
+          ...(action === 'compile' ? { compiled } : {}),
+          totalPages: pages.length,
+          pages,
+          states,
+        };
       },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          conflicts: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                key: { type: 'string' },
-                attr: { type: 'string' },
-                unit: { type: 'string' },
-                values: { type: 'array', items: { type: 'string' } },
-                current: { type: 'string' },
-                currentMemId: { type: 'string' },
-                supersededValues: { type: 'array', items: { type: 'string' } },
-              },
-              required: ['key', 'attr', 'unit', 'values', 'current', 'currentMemId', 'supersededValues'],
-            },
+    }));
+
+    // -------------------------------------------------------------- 只读服务契约
+
+    if (typeof ctx?.provide === 'function') {
+      track(ctx.provide(SERVICE_NAME, createService(ctx, {
+        store,
+        guard: assertHealthy,
+        contentVersion: () => contentGeneration,
+        recall: (query, opts) => runRecall(
+          {
+            query,
+            budget: opts?.budget,
+            topChapters: opts?.topChapters,
+            space: opts?.spaceId ?? opts?.space,
           },
-          total: { type: 'integer' },
-          supersededCount: { type: 'integer' },
-        },
-        required: ['conflicts', 'total', 'supersededCount'],
-      },
-      render: (_args, value) => textBlock(
-        value.total === 0
-          ? '未发现前后矛盾'
-          : `发现 ${value.total} 组矛盾：\n\n${value.conflicts
-            .map((c) => `- ${c.attr}（${c.unit}）：${c.values.join(' → ')}，现取 ${c.current}（${c.currentMemId}）`)
-            .join('\n')}`,
-      ),
-    },
-    isConcurrencySafe: () => true,
-    async execute(args) {
-      const limit = clampInt(args?.limit, 1, 50, 20);
-      const result = resolveConflict(chapterRows());
-      return {
-        conflicts: result.conflicts.slice(0, limit).map((c) => ({
-          key: c.key,
-          attr: String(c.attr ?? ''),
-          unit: String(c.unit ?? ''),
-          values: c.values,
-          current: c.current,
-          currentMemId: String(c.currentMemId ?? ''),
-          supersededValues: c.supersededValues,
-        })),
-        total: result.conflicts.length,
-        supersededCount: result.superseded.length,
-      };
-    },
-  }));
+          { touch: false },
+        ),
+      })));
+    }
 
-  track(ctx.tools.register({
-    name: 'memjudge_stats',
-    description:
-      'memjudge 的库体与索引体检：条目数、三分条数（person/promise/event）、三元组数、'
-      + '正文与文件字节、是否在 200KB 预算内、倒排规模、当前注入开关与字符数。'
-      + '排查「为什么查不到」时先看这个。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        verbose: { type: 'boolean', description: '附带库路径与配置快照。' },
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          memories: { type: 'integer' },
-          facts: { type: 'integer' },
-          kinds: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              person: { type: 'integer' },
-              promise: { type: 'integer' },
-              event: { type: 'integer' },
-            },
-            required: ['person', 'promise', 'event'],
-          },
-          textChars: { type: 'integer' },
-          bytes: { type: 'integer' },
-          limitBytes: { type: 'integer' },
-          withinLimit: { type: 'boolean' },
-          docs: { type: 'integer' },
-          terms: { type: 'integer' },
-          postings: { type: 'integer' },
-          chapters: { type: 'integer' },
-          injectEnabled: { type: 'boolean' },
-          injectChars: { type: 'integer' },
-          injectBudget: { type: 'integer' },
-          dbPath: { type: 'string' },
-          tidy: { type: 'string', description: 'layer 四阶段后台整理（mneme sleep 同构）的一句话结论。' },
-          modules: { type: 'string', description: '各增强模块的开关状态（ON/OFF）与是否有密钥。' },
-          keyConfigured: { type: 'boolean' },
-          keySource: { type: 'string' },
-          panelPath: { type: 'string', description: '可视化面板 HTML 的生成路径。' },
-          wiki: { type: 'string', description: 'wiki 编译层投影状态：版本、块数、编译次数、Grounding 结论。' },
-        },
-        required: [
-          'memories', 'facts', 'kinds', 'textChars', 'bytes', 'limitBytes', 'withinLimit',
-          'docs', 'terms', 'postings', 'chapters',
-          'injectEnabled', 'injectChars', 'injectBudget', 'dbPath',
-          'modules', 'keyConfigured', 'keySource', 'panelPath',
-        ],
-      },
-      render: (_args, value) => textBlock(
-        `记忆 ${value.memories} 条 / 三元组 ${value.facts} 条 / 正文 ${value.textChars} 字\n`
-        + `三分 人 ${value.kinds.person} / 约 ${value.kinds.promise} / 事 ${value.kinds.event}\n`
-        + `库体 ${(value.bytes / 1024).toFixed(1)}KB（上限 ${(value.limitBytes / 1024).toFixed(0)}KB，${value.withinLimit ? '在预算内' : '超预算'}）\n`
-        + `倒排 ${value.terms} 词 / ${value.postings} 条 posting / ${value.chapters} 章\n`
-        + `后台整理 ${value.tidy ?? '未运行'}\n`
-        + `注入 ${value.injectEnabled ? `开启（${value.injectChars}/${value.injectBudget} 字符）` : '关闭（0 字符）'}\n`
-        + `wiki ${value.wiki}\n`
-        + `模块 ${value.modules}\n`
-        + `密钥 ${value.keyConfigured ? `已配置（${value.keySource}）` : '未配置——向量/重排/LLM 提取全部停用，走纯 BM25'}\n`
-        + `面板 ${value.panelPath}（node scripts/panel.mjs --open 刷新）`,
-      ),
-    },
-    isConcurrencySafe: () => true,
-    async execute(args) {
-      const base = store.stats();
-      const ix = getIndex().stats();
-      const injectText = renderInject();
-      // layer 的整理阶段（mneme sleep 同构）在体检时报一次：每阶段独立 fail-safe，
-      // 一个阶段抛错只记进 errors，不影响统计输出。冲突阶段与 memjudge_conflicts 同源
-      // （要按章合并且文本），tier 提案要逐条的行（含 kind/tier/lastAccessed/accessCount），
-      // 所以第二份输入单独传。两边都只是报告，真正落库在 scripts/nightly.mjs。
-      const tidy = sleepPhase(chapterRows(), { tierRows: store.dump() });
-      const report = deps.configReport();
-      const out = {
-        memories: base.memories,
-        facts: base.facts,
-        kinds: base.kinds,
-        textChars: base.textChars,
-        bytes: base.bytes,
-        limitBytes: base.limitBytes,
-        withinLimit: base.withinLimit,
-        docs: ix.docs,
-        terms: ix.terms,
-        postings: ix.postings,
-        chapters: ix.chapters,
-        injectEnabled: cfg.autoInject,
-        injectChars: injectText.length,
-        injectBudget: cfg.injectBudget,
-        dbPath: args?.verbose === true ? store.path : '',
-        tidy: `${tidy.conflicts.length} 组待审矛盾 / ${tidy.archived.length} 条待降级`
-          + ` / ${tidy.tierWrites.length} 条 tier 提案`
-          + ` / ${tidy.relations.length} 条共现关系`
-          + (tidy.errors.length ? ` / ${tidy.errors.length} 阶段失败` : ''),
-        modules: (() => {
-          const r = report;
-          const f = r.flags;
-          return `jieba ${f.jieba ? 'ON' : 'OFF'} / 向量 ${f.vector ? 'ON' : 'OFF'}`
-            + ` / rerank ${f.rerank ? 'ON' : 'OFF'} / 扩展 ${f.expand ? 'ON' : 'OFF'}`
-            + ` / 选段 ${f.llmSelect ? 'ON' : 'OFF'} / LLM提取 ${f.llmExtract ? 'ON' : 'OFF'}`;
-        })(),
-        keyConfigured: report.hasKey,
-        keySource: report.keySource,
-        panelPath: path.join(STATE_DIR, 'panel.html'),
-        // wiki 投影是懒编的：体检会顺手把它建起来（只花内存，不写库、不动注入面）。
-        wiki: (() => {
-          const projected = getWiki();
-          if (!projected) return '未编译（编译异常已吞掉，raw 不受影响）';
-          const rt = wikiRuntime;
-          return `v${projected.version} 投影 ${projected.blocks.length} 块/${projected.grounding.status}`
-            + (rt.unverified ? `（Grounding 违规 ${rt.unverified} 处）` : '')
-            + ` / 编译 ${rt.compiles} 次，digest 命中跳过 ${rt.skipped} 次`;
-        })(),
-      };
-      return out;
-    },
-  }));
+    // -------------------------------------------------------------- 注入挂载（Section Tier-S + Context Tier-D）
 
-  // -------------------------------------------------------------- 只读服务契约
+    if (ctx?.systemPrompt && typeof ctx.systemPrompt.section === 'function') {
+      track(ctx.systemPrompt.section({
+        name: SECTION_NAME,
+        order: SECTION_ORDER,
+        interpolate: false,
+        text: renderSection,
+      }));
+    }
 
-  // 同进程其他插件（dsh-workbench 的收尾观测、面板类插件）读记忆库的唯一干净通路。
-  // RPC（rpc.mjs 的 /memjudge 频道）是 browser↔host 且 authority:'loopback'，对端插件
-  // 在 host 侧调不到；直接 import 对端 store.mjs 会把装机绝对路径写死，内部 API 一改就断。
-  // ctx.provide 是宿主自己的服务注册面，下游 `inject: ['memjudge']` 或 ctx.get 取用。
-  //
-  // 守卫不能省：test/plugin.test.mjs 的 MockContext 没有 provide（与之前 auto-capture
-  // 接线踩过的 `.on` 缺失同一个坑），无条件调用会让既有测试整体崩掉。
-  if (typeof ctx.provide === 'function') {
-    track(ctx.provide(SERVICE_NAME, createService(ctx, {
-      store,
-      guard: assertHealthy,
-      contentVersion: () => contentGeneration,
-      // 复用同一条召回链（runRecall），不另写一份；touch:false 保证「只读」名副其实——
-      // 下游每轮观测都调一次的话，刷新访问时间会把衰减数据冲成噪声。
-      recall: (query, opts) => runRecall(
-        { query, budget: opts?.budget, topChapters: opts?.topChapters },
-        { touch: false },
-      ),
-    })));
-  }
+    if (hasContextChannel) {
+      track(ctx.systemPrompt.context({
+        name: CONTEXT_NAME,
+        order: SECTION_ORDER,
+        interpolate: false,
+        text: renderTierDSync,
+      }));
+    } else if (typeof ctx?.on === 'function') {
+      // 无 systemPrompt.context 时的 agent/pre-step 兼容协同路径
+      track(ctx.on('agent/pre-step', async (input, next) => {
+        try {
+          if (!disposed && cfg.autoInject && shouldUseTieredMode({ agent: input?.agent, session: input?.agent?.session })) {
+            const session = input?.agent?.session ?? null;
+            const header = session?.header ?? {};
+            if (!isSubagentSession(session) && !isSubagentSession(header)) {
+              const msgs = Array.isArray(input?.messages) ? input.messages : [];
+              const lastMsg = msgs[msgs.length - 1];
+              const isToolSubstep = Boolean(lastMsg && lastMsg.role === 'tool');
+              const query = isToolSubstep ? '' : extractLatestUserQueryFromMessages(msgs);
+              if (query) {
+                const injectCtx = resolveInjectCtx({ agent: input?.agent, session });
+                const td = await injector.getTierD(query, {
+                  store,
+                  searchIndex: getIndex(),
+                  sessionId: injectCtx.sessionId,
+                  spaceId: injectCtx.spaceId,
+                  spaces: injectCtx.spaces,
+                  isToolSubstep,
+                  tierSMaxChars: Math.min(TIER_S_MAX_CHARS, cfg.tierSBudget),
+                  tierDMaxChars: Math.min(TIER_D_MAX_CHARS, cfg.tierDBudget),
+                  totalMaxChars: Math.min(TOTAL_INJECT_MAX_CHARS, cfg.injectBudget),
+                });
+                if (!disposed && td.text && Array.isArray(input?.messages)) {
+                  input.messages.unshift({
+                    role: 'user',
+                    content: [{ type: 'text', text: sanitizeWellFormed(td.text) }],
+                    source: { kind: 'runtime-context', form: 'snapshot', sections: [CONTEXT_NAME] },
+                  });
+                }
+              }
+            }
+          }
+        } catch {
+          // fail-open：动态召回异常绝不阻塞对话主循环
+        }
+        return typeof next === 'function' ? next() : input;
+      }));
+    }
 
-  // -------------------------------------------------------------- 注入
-
-  track(ctx.systemPrompt.section({
-    name: SECTION_NAME,
-    order: SECTION_ORDER,
-    // 记忆正文里可能出现 {{...}}，关掉插值免得被当成 prompt 变量。
-    interpolate: false,
-    text: renderInject,
-  }));
-
-  // -------------------------------------------------------------- 卸载
-
-  ctx.effect(() => dispose);
-  return { dispose, dbPath, config: cfg };
+    if (typeof ctx?.effect === 'function') {
+      ctx.effect(() => dispose);
+    }
+    return { dispose, dbPath, config: cfg, injector };
   } catch (err) {
     dispose();
     throw err;
@@ -1760,6 +2891,7 @@ export default {
   DEFAULTS,
   TOOL_NAMES,
   SECTION_NAME,
+  CONTEXT_NAME,
   SECTION_ORDER,
   INJECT_HARD_LIMIT,
 };

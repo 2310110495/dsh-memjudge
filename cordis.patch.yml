@@ -1,31 +1,31 @@
-# memjudge 的 cordis 补丁：把插件挂进 profile。
+# memjudge v2 的 cordis 补丁：把插件挂进 profile。
 #
 # 这里只放**非敏感**配置。密钥不进这个文件，也不进 git：
-#   写到 <DSH_HOME>/memjudge/secrets.json → {"llmKey":"你自己的key"}
-#   或注入环境变量 MEMJUDGE_LLM_KEY（CI / 容器场景）。
-# 两者都没有时插件照常工作：检索走纯 BM25，向量/重排/LLM 提取自动停用，
-# memjudge_stats 与面板都会明写「未配置密钥」。
+#   写到 <DSH_HOME>/memjudge/secrets.json → {"chatKey":"...","embedKey":"...","rerankKey":"..."}
+#   或注入环境变量 MEMJUDGE_CHAT_KEY / MEMJUDGE_EMBED_KEY / MEMJUDGE_RERANK_KEY。
+# 无密钥时插件 100% 离线工作：双边闭合轮走本地规则脱水，检索走 BM25 + entity_slots RRF 融合。
 - insert:
     - id: memjudge
       name: 'dsh-memjudge'
       config:
-        # 固定注入。默认关——能力 8 的 0 字符是优点，不是缺陷。
-        autoInject: false
-        # 单次注入字符上限，1..2000
-        injectBudget: 2000
-        # 实验性逐日注入排序；默认 legacy 保持原行为。daily 每次读取一致快照。
+        # v2 保 Prefix KV Cache 两段式动态注入（生产环境默认开启）
+        autoInject: true
+        injectMode: tiered
+        # Tier-S 冻结热底座 <= 600 chars，Tier-D 按问动态召回 <= 900 chars，单步合计 <= 1500 chars
+        tierSBudget: 600
+        tierDBudget: 900
+        injectBudget: 1500
+        # 双边闭合轮采集与异步脱水默认开启
+        autoCapture: true
+        # 实验性逐日注入排序（legacy / daily 兼容配置）
         experimentalInjectMode: legacy
-        # 仅 daily 事件排序使用，完整 24 小时计一天；取值分别为 0.5..3650 和 0..1。
         experimentalInjectHalfLifeDays: 30
         experimentalInjectFloor: 0.1
-        # dual 保持历史双档；改为 uniform 时启用下方统一半衰期，重载插件生效。
+        # 衰减模式与半衰期
         decayMode: dual
-        # uniform 模式半衰期（天），挂 lastAccessed
         halfLifeDays: 30
-        # 检索命中即刷新访问时间
         touchOnRecall: true
-        # 四个检索增强模块默认关：实测零收益的不进默认路径。
-        # 打开前先确认 secrets.json 里配了 key，否则它们会被强制关闭。
+        # 在线检索增强模块（需配置对应组 API Key 后开启）
         vector: false
         rerank: false
         expand: false

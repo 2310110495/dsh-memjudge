@@ -288,7 +288,9 @@ await check('recall 预算生效：budget=500 时返回 ≤500 字符', async ()
     clock = T0 + (chapter.n - 1) * DAY;
     for (const seg of segmentsOf(chapter)) await remember.execute(seg);
   }
-  const out = await tool(ctx, 'memjudge_recall').execute({ query: '主机功率是多少', budget: 500 });
+  // B-1 证据门生效后，问库里没有的「主机功率」会被正确拒答（语料只有「岸电功率」），
+  // 预算断言必须选库里真实存在的属性，否则测的就不是预算而是拒答门。
+  const out = await tool(ctx, 'memjudge_recall').execute({ query: '岸电功率是多少', budget: 500 });
   assert.ok(out.chars <= 500, `返回 ${out.chars} 字符，超过预算 500`);
   assert.ok(out.hits.length > 0, '预算 500 下不应零命中');
   ctx.dispose();

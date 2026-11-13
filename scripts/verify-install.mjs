@@ -4,11 +4,11 @@
 // 三项检查（默认全部跑完，任一项 FAIL 退出码非 0）：
 //   1. service  装机副本 `src/service.mjs` 存在、能 import 出 `createService`，且按契约
 //               能装出一个冻结的只读服务面（用假 store，不碰任何库）。
-//   2. sha256   源仓与装机副本**逐文件** SHA256 相等：`src/*.mjs` + `package.json` + `client.js`。
+//   2. sha256   源仓与装机副本**逐文件** SHA256 相等：src/*.mjs + package.json + client.js + cordis.patch.yml。
 //               装机目录是独立副本（不是符号链接），改了源不同步 = 线上跑的是旧代码。
-//   3. tier     库文件能打开，`memories` 表含 `tier` 列（schema v7）。
-//               用**只读连接** `PRAGMA table_info`，绝不写库；库还是 v6 时输出
-//               `tier:pending(v6)` 并退 0 —— 迁移由插件下次启动完成，不是装机故障。
+//   3. tier     只读验证 schema v8、8 张必需 STRICT 表、memories 关键列及 integrity/FK。
+//               旧 v6/v7 只报告 pending（不迁移）；--require-v8 将旧库/缺库视为发布失败。
+//               核验通过不证明原宿主已加载该版本；必须另做实际宿主检查。
 //
 // 输出格式：每个检查一行 `ok <检查名>` 或 `FAIL <检查名>`，结尾一行汇总。
 //
@@ -17,6 +17,9 @@
 //   node scripts/verify-install.mjs --json             # 同上，附带机读 JSON
 //   node scripts/verify-install.mjs --install <dir>     # 指定装机目录
 //   node scripts/verify-install.mjs --db <file>         # 指定库文件
+//   node scripts/verify-install.mjs --require-v8        # 发布门禁：旧库/缺库必须失败
+// v2 检查包括 cordis.patch.yml 和 v8 STRICT 表/完整性/外键；旧库仅 pending，不自动迁移。
+// 文件与只读库检查不证明当前宿主已经加载这些文件。
 
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -41,13 +44,13 @@ const DB = path.resolve(
   opt('--db', path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'memjudge', 'memjudge.db')),
 );
 
-/** 参与哈希比对的相对路径：`src/*.mjs` + `package.json` + `client.js`（不要求全量）。 */
+/** 参与哈希比对的核心部署清单；不冒称 docs/tests/scripts 全量一致或宿主已加载。 */
 function manifestOf(root) {
   const srcDir = path.join(root, 'src');
   const names = fs.existsSync(srcDir)
     ? fs.readdirSync(srcDir).filter((f) => f.endsWith('.mjs')).sort()
     : [];
-  return [...names.map((f) => 'src/' + f), 'package.json', 'client.js'];
+  return [...names.map((f) => 'src/' + f), 'package.json', 'client.js', 'cordis.patch.yml'];
 }
 
 const sha256Of = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -100,15 +103,18 @@ function checkSha256() {
     err.detail = parts;
     throw err;
   }
-  return `${same} 个文件逐一相同（src/*.mjs ${list.length - 2} + package.json + client.js）`;
+  return `${same} 个文件逐一相同（src/*.mjs ${list.length - 3} + package.json + client.js + cordis.patch.yml）`;
 }
 
 /**
- * 检查 3：库能只读打开，`memories` 表有 tier 列。
+ * 检查 3：只读验证 v8 核心结构、完整性及外键；旧库不迁移。
  * @returns {{ status:'ok'|'pending'|'skip', detail:string }}
  */
 async function checkTier() {
-  if (!fs.existsSync(DB)) return { status: 'skip', detail: `库不存在（${DB}），本机还没跑过插件` };
+  if (!fs.existsSync(DB)) {
+    if (has('--require-v8')) throw new Error('Schema v8 required; database does not exist');
+    return { status: 'skip', detail: `库不存在（${DB}），本机还没跑过插件` };
+  }
   let DatabaseSync;
   try {
     ({ DatabaseSync } = await import('node:sqlite'));
@@ -124,22 +130,28 @@ async function checkTier() {
     if (!table) throw new Error('库里没有 memories 表');
     const cols = db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name);
     let ver = '?';
-    try {
-      const row = db.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version');
-      if (row && row.v != null) ver = String(row.v);
-    } catch {
-      /* 老库没有 meta 表：版本号当未知，只看列 */
+    const metaCols = db.prepare('PRAGMA table_info(meta)').all().map(c => c.name);
+    if (metaCols.includes('key') && metaCols.includes('value')) {
+      ver = String(db.prepare('SELECT value AS v FROM meta WHERE key = ?').get('schema_version')?.v ?? '?');
+    } else if (metaCols.includes('k') && metaCols.includes('v')) {
+      ver = String(db.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version')?.v ?? '?');
     }
-    if (cols.includes('tier')) {
-      return { status: 'ok', detail: `tier:ok(v${ver}) memories ${cols.length} 列，含 tier` };
+    if (ver === '6' || ver === '7') {
+      if (has('--require-v8')) throw new Error('Schema v8 required; found v' + ver);
+      return { status: 'pending', detail: 'schema:pending(v' + ver + ') — requires explicit safe migration; read-only check did not migrate' };
     }
-    if (ver === '6') {
-      return {
-        status: 'pending',
-        detail: `tier:pending(v6) 无 tier 列 —— 等插件下次启动自动迁移（本次只读，未写库）`,
-      };
-    }
-    throw new Error(`库自称 v${ver} 却没有 tier 列（列：${cols.join(',')}）`);
+    if (ver !== '8') throw new Error('Expected schema v8; found ' + ver);
+    const needed = ['memories', 'memory_revisions', 'entity_slots', 'vectors', 'wiki_pages', 'ingest_queue', 'spaces', 'meta'];
+    const tables = new Map(db.prepare('PRAGMA table_list').all().filter(t => t.schema === 'main').map(t => [t.name, t]));
+    const missing = needed.filter(name => !tables.has(name) || tables.get(name).strict !== 1);
+    if (missing.length) throw new Error('v8 tables missing or not STRICT: ' + missing.join(', '));
+    const requiredCols = ['tier', 'space_id', 'category', 'slot_key', 'content_hash', 'status'];
+    const absentCols = requiredCols.filter(name => !cols.includes(name));
+    if (absentCols.length) throw new Error('v8 memories columns missing: ' + absentCols.join(', '));
+    const integrity = db.prepare('PRAGMA integrity_check').all();
+    if (integrity.length !== 1 || Object.values(integrity[0])[0] !== 'ok') throw new Error('SQLite integrity_check failed');
+    if (db.prepare('PRAGMA foreign_key_check').all().length) throw new Error('SQLite foreign_key_check failed');
+    return { status: 'ok', detail: 'schema:ok(v8), 8 required STRICT tables, integrity and foreign keys ok (read-only)' };
   } finally {
     db.close();
   }
@@ -202,5 +214,5 @@ if (failed.length) {
   console.log(`结论：${failed.map((r) => r.name).join(', ')} 未通过`);
   process.exitCode = 1;
 } else {
-  console.log('结论：装机一致');
+  console.log(pending || skip ? '结论：文件一致，但数据库核验有 pending/skip；未证明投产或宿主已加载' : '结论：文件与数据库只读核验一致；未证明宿主已加载');
 }

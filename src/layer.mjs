@@ -1,29 +1,27 @@
-// memjudge 图层——索引 + 图层加权 + 后台整理（t4 升级）
+// memjudge 图层——索引 + 图层加权 + 衰减分层 + 后台整理（Schema v8 & v2 升级）
 //
-// 为什么不是「整章当候选」：
-//   baseline-bm25 把整章（1480 字）当一条文档，top-3 返回 5566 字符/次，recall 0.989。
-//   同样是 0.989，本实现的段级返回只要 1220 字符/次（现场实测，见 test 输出）。
-//   整章倾倒的成本是给模型的上下文里塞了 4.5 倍无关文字，而召回率一点没多。
-//
-// 为什么中文必须二元组：
-//   mem-eval 实测里，中文不分词（按空白/标点切）的插件全部崩盘——aik358 0.033、
-//   annkun 0.098、memory-eternal 0.163、veyra 0.424。中文没有词边界，按字切则
-//   「舱壁」「凹陷」这类两字术语永远不会成为独立 token。二元组是零词典、零训练、
-//   对 OOV 完全鲁棒的折中：任意两字组合都进索引，代价是索引变大、单字歧义变多。
-//
-// t4 升级（来源：soul-md memory-recall.js + prime-memory graph/search.ts + mneme dream/sleep.js）：
-//   1. 索引 → soul-md 的 queryTerms/searchTopics/renderRecall：只渲染 descriptor rows
-//      （key + title + summary），不注入正文。这是「索引型记忆」的标准做法——给模型看目录，
-//      让它自己决定要不要读正文。实测 soul-md 只给描述行 recall=0.06，跟进读正文后 0.989。
-//   2. 图层 → prime-memory 的 GRAPH_FIELD_WEIGHTS 字段加权：name×6 / aliases×5 / tags×5 /
-//      currentState×4 / facts×4 / relations×3 / type×2。名称是实体最强身份信号，关系词最弱。
-//      阶梯注释固化「何时升级」的阈值，避免提前引入重型方案。
-//   3. 后台整理 → mneme 的 dream/sleep.js 四阶段 fail-safe：冲突消解 → 归档降级 → 模式发现 →
-//      关系补全。每阶段独立包裹，一个失败不拖垮其他。跨 scope 对永远人工审，不进 LLM。
+// 架构对齐《memjudge-v2-架构与实施计划书》：
+//   1. 衰减与分层：基于 Schema v8 五类法定范畴（rule/profile/decision/experience/state）
+//      及真实访问时间 lastAccessed/last_accessed_at、访问频次 accessCount/access_count、
+//      重要性 importance 计算加权衰减分与动态分层。
+//      - rule / profile / state 恒温常驻（L0，永不衰减，衰减分=1.0）
+//      - decision / experience 温水原子（L1，基于双半衰期艾宾浩斯衰减与命中频次增强）
+//   2. 兼容性导出：保留存量导出（queryTerms, searchTopics, renderRecall, GRAPH_FIELD_WEIGHTS,
+//      searchGraphNodes, sleepPhase, WIKI_VERSION, TRIAGE, PAGE_STATUS, compileWiki, diffWiki,
+//      groundingViolations, planWrite, triageMark, parseTriageMark, rawDigest, conflictJudgments），
+//      并新增规范要求导出的 decayScore, computeTier, partitionMemories。
 
-import { norm, splitSentences, extractQuantities, extractFacts, resolveConflict, decayWeight, fitBudget, CONFLICT_THRESHOLDS } from './judge.mjs';
-// tier 的口径（默认值、钳位、升降阈值）只有一份真源，在 store.mjs 里与列定义同处。
-// 依赖方向是单向的：layer → store（store 不认识 layer），不会成环。
+import {
+  norm,
+  splitSentences,
+  extractQuantities,
+  extractFacts,
+  resolveConflict,
+  decayWeight,
+  fitBudget,
+  CONFLICT_THRESHOLDS,
+} from './judge.mjs';
+
 import {
   normalizeKind,
   normalizeTier,
@@ -33,17 +31,181 @@ import {
   TIER_PROMOTE_ACCESS,
 } from './store.mjs';
 
+import {
+  TIER_L0,
+  TIER_L1,
+  TIER_L2,
+  TIER_L3,
+  normalizeCategory,
+  kindToCategory,
+} from './schema.mjs';
+
+const DAY_MS = 86400000;
+
+// ── v8 动态加权衰减与分层引擎（decayScore / computeTier / partitionMemories） ──
+
+/**
+ * 判断条目是否显式 Pinned 或处于核心恒温层（L0）。
+ * 注意：必须严格区分 v8 的 TIER_L1 (1) 与旧版 MEMORY_TIER_PINNED (1)。
+ * 只有在显式 pinned 字段为真、tier 为 0 或 category 为 rule/profile/state 时才视为 L0。
+ */
+function isL0Constant(mem, cat) {
+  if (cat === 'rule' || cat === 'profile' || cat === 'state') return true;
+  if (mem.pinned === true || mem.pinned === 1) return true;
+  if (mem.tier === TIER_L0) return true;
+  // 旧版兼容器：若明确声明了旧版 kind 为 person / promise，即使 tier 是 1 也算 pinned
+  if (mem.kind === 'person' || mem.kind === 'promise') return true;
+  return false;
+}
+
+/**
+ * 计算记忆条目的综合动态衰减分（0.0 ~ 1.0）。
+ *
+ * 核心规则：
+ * 1. rule / profile / state（以及人工 pinned）为 L0 恒温层，永不衰减，固定返回 1.0。
+ * 2. 状态为 superseded 或 archived 的条目，基底衰减折半。
+ * 3. 基于 lastAccessed 时间差与双半衰期模型计算艾宾浩斯遗忘曲线：
+ *    - 双半衰期：近期半衰期（如 7 天）快速过滤一次性噪声；远期半衰期（如 30 天）平缓保持稳定记忆。
+ * 4. 访问频次 log 强化：每次命中展宽遗忘曲线，高频访问条目衰减地板提升。
+ * 5. importance 重要度兜底：高重要度（>=0.6）提供 0.6 的衰减地板。
+ *
+ * @param {object} mem 记忆对象或行记录
+ * @param {number} [now] 当前时间戳（ms）
+ * @param {object} [opts] 参数（halfLifeDays, longHalfLifeDays, floor, importanceFloor）
+ * @returns {number} 归一化衰减分 0.0 ~ 1.0
+ */
+export function decayScore(mem, now = Date.now(), opts = {}) {
+  if (!mem || typeof mem !== 'object') return 0;
+
+  // 范畴判定：支持 category 与 legacy kind
+  const cat = mem.category
+    ? normalizeCategory(mem.category)
+    : (mem.kind ? kindToCategory(mem.kind) : 'experience');
+
+  if (isL0Constant(mem, cat)) {
+    return 1.0;
+  }
+
+  const {
+    halfLifeDays = 7,
+    longHalfLifeDays = 30,
+    floor = 0.15,
+    importanceFloor = 0.6,
+  } = opts;
+
+  const lastAccess = Number.isFinite(mem.lastAccessed)
+    ? mem.lastAccessed
+    : Number.isFinite(mem.last_accessed_at)
+      ? mem.last_accessed_at
+      : (Number.isFinite(mem.created_at) ? mem.created_at : (Number.isFinite(mem.createdAt) ? mem.createdAt : now));
+
+  const accessCount = Number(mem.accessCount ?? mem.access_count ?? 0) || 0;
+  const importance = Number(mem.importance ?? 0) || 0;
+  const status = typeof mem.status === 'string' ? mem.status : 'active';
+
+  const idleDays = Math.max(0, (now - lastAccess) / DAY_MS);
+
+  // 双半衰期热度模型：
+  // 短期衰减权重 0.7，长期平缓权重 0.3
+  const shortDecay = Math.pow(0.5, idleDays / Math.max(1, halfLifeDays));
+  const longDecay = Math.pow(0.5, idleDays / Math.max(halfLifeDays, longHalfLifeDays));
+  let base = 0.7 * shortDecay + 0.3 * longDecay;
+
+  // 重要度地板
+  const effFloor = importance >= importanceFloor ? Math.max(floor, 0.6) : floor;
+  base = Math.max(effFloor, base);
+
+  // 访问频次强化：log2(1 + count) 增益
+  const freqBoost = 1 + 0.18 * Math.log2(1 + accessCount);
+  let score = base * freqBoost;
+
+  // 失效/归档条目惩罚
+  if (status === 'superseded') {
+    score *= 0.5;
+  } else if (status === 'archived') {
+    score *= 0.25;
+  }
+
+  return Math.min(1.0, Math.max(0.0, score));
+}
+
+/**
+ * 根据衰减分与元数据判定记忆所属的层级（Tier 0 ~ Tier 3 / L0 ~ L3）。
+ *
+ * @param {object} mem 记忆对象
+ * @param {number} [now] 当前时间戳
+ * @param {object} [opts] 参数（scoreThresholdL1, scoreThresholdL2）
+ * @returns {number} 0 (L0), 1 (L1), 2 (L2), 3 (L3)
+ */
+export function computeTier(mem, now = Date.now(), opts = {}) {
+  if (!mem || typeof mem !== 'object') return TIER_L3;
+
+  const cat = mem.category
+    ? normalizeCategory(mem.category)
+    : (mem.kind ? kindToCategory(mem.kind) : 'experience');
+
+  if (isL0Constant(mem, cat)) {
+    return TIER_L0;
+  }
+
+  const status = typeof mem.status === 'string' ? mem.status : 'active';
+  if (status === 'archived') {
+    return TIER_L3;
+  }
+
+  const score = decayScore(mem, now, opts);
+  const l1Threshold = opts.scoreThresholdL1 ?? 0.65;
+  const l2Threshold = opts.scoreThresholdL2 ?? 0.35;
+
+  if (score >= l1Threshold) return TIER_L1;
+  if (score >= l2Threshold) return TIER_L2;
+  return TIER_L3;
+}
+
+/**
+ * 按 L0 ~ L3 四级对记忆集合进行热冷分层划分。
+ *
+ * @param {Array<object>} memories 记忆集合
+ * @param {number} [now] 当前时间戳
+ * @param {object} [opts] 选项
+ * @returns {{ L0: Array, L1: Array, L2: Array, L3: Array, stats: { total: number, l0: number, l1: number, l2: number, l3: number } }}
+ */
+export function partitionMemories(memories, now = Date.now(), opts = {}) {
+  const L0 = [];
+  const L1 = [];
+  const L2 = [];
+  const L3 = [];
+
+  const list = Array.isArray(memories) ? memories : [];
+  for (const m of list) {
+    const tier = computeTier(m, now, opts);
+    if (tier === TIER_L0) L0.push(m);
+    else if (tier === TIER_L1) L1.push(m);
+    else if (tier === TIER_L2) L2.push(m);
+    else L3.push(m);
+  }
+
+  return {
+    L0,
+    L1,
+    L2,
+    L3,
+    stats: {
+      total: list.length,
+      l0: L0.length,
+      l1: L1.length,
+      l2: L2.length,
+      l3: L3.length,
+    },
+  };
+}
+
 // ── soul-md 索引（queryTerms + searchTopics + renderRecall） ──────────────
-// soul-md 的索引设计：只给模型看 descriptor rows（key + title + summary），
-// 不注入正文。模型看到目录后自己决定要不要调 readText 读正文。
-// 这是「索引型记忆」的标准做法——实测 soul-md 只给描述行 recall=0.06，
-// 跟进读正文后 0.989。索引的价值是「让模型知道有什么」，不是「替模型读」。
 
 /** 查询分词：NFKC + 小写 + CJK 二元组 + 拉丁词。与 soul-md 的 queryTerms 同源。 */
 export function queryTerms(query) {
   const value = String(query ?? '').normalize('NFKC').toLowerCase().slice(0, 2000);
   const terms = new Set(value.match(/[\p{L}\p{N}_-]+/gu) ?? []);
-  // Chinese text rarely has spaces: bigrams allow partial phrase matches.
   for (const run of value.match(/[\p{Script=Han}]+/gu) ?? []) {
     for (let i = 0; i < run.length - 1; i++) terms.add(run.slice(i, i + 2));
   }
@@ -57,8 +219,6 @@ export function boundedInteger(value, fallback, max) {
 
 /**
  * 话题搜索：对 topics 数组做词法打分，返回 top-N。
- * 与 soul-md 的 searchTopics 同源：label×4 + summary×2 + content×1 的加权。
- * topics 是 { key, title, summary, source, file } 数组；readText 是读正文的回调。
  */
 export function searchTopics(topics, query, readText, limit = 5) {
   const terms = queryTerms(query);
@@ -81,8 +241,6 @@ export function searchTopics(topics, query, readText, limit = 5) {
 
 /**
  * 渲染索引：只输出 descriptor rows，绝不注入正文。
- * 与 soul-md 的 renderRecall 同源：「- "key" — title：summary」格式。
- * cap 是字符预算，超出的行被丢弃。
  */
 export function renderRecall(groups, cap) {
   const lines = [];
@@ -99,18 +257,7 @@ export function renderRecall(groups, cap) {
 }
 
 // ── prime-memory 图层加权（GRAPH_FIELD_WEIGHTS + 阶梯注释） ──────────────
-// prime-memory 的图谱检索：字段加权重叠计分 + 可解释命中输出。
-// 与 L1 检索（FTS5/向量）不同，图谱节点量级是「可重建投影」的百~千级，
-// 在此直接内存打分即可，不建倒排索引（>2k 节点再考虑预建）。
-//
-// 图谱演进阶梯（阈值触发，非按需猜测）：
-//   T0  邻接表 + 字段加权打分（即本文件）        SQLite    nodes 10²~10³（现状）
-//   T1  TS 内存 BFS/DFS：k-hop/最短路径/连通分量   **不变**  nodes ≤ ~10k
-//   T2  递归 CTE（不物化全图）                    **不变**  图装不进内存
-//   T3  闭包表/物化路径（传递闭包预计算）          **不变**  高频多跳重复查询
-//   T4  嵌入式图引擎（Kuzu 优先，非 Neo4j）        换引擎    T1-T3 全部不足
 
-/** 字段权重：名称最高、关系词最低。与 prime-memory 的 GRAPH_FIELD_WEIGHTS 同源。 */
 export const GRAPH_FIELD_WEIGHTS = {
   name: 6,
   aliases: 5,
@@ -133,11 +280,6 @@ const FIELD_LABELS = {
 
 const FIELD_ORDER = ['name', 'aliases', 'tags', 'currentState', 'facts', 'relations', 'type'];
 
-/**
- * 图谱节点检索：字段加权重叠计分。
- * nodes 是 { id, name, aliases, tags, currentState, facts, relations, type } 数组。
- * 只命中关系名的节点通常是邻接噪声，过滤丢弃；type-only 命中仍保留。
- */
 export function searchGraphNodes(nodes, query, limit = 10) {
   const terms = queryTerms(query);
   if (!terms.length) return [];
@@ -163,7 +305,6 @@ export function searchGraphNodes(nodes, query, limit = 10) {
         matchedFields.push(field);
       }
     }
-    // 仅关系词命中的节点通常是邻接噪声，过滤丢弃
     if (matchedFields.length === 1 && matchedFields[0] === 'relations') return [];
     if (!matchedFields.length) return [];
     const matchReason = matchedFields.map((f) => FIELD_LABELS[f]).join('+');
@@ -173,37 +314,7 @@ export function searchGraphNodes(nodes, query, limit = 10) {
 }
 
 // ── mneme 后台整理（dream/sleep.js 四阶段 fail-safe） ──────────────────────
-// mneme 的 sleep 相位：idle-triggered, LLM-assisted deep pass over the memory store.
-// 四个独立、fail-safe 的阶段：
-//   1. conflict resolution — 高相似度同类型对要么 parked for review（freeze mode），
-//      要么由 LLM 裁决（winner kept / loser archived）。跨 scope 对永远人工审。
-//   2. archival demotion — 超过 sleepArchiveDays 未被引用的记忆缩成一行摘要，
-//      全文移到 _full_content；超过 sleepCompressDays 直接归档。
-//      memjudge 的最小版把它拆成两个提案：archived（材料多老了）与 tierWrites（该不该
-//      换层级）。两者都只出提案，落库只在 scripts/nightly.mjs --apply。
-//   3. pattern discovery — LLM 扫描最近的记忆，生成 type=pattern 条目。
-//   4. relation completion — 孤儿实体（零关系）从记忆共现补全隐含关系。
-// 每阶段独立包裹，一个失败不拖垮其他。AbortController signal 可中断。
 
-/**
- * 后台整理四阶段：冲突消解 → 层级提案 → 模式发现 → 关系补全。
- * 与 mneme 的 sleep 同构，但 memjudge 没有 LLM 路由，用确定性规则回退。
- *
- * **本函数不写库**：四个阶段产出的都是「提案」。谁落库由调用方决定——
- * 目前唯一的落库入口是 scripts/nightly.mjs 的 --apply，且默认是 dry-run。
- * 早期版本让 archived 看起来像「已经归档了」，那是误导：函数是纯的，
- * 报告不能假装动作已经发生。
- *
- * @param {Array<{id:string,text:string,createdAt?:number,ch?:number,scope?:string,
- *          kind?:string,tier?:number,lastAccessed?:number,accessCount?:number}>} memories
- * @param {{conflictMode?: 'gentle'|'normal'|'aggressive', archiveDays?: number,
- *          compressDays?: number, llm?: Function, tierRows?: Array, now?: number}} [opts]
- *   tierRows：逐条的库行（store.dump() 的形状，含 kind/tier/lastAccessed/accessCount）。
- *   冲突阶段要的是「按章合并且文本」，tier 阶段要的是「逐条」，两者输入形状不同，
- *   所以分开传；不给 tierRows 时退回 memories 自身（纯函数调用方的默认）。
- * @returns {{conflicts: Array, archived: Array, tierWrites: Array, patterns: Array,
- *   relations: Array, errors: Array}}
- */
 export function sleepPhase(memories, opts = {}) {
   const errors = [];
   const results = { conflicts: [], archived: [], tierWrites: [], patterns: [], relations: [], errors };
@@ -216,15 +327,13 @@ export function sleepPhase(memories, opts = {}) {
     errors.push({ phase: 'conflict', error: e.message });
   }
 
-  // Phase 2: 归档降级**提案**（超过 archiveDays 未被引用的记忆缩成摘要）
-  // 注意 age 的口径是 createdAt：这一阶段问的是「这条材料多老了」（该不该压缩成摘要），
-  // 与 Phase 2b 问的「多久没被用到」是两个问题，别混。
+  // Phase 2: 归档降级提案
   try {
     const archiveDays = opts.archiveDays ?? 30;
     const compressDays = opts.compressDays ?? 90;
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
     for (const mem of memories) {
-      const age = (now - (mem.createdAt ?? mem.ch ?? 0)) / 86400000;
+      const age = (now - (mem.createdAt ?? mem.created_at ?? mem.ch ?? 0)) / DAY_MS;
       if (age > compressDays) {
         results.archived.push({ id: mem.id, action: 'archive', age: Math.round(age), proposal: true });
       } else if (age > archiveDays) {
@@ -235,33 +344,44 @@ export function sleepPhase(memories, opts = {}) {
     errors.push({ phase: 'archive', error: e.message });
   }
 
-  // Phase 2b: 层级升降**提案**（描述「将要写什么」，一个字节都不落库）
-  //
-  // 两条规则的互斥关系是有意定的：一条命中过 TIER_PROMOTE_ACCESS 次以上的 event
-  // 不参与下沉，即使它 30 天没被读。「最近没读」远弱于「被反复读过」——
-  // 让前者把后者摁下去，这套分层就退化成只看最后访问时间的 LRU。
-  // 人 / 约连算都不算：恒 1 是结构保证（写入侧 normalizeTier 也钉死了）。
+  // Phase 2b: 层级升降提案（支持 v8 范畴规则与热度模型）
   try {
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
     const rows = Array.isArray(opts.tierRows) && opts.tierRows.length ? opts.tierRows : memories;
     for (const row of rows) {
       const id = row?.id;
       if (!id) continue;
-      const kind = normalizeKind(row.kind);
-      const tier = normalizeTier(row.tier, kind);
-      if (kind === 'person' || kind === 'promise') {
-        if (tier !== MEMORY_TIER_PINNED) {
-          results.tierWrites.push({ id, kind, action: 'pin', from: tier, to: MEMORY_TIER_PINNED, reason: '人/约恒 1' });
+      const rawKind = row.kind ?? (row.category ? row.category : 'event');
+      const kind = normalizeKind(rawKind);
+      const cat = row.category ? normalizeCategory(row.category) : kindToCategory(kind);
+
+      // L0 常驻层（rule / profile / state / person / promise）
+      if (cat === 'rule' || cat === 'profile' || cat === 'state' || kind === 'person' || kind === 'promise') {
+        const tier = normalizeTier(row.tier, kind);
+        if (tier !== MEMORY_TIER_PINNED && Number(row.tier) !== TIER_L0) {
+          results.tierWrites.push({
+            id,
+            kind,
+            action: 'pin',
+            from: tier,
+            to: MEMORY_TIER_PINNED,
+            reason: '核心恒温层(L0)常驻不衰减',
+          });
         }
         continue;
       }
+
+      const tier = normalizeTier(row.tier, kind);
       const lastAccess = Number.isFinite(row.lastAccessed)
         ? row.lastAccessed
-        : Number.isFinite(row.last_accessed)
-          ? row.last_accessed
-          : (Number.isFinite(row.createdAt) ? row.createdAt : now);
+        : Number.isFinite(row.last_accessed_at)
+          ? row.last_accessed_at
+          : Number.isFinite(row.last_accessed)
+            ? row.last_accessed
+            : (Number.isFinite(row.createdAt) ? row.createdAt : (Number.isFinite(row.created_at) ? row.created_at : now));
       const accessCount = Number(row.accessCount ?? row.access_count ?? 0) || 0;
-      const idleDays = (now - lastAccess) / 86400000;
+      const idleDays = (now - lastAccess) / DAY_MS;
+
       if (accessCount >= TIER_PROMOTE_ACCESS && tier > MEMORY_TIER_PINNED) {
         results.tierWrites.push({
           id, kind, action: 'promote', from: tier, to: tier - 1, reason: `命中 ${accessCount} 次`,
@@ -281,13 +401,13 @@ export function sleepPhase(memories, opts = {}) {
     errors.push({ phase: 'tier', error: e.message });
   }
 
-  // Phase 3: 模式发现（LLM 扫描最近记忆，生成 pattern 条目）
+  // Phase 3: 模式发现
   try {
     const llm = typeof opts.llm === 'function' ? opts.llm : null;
     if (llm) {
       const recent = memories
         .slice()
-        .sort((a, b) => (b.createdAt ?? b.ch ?? 0) - (a.createdAt ?? a.ch ?? 0))
+        .sort((a, b) => (b.createdAt ?? b.created_at ?? b.ch ?? 0) - (a.createdAt ?? a.created_at ?? a.ch ?? 0))
         .slice(0, 50);
       const prompt = `从以下记忆中提取模式（重复出现的主题、规律、趋势）：\n${recent.map((m) => m.text).join('\n')}`;
       const response = llm(prompt);
@@ -297,9 +417,8 @@ export function sleepPhase(memories, opts = {}) {
     errors.push({ phase: 'pattern', error: e.message });
   }
 
-  // Phase 4: 关系补全（孤儿实体从记忆共现补全隐含关系）
+  // Phase 4: 关系补全
   try {
-    // 简化实现：找零关系的实体，从记忆共现推断关系
     const entityMentions = new Map();
     for (const mem of memories) {
       for (const q of extractQuantities(mem.text)) {
@@ -320,18 +439,7 @@ export function sleepPhase(memories, opts = {}) {
   return results;
 }
 
-// ── karpathy llm-wiki 编译层：raw 不可变 → wiki 投影（worker t14） ──────────
-//
-// llm-wiki 的分层是：raw（原始材料，只追加、永不改写）→ wiki（编译产物，可随时丢弃重建）。
-// 移植到 SQLite 时最容易走歪的一步是把「编译结果」写回 raw 表——那样 raw 就变成了
-// 一份既有原文又有加工物的混合体，原文不再可信，冲突也永远说不清哪边是材料、哪边是判断。
-// 这里的边界是硬的：memories 表是 raw 的唯一副本，编译层只读它，投影全部在内存里生成。
-// compileWiki() 是纯函数：同样的 raw 进来，同样的 wiki 出去，两次结果字节级相同。
-//
-// 为什么要有 Status 三态而不是「删掉旧的」：
-//   矛盾不删是记忆系统的底线。旧值被判负并不等于它没出现过——「原报九厘米、现予更正
-//   十一厘米」这句话本身就要求两个值都留着，否则下次问「原报多少」就答不上来。
-//   Current / Outdated / Disputed 三态正好对应三种处境：当前有效、明确被取代、无法裁决。
+// ── karpathy llm-wiki 编译层：raw 不可变 → wiki 投影 ──────────
 
 export const WIKI_VERSION = 1;
 
@@ -348,17 +456,8 @@ export const PAGE_STATUS = Object.freeze({
   DISPUTED: 'Disputed',
 });
 
-// judge.mjs:545 的 REVISION_CUE 是模块内常量、没有导出，而 t14 不允许改 judge.mjs。
-// 这里复制同一张表：编译层判「明确被取代」和判断层判「原文自带更正」必须是同一个判据，
-// 两边若分叉，wiki 会把旧值标成 Outdated 而判断层认为没发生修订，状态就对不上了。
 const REVISION_CUE = /现予更正|予以更正|更正为|更正后|作废|以.{0,8}为准|已撤销|已推翻|原报|原测|原记录|系估值|系估算|系目测|系误记/;
-
-// extractFacts 把「原报九厘米」抽成 (entity, 原报) = 九厘米，属性落在这些前缀上时，
-// 该值在原文里就是以「旧值」身份出现的，投影据此直接标 Outdated。
 const REVISION_PREFIX_ATTR = /^(原报|原测|原记录|原载|原写|原称|原为|原系|原属)$/;
-
-// 日期与引号串：Grounding 校验要逐个回 raw 找的东西。带 g 的常量不进状态机判断，
-// 每次用 tokensOf() 复制一份再 matchAll，免得 lastIndex 在调用之间残留。
 const DATE_RE = /\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?/g;
 const QUOTED_RE = /「[^」]{2,}」|“[^”]{2,}”|"[^"]{2,}"/g;
 
@@ -367,7 +466,6 @@ function tokensOf(re, text) {
   return [...String(text).matchAll(new RegExp(re.source, re.flags))].map((m) => m[0]);
 }
 
-/** FNV-1a 32 位：比 JSON.stringify 更适合当「内容指纹」，不受键序影响。 */
 function fnv1a(input) {
   let h = 0x811c9dc5;
   for (const byte of Buffer.from(String(input), 'utf8')) {
@@ -381,16 +479,6 @@ function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * 把抽出来的值对齐回 raw 的逐字片段。
- *
- * extractFacts 的 value 是 `${数字}${单位}` 直接拼的（judge.mjs:151），原文若写成
- * 「147 卷」带空格，拼出来就是「147卷」——语义没错，但投影里出现了 raw 里不存在的
- * 字符串，Grounding Invariant 立刻判违规。修的位置必须在这层：raw 是真相，投影向 raw
- * 对齐；反过来去改判断层的抽取口径会动到检索/拒答的既有行为（t14 明确不许改 judge.mjs）。
- *
- * 对齐不上就原样返回，让校验脚本把它报出来——不回填、不猜测，违规比编造好。
- */
 function alignToRaw(value, raw) {
   const v = String(value ?? '');
   if (!v || raw.includes(v)) return v;
@@ -402,17 +490,12 @@ function alignToRaw(value, raw) {
 
 function scopeKey(mem) {
   if (mem == null) return '';
-  for (const k of ['scope', 'agent_scope', 'workspace_scope']) {
+  for (const k of ['scope', 'space_id', 'agent_scope', 'workspace_scope']) {
     if (mem[k] != null && mem[k] !== '') return String(mem[k]);
   }
   return '';
 }
 
-/**
- * raw 指纹：只由 id + text 决定，与编译结果无关。
- * 用来证明「编译没有动 raw」——两次编译之间 rawDigest 不同就说明有人改了原文，
- * 而不是投影漂移。
- */
 export function rawDigest(memories) {
   const list = (Array.isArray(memories) ? memories : [])
     .map((m) => `${String(m?.id ?? '')}\u0000${String(m?.text ?? '')}`)
@@ -420,7 +503,6 @@ export function rawDigest(memories) {
   return fnv1a(list.join('\u0001'));
 }
 
-/** 归一成条目：facts 一律从 raw 现算，绝不读任何派生表（派生表是投影，不是真相）。 */
 function buildEntries(memories) {
   const list = (Array.isArray(memories) ? memories : []).map((mem, index) => {
     const text = String(mem?.text ?? '');
@@ -434,20 +516,15 @@ function buildEntries(memories) {
     } catch {
       facts = [];
     }
-    const at = Number.isFinite(mem?.createdAt) ? mem.createdAt
-      : (Number.isFinite(mem?.ch) ? mem.ch : 0);
+    const at = Number.isFinite(mem?.createdAt)
+      ? mem.createdAt
+      : (Number.isFinite(mem?.created_at) ? mem.created_at : (Number.isFinite(mem?.ch) ? mem.ch : 0));
     return { mem, id: String(mem?.id ?? `#${index}`), text, at, scope: scopeKey(mem), facts, order: index };
   });
-  // 排序必须确定：时间 → id → 输入序。缺了任一维，等时间的批量导入就会随 V8 的
-  // 稳定排序假设漂移，compile 的幂等性就靠不住。
   list.sort((a, b) => a.at - b.at || a.id.localeCompare(b.id, 'en') || a.order - b.order);
   return list;
 }
 
-/**
- * 两个同槽事实谁赢：修订措辞 > 同 scope 下更新的时间 > 无法裁决。
- * 返回 winner 'a' / 'b' / null（null = Disputed）。
- */
 function adjudicatePair(a, b) {
   const cueA = REVISION_CUE.test(String(a.fact.text ?? ''));
   const cueB = REVISION_CUE.test(String(b.fact.text ?? ''));
@@ -457,12 +534,6 @@ function adjudicatePair(a, b) {
   return { winner: null, reason: 'same-time' };
 }
 
-/**
- * 写入分诊：New / Update / Disputed / No material。
- *
- * 判据落在「同实体同属性」（extractFacts 的 entity+attr 槽），不是「同一个单位」——
- * 「焊缝深度九厘米」和「吃水九厘米」同单位但不是一件事，按单位比会把无关条目判成冲突。
- */
 function decide(entry, priors) {
   if (!entry.facts.length) {
     return { kind: TRIAGE.NO_MATERIAL, reason: 'no-facts', slot: null, against: null, fact: null };
@@ -474,7 +545,6 @@ function decide(entry, priors) {
       for (const pf of p.facts) if (pf.slot === fact.slot) peers.push({ entry: p, fact: pf });
     }
     if (!peers.length) continue;
-    // 同槽同值：原文又一次陈述了已存在的事实，没有新信息，算 Update（不是 New）
     const same = peers.find((x) => x.fact.value === fact.value);
     if (same) {
       return { kind: TRIAGE.UPDATE, reason: 'same-value', slot: fact.slot, against: same.entry.id, fact, peer: same.fact };
@@ -486,13 +556,11 @@ function decide(entry, priors) {
         return { kind: TRIAGE.UPDATE, reason: verdict.reason, slot: fact.slot, against: peer.entry.id, fact, peer: peer.fact };
       }
     }
-    // 同槽多值且一个都裁不了：两边都留，标 Disputed，绝不替用户选
     return { kind: TRIAGE.DISPUTED, reason: 'undecidable', slot: fact.slot, against: peers[0].entry.id, fact, peer: peers[0].fact };
   }
   return { kind: TRIAGE.NEW, reason: 'new-slot', slot: entry.facts[0].slot, against: null, fact: entry.facts[0] };
 }
 
-/** 落盘标记：一行字符串，可写进 memories.source 或 meta，事后再解析回分诊结论。 */
 export function triageMark(triage) {
   const parts = ['triage:v1', triage.kind];
   if (triage.slot) parts.push(`slot=${triage.slot}`);
@@ -500,18 +568,14 @@ export function triageMark(triage) {
   return parts.join(':');
 }
 
-/** 解析落盘标记，还原 kind（供 CLI / 审计脚本读回）。 */
 export function parseTriageMark(mark) {
   const m = /^triage:v1:([a-z-]+)/.exec(String(mark ?? ''));
   return m ? m[1] : null;
 }
 
-/** 一个槽位内所有事实的三态：只有一个值时全 Current，多值才需要裁决。 */
 function resolveSlot(items) {
   const values = [...new Set(items.map((i) => i.fact.value))];
   if (values.length < 2) {
-    // 单值槽也可能自带旧值身份：「原报九厘米」抽出来的属性就是「原报」。
-    // 原文自己说这是旧值，投影不能把它标成 Current——那不是裁决，是照抄措辞。
     return items.map((item) => {
       const restated = REVISION_PREFIX_ATTR.test(String(item.fact.attr ?? ''));
       return {
@@ -560,22 +624,9 @@ function renderBlock(block) {
   return lines;
 }
 
-/**
- * 全量重建 wiki 投影：raw → blocks → doc。
- *
- * 幂等由三个确定性来源保证：条目按 (时间, id, 输入序) 排序、facts 从 raw 现算、
- * 状态裁决只看 raw 自带的时间/措辞/scope——没有 Date.now()、没有 Map 迭代序依赖。
- *
- * @param {Array<{id:string,text:string,createdAt?:number,ch?:number,scope?:string}>} memories
- * @param {{now?: number}} [opts]
- * @returns {{version:number, rawDigest:string, blocks:Array, doc:string, slots:Array,
- *   statusCounts:object, pageStatusCounts:object, triageCounts:object}}
- */
 export function compileWiki(memories, opts = {}) {
   const entries = buildEntries(memories);
 
-  // 分诊是历史判定：第 i 条只跟它之前的记忆比。事后重算会把「当时裁不了的 Disputed」
-  // 洗成 Update（后面的条目补上了裁决依据），那就丢了写入时刻的判断痕迹。
   const triageByIndex = new Map();
   for (let i = 0; i < entries.length; i += 1) {
     triageByIndex.set(i, decide(entries[i], entries.slice(0, i)));
@@ -667,10 +718,6 @@ export function compileWiki(memories, opts = {}) {
   };
 }
 
-/**
- * 两次编译的差异。返回 added/removed/changed 三个列表，same 为真即幂等。
- * 差异按 block id 对齐——id 是 raw 的确定性指纹，不会因为排序变化而错位。
- */
 export function diffWiki(left, right) {
   const toMap = (w) => new Map((w?.blocks ?? []).map((b) => [b.id, b]));
   const L = toMap(left);
@@ -697,21 +744,12 @@ export function diffWiki(left, right) {
   };
 }
 
-/**
- * Grounding Invariant：投影里出现的每个值、日期、引号串，都必须能在该块自己的 raw 里
- * 逐字 indexOf 到。找不到 = 编译层造了原文没有的东西，必须报违规（脚本退出码非 0）。
- *
- * 只回本块 raw 而不是全库：跨条引入同样是编造——「这条记忆里没写过这个数」不能靠
- * 「别的记忆里写过」来洗白。
- */
 export function groundingViolations(wiki) {
   const out = [];
   for (const block of wiki?.blocks ?? []) {
     const raw = String(block.raw ?? '');
     const seen = new Set();
     const add = (field, token) => {
-      // 日期正则的尾随 \s* 会把空格吃进匹配，trim 掉再比对，否则「2026-10-28 」
-      // 永远找不到（raw 里是「2026-10-28 完成」），会把好块误报成违规。
       const t = String(token ?? '').trim();
       if (!t) return;
       const key = `${field}\u0000${t}`;
@@ -732,12 +770,6 @@ export function groundingViolations(wiki) {
   return out;
 }
 
-/**
- * 写入路径分诊（remember 前调用）：给集成层一个「写之前先问一句」的入口。
- *
- * 返回的 supersedes 只在 Update 时给一条——Disputed 绝不挂取代链，两边都留在库里。
- * mark 是要落盘的标记字符串，写进 memories.source 即可事后审计。
- */
 export function planWrite(memory, existing = [], opts = {}) {
   const entry = buildEntries([memory])[0];
   const priors = buildEntries(existing).filter((p) => p.id !== entry.id);
@@ -749,7 +781,6 @@ export function planWrite(memory, existing = [], opts = {}) {
     slot: triage.slot ?? null,
     against,
     mark: triageMark(triage),
-    // same-value 是「同值重复陈述」：没有新信息，也就没有谁被取代，不能挂取代链。
     supersedes:
       triage.kind === TRIAGE.UPDATE && triage.reason !== 'same-value' && against && opts.linkSupersedes !== false
         ? [against]
@@ -758,21 +789,8 @@ export function planWrite(memory, existing = [], opts = {}) {
   };
 }
 
-// ── 召回路径的冲突自述（能力 10） ──────────────────────────────────────────
-//
-// judge.render() 里的 conflictNarrate 只覆盖「render 回调」这一条路，而 memjudge_recall
-// 走的是 index.mjs 自己的 render——所以在 render 里加等于白改。判断层要落在召回路径上，
-// 判据必须硬：不是「有数字就报矛盾」，而是
-//   ① 同一 attr 出现 ≥2 个不同取值（同槽多值）
-//   ② 其中至少一条的整句含修订语（现予更正 / 作废 / 以…为准 / 已撤销 / 更正后）
-// 两条同时成立才输出一行。缺一条就不说话——宁可漏报，不可在无关问题里塞一句「两处不一致」。
-//
-// 输出行必须同时满足两个下游口径（mem-eval/harness/score.mjs:196）：
-//   JUDGED_CONFLICT —— 文本里要有「两处…不一致」这类判断句（语料正文没有这些措辞，
-//                      命中只可能来自插件自己的判断）
-//   newSide         —— 文本里要出现后文修正值（十一厘米），所以修正值必须写进行里
+// ── 召回路径的冲突自述 ──────────────────────────────────────────
 
-/** 从 fact 的句子指针切回原文，切出来的一定是原文子串。 */
 function sentOf(text, fact) {
   const start = Number(fact?.sent_off ?? fact?.at ?? 0);
   const len = Number(fact?.sent_len ?? 0);
@@ -780,16 +798,6 @@ function sentOf(text, fact) {
   return text.slice(start, start + (len > 0 ? len : 40));
 }
 
-/**
- * 召回到的段落里挑出「同槽多值 + 有修订语」的冲突，生成一行自述。
- *
- * 只看召回结果覆盖的那些记忆（不扫全库）：否则问「硫含量」也会被塞进凹陷深度的冲突，
- * 那是污染不是能力。返回按证据强度排序，默认最多 2 行。
- *
- * @param {Array<{id:string, chapter?:number, text:string, facts:Array}>} entries
- * @param {{limit?:number}} [opts]
- * @returns {Array<{attr:string, values:string[], revised:string, line:string, evidence:Array}>}
- */
 export function conflictJudgments(entries, opts = {}) {
   const limit = Number.isInteger(opts.limit) && opts.limit > 0 ? opts.limit : 2;
   const byAttr = new Map();
@@ -815,12 +823,10 @@ export function conflictJudgments(entries, opts = {}) {
     const values = [...new Set(items.map((i) => i.value))];
     if (values.length < 2) continue;
     const cued = items.filter((i) => REVISION_CUE.test(i.sent));
-    if (!cued.length) continue; // 没有修订语就不是「明确被更正」，不报
-    // 修正值取修订语那条里的值；多条时取章节号最大的（后文），同章取 at 最大
+    if (!cued.length) continue;
     const revised = cued
       .slice()
       .sort((a, b) => b.chapter - a.chapter || b.at - a.at)[0].value;
-    // 取值按章节升序排，读起来就是「先旧后新」
     const ordered = [...new Set(items.slice().sort((a, b) => a.chapter - b.chapter || a.at - b.at).map((i) => i.value))];
     out.push({
       attr,
@@ -830,7 +836,6 @@ export function conflictJudgments(entries, opts = {}) {
       evidence: items.map((i) => ({ id: i.entryId, chapter: i.chapter, value: i.value })),
     });
   }
-  // 取值多的、带修订语的优先；同规模按 attr 字典序，保证输出稳定
   out.sort((a, b) => b.values.length - a.values.length || a.attr.localeCompare(b.attr, 'en'));
   return out.slice(0, limit);
 }
