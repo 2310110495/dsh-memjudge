@@ -768,7 +768,10 @@ export function open(dbPath = ':memory:', opts = {}) {
               throw new Error('migration backup integrity check failed');
             }
           } finally { verify.close(); }
-          const fd = fs.openSync(snapshotPath, 'r');
+          // Windows FlushFileBuffers (fsync) requires a writable handle. r+ grants
+          // that access without truncating the verified snapshot; flush failures
+          // still abort before backup publication and migration DDL.
+          const fd = fs.openSync(snapshotPath, 'r+');
           try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
         }
         db.exec('BEGIN IMMEDIATE;');
