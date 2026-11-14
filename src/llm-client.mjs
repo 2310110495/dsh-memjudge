@@ -142,9 +142,9 @@ export async function chat(payload, opts = {}) {
   const outer = opts.signal ?? null;
 
   const ctrl = new AbortController();
-  const onOuterAbort = () => ctrl.abort();
+  const onOuterAbort = () => ctrl.abort(outer.reason);
   if (outer) {
-    if (outer.aborted) ctrl.abort();
+    if (outer.aborted) ctrl.abort(outer.reason);
     else outer.addEventListener('abort', onOuterAbort, { once: true });
   }
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);

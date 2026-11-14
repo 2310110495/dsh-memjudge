@@ -538,6 +538,10 @@ describe('T8: memjudge v2 端到端记忆能力实测与 1000 轮容量收敛压
   });
 
   test('场景 A（本地线上真库只读沙盒拷贝）：真库零修改验证 + 92 条记录及 7 条核心记忆 100% 无损升迁 v8', async (t) => {
+    if (process.env.MEMJUDGE_TEST_LIVE_DB !== '1') {
+      t.skip('private live-database fixture requires explicit MEMJUDGE_TEST_LIVE_DB=1; synthetic migration remains mandatory');
+      return;
+    }
     if (!fs.existsSync(LIVE_V7_DB_PATH)) {
       t.diagnostic(`[Scene A - Live Copy] 宿主机未发现 ${LIVE_V7_DB_PATH}，跳过真库拷贝分支（已由自包含固件完整覆盖）`);
       return;

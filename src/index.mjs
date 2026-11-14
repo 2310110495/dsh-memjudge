@@ -297,33 +297,8 @@ export function toDoc(m) {
   };
 }
 
-/**
- * 证据门硬拒判定：gate()/gateSlots() 一旦给出 deny=true，除确认可放行的理由外一律硬拒。
- * 白名单只保留「已验证可放行」的两个理由，其余理由由证据门自行扩充即可生效——
- * 不再逐一枚举拒绝理由，避免产出集合与判定集合漂移导致判定恒 false。
- */
-export function isHardDeny(v) {
-  if (!v?.deny) return false;
-  if (v.reason === 'hit' || v.reason === 'explain-question') return false;
-  return true;
-}
-
-/**
- * recall 证据门的最终裁决：bodyVerdict（片段窗口核验）与 slotGate（槽位索引核验）谁说了算。
- * - 片段核验放行即放行：槽位图只是结构化投影，抽不出槽位不等于事实不存在，
- *   让槽位门单方面否决会把「文本里明明写着、只是没抽成槽位」的整类召回拒死；
- * - 片段核验要拒时，只有槽位门给出「肯定命中」才豁免，用来抵住文本窗口截断造成的误拒。
- */
-export function shouldDenyRecall(bodyVerdict, slotGate) {
-  if (!isHardDeny(bodyVerdict)) return false;
-  const slotExplicitlyAffirmed = Boolean(
-    slotGate
-    && slotGate.deny === false
-    && slotGate.reason === 'hit'
-    && (slotGate.hits?.length ?? 0) > 0,
-  );
-  return !slotExplicitlyAffirmed;
-}
+import { isHardDeny, shouldDenyRecall } from './evidence-policy.mjs';
+export { isHardDeny, shouldDenyRecall } from './evidence-policy.mjs';
 
 function textBlock(text) {
   return [{ type: 'text', text }];
@@ -488,6 +463,8 @@ export function apply(ctx, config = {}, dependencies = {}) {
   const lifetime = new AbortController();
   let metabolismTimer = null;
   let ingestTimer = null;
+  let ingestTimerDue = Infinity;
+  let ingestWakeRequested = false;
   const turnCollectors = new Map();
   const pendingQueries = new Map();
   const registeredSpaces = new Set([GLOBAL_SPACE_ID]);
@@ -707,15 +684,23 @@ export function apply(ctx, config = {}, dependencies = {}) {
         ingestTask = null;
         // Continue full batches; also revisit expired crash leases without stealing
         // a possibly live worker's claim on activation. Timer never keeps host alive.
-        if (!disposed) scheduleIngestDrain(300_000);
+        const delay = ingestWakeRequested ? 0 : 300_000;
+        ingestWakeRequested = false;
+        if (!disposed) scheduleIngestDrain(delay);
       });
       return ingestTask;
     }
 
     function scheduleIngestDrain(delayMs = 0) {
-      if (disposed || ingestTimer) return;
+      if (disposed) return;
+      if (ingestTask && delayMs === 0) { ingestWakeRequested = true; return; }
+      const due = Date.now() + delayMs;
+      if (ingestTimer && ingestTimerDue <= due) return;
+      if (ingestTimer) clearTimeout(ingestTimer);
+      ingestTimerDue = due;
       ingestTimer = setTimeout(() => {
         ingestTimer = null;
+        ingestTimerDue = Infinity;
         void drainIngestQueue();
       }, delayMs);
       if (typeof ingestTimer.unref === 'function') ingestTimer.unref();
@@ -1321,7 +1306,9 @@ export function apply(ctx, config = {}, dependencies = {}) {
         ensureSpaceRegistered(sc);
         return visibleSpaces(sc);
       }
-      return null;
+      // No execution scope is not permission to search every project. Match the
+      // no-session writer default; only explicit space="all" opts out of filtering.
+      return [GLOBAL_SPACE_ID];
     }
 
     // -------------------------------------------------------------- 1. memjudge_remember

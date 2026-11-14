@@ -61,14 +61,19 @@ test('enabled failures retain one retry and null fallback',async()=>{
 test('chat preserves network, JSON, HTTP and abort errors for in-flight requests',async()=>{
   for(const kind of ['network','json','http','abort']){
     setup();const error=kind==='abort'?new DOMException('original abort','AbortError'):new Error('original '+kind);
+    const ctrl=new AbortController();
     const fetchImpl=async(_url,{signal})=>{await Promise.resolve();disable();
       if(kind==='http')return {ok:false,status:429,text:async()=>'fixture body'};
       if(kind==='json')return {ok:true,json:async()=>{throw error;}};
-      if(kind==='abort'){assert.equal(signal.aborted,true);}throw error;
+      if(kind==='abort'){ctrl.abort(error);assert.equal(signal.aborted,true);}throw error;
     };
-    const ctrl=new AbortController();if(kind==='abort')ctrl.abort();
+    // Cancel inside fetch: a pre-aborted request must never invoke this provider.
     await assert.rejects(chat({}, {fetchImpl,signal:ctrl.signal}),e=>kind==='http'?(e instanceof ChatHttpError&&e.status===429&&e.body==='fixture body'):e===error);
   }
+});
+test('pre-aborted request preserves reason and never calls fetch',async()=>{
+  setup();const ctrl=new AbortController();const reason=new DOMException('caller cancelled','AbortError');ctrl.abort(reason);let calls=0;
+  await assert.rejects(chat({}, {signal:ctrl.signal,fetchImpl:async()=>{calls++;return reply();}}),e=>e===reason);assert.equal(calls,0);
 });
 test('disable after cached result collection preserves cached partial results',async()=>{
   setup();let calls=0;const cache={get(text){if(text==='alpha 1'){disable();return [];}},set(){},flush(){}};

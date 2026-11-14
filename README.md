@@ -1,6 +1,6 @@
 # dsh-memjudge
 
-> **开发检查点，非正式发布（2026-11-13）**：本次先保存并提交 v2 工作。尚有证据门集成、STRICT 表约束及存储生命周期最终验证未完成；当前提交未通过最终完整回归，也未投产。详见 [已知问题与后续验证](docs/V2-CHECKPOINT.md)。
+> **源码修复检查点，非正式发布（2026-11-14）**：已修复 evidenceBound 拒答优先级、条件/否定原句校验、八表 STRICT 迁移、运行时要求与采集唤醒问题。源码回归结果与未完成边界见 [验证检查点](docs/V2-CHECKPOINT.md)。本次没有升级正在运行的插件或迁移生产数据库。
 
 面向 DeepSeek Harness (Cordis) 的可验证本地记忆插件（v2）：SQLite Schema v8 工作区隔离存储 + L0-L3 四级热冷代谢 + 增量 Wiki 知识页 + 保 Prefix KV Cache 两段式动态注入（Tier-S + Tier-D）+ O(log N) 结构化槽位拒答与三分冲突裁决 + Turn 级异步脱水采集 + Web 治理面板。
 
@@ -23,9 +23,9 @@
 
 `src/rpc.mjs` 与前端 `client.js` / `cordis.patch.yml` 配合，挂载 8 条同源 Fetch 路由供 DSH 设置与记忆治理面板调用：
 
-- `GET/POST /api/memjudge.status` — 库统计、空间列表、L0-L3 层级、注入水位、索引重建与配置脱敏快照
-- `GET/POST /api/memjudge.memories` — 空间/范畴/层级过滤记忆列表、修订历史、单活状态、Wiki 编译与代谢触发
-- `GET /api/memjudge.conflicts` — 三分冲突定性与证据摘要
+- `POST /api/memjudge.status` — 库统计、空间列表、L0-L3 层级、注入水位、索引重建与配置脱敏快照
+- `POST /api/memjudge.memories` — 空间/范畴/层级过滤记忆列表、修订历史、单活状态、Wiki 编译与代谢触发
+- `POST /api/memjudge.conflicts` — 三分冲突定性与证据摘要
 - `POST /api/memjudge.saveKey` — 保存对话 / 向量 / 重排分组密钥
 - `POST /api/memjudge.clearKey` — 清除已保存分组密钥
 - `POST /api/memjudge.saveConfig` — 保存模块开关或触发索引重建
@@ -44,12 +44,13 @@ memjudge-plugin/
 ├── client.js                  # DSH Web 记忆治理与设置面板客户端入口
 ├── cordis.patch.yml           # 宿主默认配置补丁声明
 ├── package.json               # 包清单（零外部私仓路径依赖）
-├── src/                       # 24 个核心运行时模块（v2 架构）
+├── src/                       # 28 个运行时模块（含观测、证据策略、运行时预检与 STRICT 迁移）
 │   ├── index.mjs              # Cordis 插件入口（8 工具 + Tier-S/Tier-D 注入 + 轮次采集 + 周期代谢）
 │   ├── store.mjs              # SQLite 存储引擎（Schema v8：spaces / entity_slots / vectors / revisions / wiki_pages / ingest_queue）
 │   ├── search.mjs             # 前置空间过滤 + BM25 + Int8 向量 + 槽位图三路 RRF 混合检索引擎
 │   ├── inject.mjs             # 保 Prefix KV Cache 两段式动态注入器（Tier-S 静态底座 + Tier-D 按问召回 + SessionSeen）
 │   ├── judge.mjs              # O(log N) 槽位拒答门（gateSlots）、数值单位归一化与三分冲突裁决（classifyConflict）
+│   ├── evidence-policy.mjs    # 共用最终拒答策略、动态注入同源证据与保守技术赋值核验
 │   ├── lifecycle.mjs          # L0-L3 四级热冷代谢引擎、增量 Wiki 聚类编译与超限冷归档压缩
 │   ├── distiller.mjs          # 云端 LLM / 本地规则双模异步脱水器与 ingest_queue 消费器
 │   ├── turn-collector.mjs     # 会话轮次收集器、噪声/子代理门禁与敏感凭据脱敏
@@ -79,19 +80,26 @@ memjudge-plugin/
 │   ├── auto-capture-spec.md   # 自动采集设计规格
 │   ├── panel-spec.md          # 设置面板与 RPC 协议规格
 │   └── wiki-layer-spec.md     # L2 Wiki 编译投影规格
-└── test/                      # 39 个测试文件：单元、集成、发布回归与 1000 轮端到端压测
+└── test/                      # 50 个 *.test.mjs 文件（另有夹具/隔离辅助模块）
 ```
+
+开发证据入口的口径、安全边界与待验项目见 [十二维开发证据说明](docs/CAPABILITY-EVIDENCE.md)。回归通过不等于正式能力达标或生产安装验收。
 
 ## 验证与运维命令
 
-```bash
-# 语法静态检查
-for file in src/*.mjs client.js; do
-  node --check "$file" || exit 1
-done
+要求 Node.js `^22.16.0 || >=24.0.0`，并在打开数据文件前实测 `DatabaseSync.isTransaction` 与同步 SQL 能力。实际回归环境为 Node 24.21.0；不能把版本字符串检查当作所有支持版本的完整实测。
 
-# 运行全套自包含单元测试
-node --test
+```bash
+# 语法检查（29 个文件）
+node scripts/verify.mjs --syntax-only
+
+# 完整自包含源码回归：临时 DSH_HOME、清除模块环境覆盖、禁用私人真库夹具
+node scripts/verify.mjs
+
+# 十二维开发证据：完整日志+源码快照，非SPEC正式十二项验收
+node scripts/capability-evidence.mjs
+# 验证上一步产物完整性及当前源码一致性
+node scripts/capability-evidence.mjs --verify <绝对运行目录>
 
 # 装机一致性体检
 node scripts/verify-install.mjs

@@ -9,6 +9,8 @@
 //   5. 向量显式主键绑定（vectors.memory_id + space_id + content_hash + ON DELETE CASCADE），根除 VACUUM rowid 漂移。
 
 import { DatabaseSync } from 'node:sqlite';
+import { assertRuntime, assertSQLiteCapabilities } from './runtime.mjs';
+import { CORE_TABLES, upgradeStrictTables } from './strict-schema.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -412,7 +414,7 @@ CREATE TABLE IF NOT EXISTS main.spaces (
   label TEXT,
   created_at INTEGER NOT NULL,
   last_seen_at INTEGER NOT NULL
-);
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS main.memories (
   id TEXT PRIMARY KEY,
@@ -434,7 +436,7 @@ CREATE TABLE IF NOT EXISTS main.memories (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   last_accessed_at INTEGER NOT NULL
-);
+) STRICT;
 
 CREATE INDEX IF NOT EXISTS main.idx_memories_space_status_cat
   ON memories(space_id, status, category, tier);
@@ -454,7 +456,7 @@ CREATE TABLE IF NOT EXISTS main.memory_revisions (
   prev_hash TEXT NOT NULL,
   reason TEXT,
   changed_at INTEGER NOT NULL
-);
+) STRICT;
 CREATE INDEX IF NOT EXISTS main.idx_revisions_mem
   ON memory_revisions(memory_id, changed_at DESC);
 
@@ -470,7 +472,7 @@ CREATE TABLE IF NOT EXISTS main.entity_slots (
   confidence REAL NOT NULL DEFAULT 0.8,
   quote TEXT,
   created_at INTEGER NOT NULL
-);
+) STRICT;
 CREATE INDEX IF NOT EXISTS main.idx_slots_lookup
   ON entity_slots(space_id, entity, attr);
 CREATE INDEX IF NOT EXISTS main.idx_slots_entity
@@ -487,7 +489,7 @@ CREATE TABLE IF NOT EXISTS main.vectors (
   vec BLOB NOT NULL,
   content_hash TEXT NOT NULL,
   updated_at INTEGER NOT NULL
-);
+) STRICT;
 CREATE INDEX IF NOT EXISTS main.idx_vectors_space
   ON vectors(space_id);
 
@@ -502,7 +504,7 @@ CREATE TABLE IF NOT EXISTS main.wiki_pages (
   version INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL,
   UNIQUE(space_id, slug)
-);
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS main.ingest_queue (
   job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -516,14 +518,14 @@ CREATE TABLE IF NOT EXISTS main.ingest_queue (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(session_id, turn_no)
-);
+) STRICT;
 CREATE INDEX IF NOT EXISTS main.idx_ingest_status
   ON ingest_queue(status, created_at ASC);
 
 CREATE TABLE IF NOT EXISTS main.meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
-);
+) STRICT;
 `;
 
 // 连接级 TEMP 兼容层：让尚未升级的外部脚本/存量测试执行 `SELECT v FROM meta WHERE k = ?`
@@ -652,6 +654,8 @@ function makeStateId(spaceId, slotKey) {
  * }} [opts]
  */
 export function open(dbPath = ':memory:', opts = {}) {
+  assertRuntime();
+  assertSQLiteCapabilities(DatabaseSync);
   const isMemory = dbPath === ':memory:';
   const file = isMemory ? ':memory:' : path.resolve(dbPath);
   if (!isMemory) fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -726,8 +730,11 @@ export function open(dbPath = ':memory:', opts = {}) {
       || existingTables.has('str_dict');
 
     const isFreshEmpty = existingTables.size === 0;
+    const strictUpgradeOnly = !isFreshEmpty && fromVersion === STORE_SCHEMA_VERSION
+      && metaHasKeyValue && isV8Memories && !hasLegacyTables
+      && db.prepare('PRAGMA main.table_list').all().some(r => CORE_TABLES.includes(r.name) && r.strict !== 1);
     const needsMigration = !isFreshEmpty && (
-      fromVersion < STORE_SCHEMA_VERSION
+      strictUpgradeOnly || fromVersion < STORE_SCHEMA_VERSION
       || !metaHasKeyValue
       || !isV8Memories
       || hasLegacyTables
@@ -790,6 +797,9 @@ export function open(dbPath = ':memory:', opts = {}) {
         if (snapshotDir) fs.rmSync(snapshotDir, { recursive: true, force: true });
       }
       try {
+        if (strictUpgradeOnly) {
+          upgradeStrictTables(db);
+        } else {
         const tMig = now();
 
         // 2.1 提取旧 meta 键值（剔除已废弃的 v1 内部迁移标记）
@@ -1017,6 +1027,8 @@ export function open(dbPath = ':memory:', opts = {}) {
           insMetaMig.run('data_generation', '1');
         }
 
+        upgradeStrictTables(db);
+        }
         db.exec('COMMIT;');
       } catch (migErr) {
         if (db.isTransaction) {
@@ -1049,7 +1061,7 @@ export function open(dbPath = ':memory:', opts = {}) {
     let hybridPublishing = false;
     let derivedStamp = null;
     let derivedTexts = new Map();
-    const databaseEpoch = () => `${db.prepare('PRAGMA data_version').get().data_version}:${db.prepare('SELECT total_changes() AS n').get().n}`;
+    const databaseEpoch = () => `${db.prepare('PRAGMA data_version').get().data_version}:${db.prepare('SELECT total_changes() AS n').get().n}:${db.prepare('PRAGMA main.schema_version').get().schema_version}`;
     let derivedEpoch;
 
     const SNAPSHOT_MEMORIES_SQL = `
@@ -1173,11 +1185,16 @@ export function open(dbPath = ':memory:', opts = {}) {
 
     function ensureFresh() {
       if (db.isTransaction) throw new Error('derived read requires an idle connection');
+      // No writes on this connection (including raw SQL) and no commits from
+      // peers or schema changes: the derived snapshot cannot have changed. Avoid serializing the
+      // entire memory table for every getter; do not use a time-based cache.
+      if (databaseEpoch() === derivedEpoch) return;
       const stamp = contentVersion();
       if (stamp === derivedStamp && databaseEpoch() === derivedEpoch) return;
       const next = { byId: new Map(), slot: new Map(), total: 0 };
       let rows;
       let finalStamp = stamp;
+      let finalEpoch = null;
       let committing = false;
       try {
         db.exec('BEGIN IMMEDIATE');
@@ -1197,6 +1214,9 @@ export function open(dbPath = ':memory:', opts = {}) {
             replaceSeg.run(row.ord, packCovered(splitSegments(row.text).length));
           }
         }
+        // Certify the epoch while the same write lock still protects these rows.
+        // Never sample a newer peer commit after unlocking and attach it to old facts.
+        finalEpoch = databaseEpoch();
         committing = true;
         db.exec('COMMIT');
         if (db.isTransaction) throw new Error('derived refresh commit left an active transaction');
@@ -1211,7 +1231,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       }
       memFacts = next;
       derivedStamp = finalStamp;
-      derivedEpoch = databaseEpoch();
+      derivedEpoch = finalEpoch;
       factsRevision += 1;
     }
 
@@ -1770,7 +1790,7 @@ export function open(dbPath = ':memory:', opts = {}) {
             committing = true;
             db.exec('COMMIT');
             derivedStamp = readSnapshotStamp();
-            derivedEpoch = databaseEpoch();
+            derivedEpoch = null;
             return {
               id: existing.id,
               updated: false,
@@ -1875,7 +1895,7 @@ export function open(dbPath = ':memory:', opts = {}) {
 
       if (normalizedSlots) syncMemFactsForId(outId, normalizedSlots);
       derivedStamp = readSnapshotStamp();
-      derivedEpoch = databaseEpoch();
+      derivedEpoch = null;
 
       return {
         id: outId,
@@ -1916,7 +1936,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       syncMemFactsForId(memoryId, normalized);
       if (!inTx) {
         derivedStamp = readSnapshotStamp();
-        derivedEpoch = databaseEpoch();
+        derivedEpoch = null;
       }
       return normalized.length;
     }
@@ -2648,7 +2668,7 @@ export function open(dbPath = ':memory:', opts = {}) {
 
       if (normalizedSlots) syncMemFactsForId(id, normalizedSlots);
       derivedStamp = readSnapshotStamp();
-      derivedEpoch = databaseEpoch();
+      derivedEpoch = null;
 
       return toMemoryView(stmt.byId.get(id), { withFacts: true, includeCompatSnake: true });
     }
@@ -2828,7 +2848,7 @@ export function open(dbPath = ':memory:', opts = {}) {
             db.exec('COMMIT');
             if (db.isTransaction) throw new Error('put commit left an active transaction');
             derivedStamp = readSnapshotStamp();
-            derivedEpoch = databaseEpoch();
+            derivedEpoch = null;
             return {
               id: hit.id,
               inserted: false,
@@ -2915,7 +2935,7 @@ export function open(dbPath = ':memory:', opts = {}) {
           syncMemFactsForId(id, normalizedSlots);
           derivedTexts.set(ord, text);
           derivedStamp = readSnapshotStamp();
-          derivedEpoch = databaseEpoch();
+          derivedEpoch = null;
 
           return {
             id,
@@ -2999,7 +3019,7 @@ export function open(dbPath = ':memory:', opts = {}) {
       }
 
       derivedStamp = readSnapshotStamp();
-      derivedEpoch = databaseEpoch();
+      derivedEpoch = null;
 
       return {
         id: key,
@@ -3502,7 +3522,9 @@ export function open(dbPath = ':memory:', opts = {}) {
     }
 
     derivedStamp = contentVersion();
-    derivedEpoch = databaseEpoch();
+    // Startup and incremental writes are deliberately uncertified: the next getter
+    // rebuilds under its own lock before enabling the steady-read shortcut.
+    derivedEpoch = null;
     return api;
   } catch (err) {
     try { db.exec('ROLLBACK'); } catch { /* ignore */ }

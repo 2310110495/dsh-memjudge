@@ -6,6 +6,13 @@ const URL_EXTRACT_RE = /https?:\/\/[^\s)>\]"'`，。；！？<>]+/gi;
 
 // Units ordered strictly longest-first so multi-char units ('bytes', '厘米', '小时', 'ms')
 // win over single-char prefixes ('B', '米', '时', 's').
+// Normalize only for matching; callers retain the original substring as evidence.
+export function stripEvidenceMarkup(text) {
+  return String(text).trim().replace(/^(?:(?:[-+*•]\s+|>\s*|[0-9]+[.)]\s+))+/, '')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/__([^_\n]+)__/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1');
+}
+
 export const SLOT_UNITS = [
   'tokens', 'bytes', 'chars',
   '平方千米', '平方米', '平方厘米', '立方米',
@@ -405,6 +412,7 @@ export function extractSlots(text) {
   const dedup = new Set();
 
   let lastEntityInSentence = '';
+  let conditionalQuote = '';
 
   const commitSlot = (rawSlot, rawClauseText) => {
     const entity = cleanSlotEntity(unmaskUrls(rawSlot.entity, urls));
@@ -417,11 +425,11 @@ export function extractSlots(text) {
     if (!entity || !attr || !value) return false;
     if (value.length > 160) return false;
 
-    const candidateQuote = unmaskUrls(rawSlot.quote || rawClauseText, urls);
+    const candidateQuote = conditionalQuote || unmaskUrls(rawSlot.quote || rawClauseText, urls);
     const quote = resolveGroundedQuote(text, candidateQuote);
     if (!quote || !text.includes(quote)) return false;
 
-    const key = `${entity}\0${attr}\0${value}\0${unit}\0${polarity}`;
+    const key = JSON.stringify([entity, attr, value, unit, polarity, quote]);
     if (dedup.has(key)) return true;
     dedup.add(key);
 
@@ -439,7 +447,11 @@ export function extractSlots(text) {
   };
 
   for (const clauseObj of clauses) {
-    const clause = clauseObj.text.trim().replace(/^[-*•>\s]+/, '').trim();
+    const sentenceStart = Math.max(...['。','！','？','；','\n'].map(c => masked.lastIndexOf(c, clauseObj.start - 1))) + 1;
+    const context = masked.slice(sentenceStart, clauseObj.start + clauseObj.text.length).trim();
+    const condition = /^(?:(?:仅在|在|如果|若|当|仅当)\s*.+?(?:情况下|的时候|环境下|模式下|条件下|之时|下|时))[,，]?\s*/;
+    conditionalQuote = condition.test(stripEvidenceMarkup(context)) ? unmaskUrls(context, urls) : '';
+    const clause = stripEvidenceMarkup(clauseObj.text).replace(condition, '').trim();
     if (!clause || clause.length < 3) continue;
     // Drop interrogative questions so questions aren't stored as declarative facts
     if (/[?？]$/.test(clause) || /^(?:请问|为什么|为何|怎么|如何|是否|能不能)\b/.test(clause)) {

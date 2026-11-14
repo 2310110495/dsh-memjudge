@@ -24,6 +24,7 @@ import {
   matchEntitySlots,
 } from './search.mjs';
 import { classifyConflict } from './judge.mjs';
+import { shouldDenyRecall, judgeSourceText } from './evidence-policy.mjs';
 import {
   GLOBAL_SPACE_ID,
   isSubagentSession,
@@ -533,14 +534,34 @@ export class InjectionEngine {
     const idx = this.#resolveSearchIndex(store, dynamicMems.length ? dynamicMems : mems, ctx);
     const queryTokens = tokenize(query).tokens;
     const minVecScore = ctx.minVecScore ?? this.opts.minVecScore ?? 0.35;
-    return { store, mems, dynamicMems, state, maxTierD, idx, queryTokens, minVecScore };
+    return { store, mems, dynamicMems, state, maxTierD, idx, query, queryTokens, minVecScore };
   }
 
   #finalizeTierD(prep, hits, queryVec, ctx, t0) {
     if (this.#disposed || this.#sessions.get(String(ctx.sessionId || 'default')) !== prep.state) {
       return this.#disposedResult(t0);
     }
-    const { store, dynamicMems, state, maxTierD, queryTokens, minVecScore } = prep;
+    const { store, dynamicMems, state, maxTierD, query, queryTokens, minVecScore } = prep;
+    const scope = buildScopeGuard({ ...this.opts, ...ctx });
+    // Search hits carry relevance, never authority. Read current source by id;
+    // a store miss/error must not fall back to a stale external index snapshot.
+    const sources = new Map((prep.mems.length || store || Array.isArray(ctx.memories)
+      ? prep.mems : prep.idx.docs).map(m => [String(m.id), m]));
+    const resolveSource = (id) => {
+      try {
+        const source = typeof store?.get === 'function' ? store.get(String(id)) : sources.get(String(id));
+        if (!source || String(source.id) !== String(id) || typeof source.text !== 'string' || !source.text.trim()
+          || (source.status && source.status !== 'active') || source.supersededBy
+          || !scope.allow(source.spaceId ?? source.space_id ?? GLOBAL_SPACE_ID)) return null;
+        return source;
+      } catch { return null; }
+    };
+    const supports = (text) => {
+      // No global slot projection: a lossy/foreign slot must not recover a
+      // candidate-local denial. Narrative keyword/explanation gates still pass.
+      try { return !shouldDenyRecall(judgeSourceText(query, text), null); }
+      catch { return false; }
+    };
     if (!hits.length) {
       return {
         text: '',
@@ -580,12 +601,15 @@ export class InjectionEngine {
     const confidentHits = [];
     for (const h of hits) {
       const cosScore = cosById.get(h.id) ?? (h.routes?.includes('vector') ? minVecScore : 0);
-      const enriched = { ...h, cosScore };
+      const source = resolveSource(h.id);
+      if (!source) continue;
+      const enriched = { ...h, ...source, id: String(source.id), cosScore };
       if (!isConfidentHit(enriched, queryTokens, { ...this.opts, ...ctx })) continue;
       if (state.seen.has(enriched)) {
         filteredBySeen += 1;
         continue;
       }
+      if (!supports(source.text)) continue;
       confidentHits.push(enriched);
     }
 
@@ -614,7 +638,8 @@ export class InjectionEngine {
       const idsToRecord = [{ id: h.id, text: h.text }];
 
       if (sk && activeBySlotKey.has(sk)) {
-        const siblings = activeBySlotKey.get(sk).filter((m) => String(m.id) !== String(h.id) && !state.seen.has(m));
+        const siblings = activeBySlotKey.get(sk).map(m => resolveSource(m.id)).filter(m => m
+          && String(m.id) !== String(h.id) && !state.seen.has(m) && supports(m.text));
         if (siblings.length > 0) {
           const other = siblings[siblings.length - 1];
           const tri = classifyConflict(
@@ -637,9 +662,13 @@ export class InjectionEngine {
 
       if (line.length > avail) {
         if (lines.length > 0) continue;
+        // Never publish only half of a disputed pair, or mark an omitted side seen.
+        if (idsToRecord.length > 1) continue;
         line = truncateSafe(line, avail);
       }
 
+      // Formatting and truncation must not drop the only source evidence.
+      if (!supports(line)) continue;
       const nextLines = [...lines, line];
       if (buildText(nextLines).length > maxTierD) continue;
 

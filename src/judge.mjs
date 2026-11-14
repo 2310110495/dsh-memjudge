@@ -17,6 +17,7 @@ import {
   cleanSlotEntity,
   cleanSlotAttr,
   normalizeValueAndUnit,
+  stripEvidenceMarkup,
 } from './slots.mjs';
 import { GLOBAL_SPACE_ID, visibleSpaces } from './scope.mjs';
 
@@ -540,7 +541,7 @@ export function parseSlotQuery(query, opts = {}) {
   raw = raw.replace(/^(?:请问|请教|帮我查一下|查一下|查询|查看|告诉我|请问一下|想问一下)\s*/, '');
 
   // 1. 是非/核验问句探测：如 "API 网关的超时阈值是 3000ms 吗？" / "timeoutMs 是不是 90000？"
-  const strippedTail = raw.replace(/[吗么呢吧呀啊？?！!。，,\s]+$/g, '').trim();
+  const strippedTail = raw.replace(/[吗呢吧呀啊？?！!。，,\s]+$/g, '').trim();
   const normalizedYesNo = strippedTail.replace(/(?:是不是|是否为|是否等于|是否定为|是否设为|是否)/g, '是');
   const hasWhWord = SLOT_QUERY_INTERROGATIVE_RE.test(normalizedYesNo);
 
@@ -722,7 +723,7 @@ export function gateSlots(query, store, opts = {}) {
     spaces = visibleSpaces(opts.scope);
   }
 
-  const parsed = parseSlotQuery(query, opts);
+  const parsed = parseSlotQuery(String(query).replace(/^(?:(?:仅在|在|如果|若|当|仅当)\s*.+?(?:情况下|的时候|环境下|模式下|条件下|之时|下|时))[,，]?\s*/, ''), opts);
 
   // 与 gate() 一致：非判定性提问（关键词检索、短语召回）不进证据门，
   // 否则槽位图会替它编一个「缺属性」的理由把正常召回拒死。
@@ -902,7 +903,12 @@ export function gateSlots(query, store, opts = {}) {
   }
 
   // Step 3: O(log N) 检查值是否已记录
-  const positiveRows = attrRows.filter((r) => (r.polarity ?? 1) > 0 && String(r.value ?? '').trim() !== '');
+  // An indexed value is not an unconditional equality proof. Older extractors
+  // flatten conditions/comparators, so recheck the bounded source quote too.
+  const supportsQuery = r => (r.polarity ?? 1) > 0
+    && String(r.value ?? '').trim() !== ''
+    && (!r.quote || candidateEvidence(query, r.quote)?.deny !== true);
+  const positiveRows = attrRows.filter(supportsQuery);
   if (parsed.checkValue && parsed.expectedValue !== null) {
     // 先试复合索引精确点查 value
     const exactValRows = queryFn({
@@ -912,7 +918,7 @@ export function gateSlots(query, store, opts = {}) {
       value: parsed.expectedValue,
       activeOnly: true,
       limit: 16,
-    }).filter((r) => slotValueMatches(r, parsed.expectedValue, parsed.expectedUnit));
+    }).filter((r) => supportsQuery(r) && slotValueMatches(r, parsed.expectedValue, parsed.expectedUnit));
 
     const matchedValRows = exactValRows.length > 0
       ? exactValRows
@@ -976,10 +982,12 @@ export function gateSlots(query, store, opts = {}) {
 // clause by the subject immediately preceding its attribute, never by document-wide includes.
 function candidateEvidence(query, text) {
   // Keep a leading condition attached even when a comma separates it from the assertion.
-  const leadingCondition = /^(?:(?:在|如果|若|当|仅当)\s*.+?(?:情况下|的时候|环境下|模式下|条件下|之时|下|时))[,，]?\s*/;
+  const leadingCondition = /^(?:(?:仅在|在|如果|若|当|仅当)\s*.+?(?:情况下|的时候|环境下|模式下|条件下|之时|下|时))[,，]?\s*/;
   const queryCondition = String(query).trim().match(leadingCondition)?.[0] || '';
   const parsed = parseSlotQuery(String(query).trim().slice(queryCondition.length));
-  if (!parsed.entity || !parsed.attr || parsed.attr === 'value') return null;
+  if (!parsed.entity || !parsed.attr) return null;
+  // Single-key assignments have no separate subject attribute.
+  const assertionAttr = parsed.attr === 'value' ? '' : parsed.attr;
   // A bare compound noun has no explicit subject boundary. Require the complete
   // compound attribute immediately followed by a value, not separate document hits.
   const explicitSubject = /(?:项目|服务|系统|网关|模块|组件|集群|节点|实例|对象|队列|缓存|线程池|连接池|号)$/.test(parsed.entity);
@@ -988,7 +996,7 @@ function candidateEvidence(query, text) {
     const compound = parsed.entity + parsed.attr;
     let mentioned = false;
     for (const sentence of String(text).split(/[。！？；;\n]/)) {
-      const conditional = Boolean(sentence.trim().match(leadingCondition));
+      const conditional = Boolean(stripEvidenceMarkup(sentence).match(leadingCondition));
       for (const clause of sentence.split(/[，,]/)) {
         const at = clause.indexOf(compound);
         if (at < 0) continue;
@@ -1004,18 +1012,18 @@ function candidateEvidence(query, text) {
   const conditionKey = s => String(s).replace(/[,，\s]/g, '');
   const rows = [];
   for (const sentence of String(text).split(/[。！？；;\n]/)) {
-    const condition = sentence.trim().match(leadingCondition)?.[0] || '';
+    const condition = stripEvidenceMarkup(sentence).match(leadingCondition)?.[0] || '';
     for (const clause of sentence.split(/[，,]/)) {
       const at = clause.indexOf(parsed.entity);
       if (at < 0) continue;
       const prefix = clause.slice(0, at).trim();
       // A suffix inside a longer subject is not the queried subject. Conditions are wrappers,
       // not part of the subject; other attached word characters cannot establish ownership.
-      const ownerPrefix = prefix.replace(leadingCondition, '');
+      const ownerPrefix = stripEvidenceMarkup(prefix).replace(leadingCondition, '');
       if (/[\p{L}\p{N}_]$/u.test(ownerPrefix)) continue;
       const rest = clause.slice(at + parsed.entity.length).replace(/^\s*的?\s*/, '');
-      if (!rest.startsWith(parsed.attr)) continue;
-      const predicate = rest.slice(parsed.attr.length).match(/^\s*(不是|不为|不等于|是|为|等于|设为|定为|约为|不超过|不少于|不低于|不高于|达到|高达|[:：=])?\s*(.+)$/);
+      if (!rest.startsWith(assertionAttr)) continue;
+      const predicate = rest.slice(assertionAttr.length).match(/^\s*(不是|不为|不等于|是|为|等于|设为|定为|约为|不超过|不少于|不低于|不高于|达到|高达|[:：=])?\s*(.+)$/);
       if (!predicate) continue;
       const negative = /^(?:不是|不为|不等于)$/.test(predicate[1] || '');
       const exact = !/^(?:约为|不超过|不少于|不低于|不高于|达到|高达)$/.test(predicate[1] || '');
